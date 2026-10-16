@@ -62,7 +62,7 @@ def _first_env(*names: str) -> str:
 
 def _is_oauth_token(key: str) -> bool:
     """True for Anthropic OAuth/setup tokens (sk-ant-*, eyJ JWTs, cc-); False for sk-ant-api* Console keys."""
-    if not key or key.startswith("sk-ant-api"):
+    if not key or key.startswith(("sk-ant-api", "sk-ant-usr")):  # 2026-10-13 grok-bot: sk-ant-usr Console keys use x-api-key
         return False
     return key.startswith(("sk-ant-", "eyJ", "cc-"))
 

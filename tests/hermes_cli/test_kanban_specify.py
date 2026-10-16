@@ -139,3 +139,65 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+# ---------------------------------------------------------------------------
+# list_triage_ids must not resurrect block_loop_detected escalations
+# ---------------------------------------------------------------------------
+
+
+def _running_task(conn, title="t"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    return tid
+
+
+def test_list_triage_ids_excludes_block_loop_detected(kanban_home):
+    """A triage card whose latest event is block_loop_detected is a human-gated
+    escalation; auto-specify must not re-specify it back to todo (that is
+    exactly the storm this fix stops)."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid not in spec.list_triage_ids()
+
+
+def test_list_triage_ids_includes_fresh_triage_card(kanban_home):
+    """A plain one-liner idea card in triage (no block_loop_detected event at
+    all) must still be picked up — only the escalation kind is excluded."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="idea", triage=True)
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid in spec.list_triage_ids()
+
+
+def test_list_triage_ids_includes_card_re_escalated_for_unrelated_reason(kanban_home):
+    """The exclusion is on the MOST RECENT event only. A card that hit
+    block_loop_detected and later gets a fresh, unrelated, newer event while
+    still in triage must be included again -- this is not a blanket
+    NOT EXISTS over all history."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert tid not in spec.list_triage_ids()
+
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reopened_for_fresh_idea", {"reason": "unrelated"})
+
+    assert tid in spec.list_triage_ids()
+
+

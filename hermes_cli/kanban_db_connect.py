@@ -837,6 +837,11 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    # Epoch seconds a 'scheduled' task auto-wakes to 'ready'; NULL = no timer
+    # (legacy ``schedule_task`` behaviour — parked until an explicit
+    # ``unblock_task``). Set by quota/429 backoff scheduling; cleared by
+    # ``recompute_scheduled`` once it fires.
+    ("resume_at", "resume_at INTEGER"),
 )
 
 _NOTIFY_SUB_COLUMNS = (
