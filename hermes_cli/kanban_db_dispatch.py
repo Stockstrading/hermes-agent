@@ -1582,15 +1582,16 @@ _REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
 _REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner (raised 2 -> 4 by the owner 2026-10-08)
 # Owner-granted extra rounds for specific PRs (2026-10-08: 3 more rounds each, then report readiness).
 _REVIEW_ROUND_CAP_BY_PR = {'strategy-api#340': 5, 'strategy-api#334': 5, 'account-pod-provisioner#12': 5, 'strategy-lab#27': 8, 'strategy-lab#28': 7, 'bff-api#141': 11, 'ai-stocktrading#560': 7, 'execution-service#308': 7, 'ai-stocktrading#531': 10, 'strategy-api#276': 7, 'account-pod-provisioner#7': 7, 'ai-stocktrading#535': 7, 'execution-service#326': 9, 'oke-platform-gitops#241': 12, 'ai-stocktrading#546': 6, 'ai-stocktrading#533': 3, 'strategy-lab#33': 7, 'ai-stocktrading#532': 8, 'bff-api#144': 7, 'bff-api#150': 7, 'oke-platform-gitops#228': 18, 'oke-platform-gitops#333': 7, 'oke-platform-gitops#336': 28, 'ai-stocktrading#538': 7, 'ai-stocktrading#551': 8, 'ai-stocktrading#552': 7, 'risk-api#51': 7, 'strategy-api#335': 7, 'strategy-api#298': 8, 'strategy-api#245': 8, 'strategy-api#304': 7, 'account-pod-provisioner#11': 7, 'strategy-api#319': 8, 'strategy-api#243': 16, 'indicator-api#96': 15}  # 2026-10-12 owner: +3 for #141/#560/#533, +2 for #308/#531/#546; 2026-10-12 owner (2nd batch): +3 rounds for strategy-api#276, account-pod-provisioner#7, ai-stocktrading#531/#535, execution-service#326, oke-platform-gitops#241
-# --- Review cost gate (ported from the local 2026-09-29 owner-approved patch) -----
-# Reviews used ~76% of all Claude tokens (1,384 review runs on 133 PRs in 10 days, up
-# to 16 gate-1 rounds on one PR). The round cap in the SOULs was only checked by the
-# model AFTER a full paid review, so it is enforced here, at spawn time.
-_REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
-_REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner
 _REVIEW_MIN_RUN_SECONDS = 120  # shorter runs are crashes / synthesized block runs
 _REVIEW_LOOKBACK_SECONDS = 30 * 86400
 _REVIEW_CAP_MARKER = "review round cap"
+# Quota-stall cap (card t_480b842d, ADR Rule 4): a spawn that 429'd or got parked via the
+# resume_at scheduling path (t_36404fba) before producing a verdict costs nothing but still
+# occupies a dispatch slot forever if left uncounted. 3 stalls -> same owner escalation as a
+# real round cap hit, via its own marker so the two caps' "owner unblocked -> one more round"
+# grace periods never bleed into each other.
+_QUOTA_STALL_CAP = 3
+_QUOTA_STALL_CAP_MARKER = "quota stall cap"
 _REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
 _REVIEW_PR_TITLE_RE = re.compile(
     r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
@@ -1658,6 +1659,112 @@ def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str])
     return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
 
 
+def _review_quota_stalls(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
+    """Quota-stall runs by ``profile`` on any card about the same PR, oldest first.
+
+    A stall is a spawn that never produced a verdict: either it ran the
+    resume_at scheduling path (``outcome = 'scheduled'``, card t_36404fba) or it
+    ended ``rate_limited``/``blocked`` AND the card is currently typed
+    ``block_kind = 'needs_input'`` -- the SOUL's pre-t_36404fba fallback for a
+    quota wall it could not schedule around. Either way the run must be SHORT
+    (< ``_REVIEW_MIN_RUN_SECONDS``): a long run that happens to end blocked is a
+    real reviewed-and-blocked verdict, already counted by
+    :func:`_review_verdict_runs`, never double-counted here.
+    """
+    nums = sorted({k.rsplit("#", 1)[1] for k in keys})
+    if not nums:
+        return []
+    like = " OR ".join(["t.title LIKE ? OR t.body LIKE ?"] * len(nums))
+    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, int(time.time()) - _REVIEW_LOOKBACK_SECONDS]
+    for n in nums:
+        params += [f"%#{n}%", f"%/pull/{n}%"]
+    rows = conn.execute(
+        "SELECT r.task_id, r.started_at, r.ended_at, t.title, t.body "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
+        "AND (r.outcome = 'scheduled' "
+        "     OR (r.outcome IN ('rate_limited', 'blocked') AND t.block_kind = 'needs_input')) "
+        "AND (r.ended_at - r.started_at) < ? AND r.started_at >= ? "
+        f"AND ({like}) ORDER BY r.ended_at",
+        params,
+    ).fetchall()
+    return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
+
+
+def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
+    """Best-effort ``https://github.com/org/repo/pull/N`` for a ``repo#n`` cap-gate
+    key, read off any task about the same PR whose ``completion_contract`` was bound
+    to the published PR URL (kanban_pr_acceptance_store.prepare_acceptance sets this
+    once a dev's first green completion publishes it). None when no task has ever
+    published one -- CI status degrades to 'unknown' in the escalation summary
+    rather than blocking on it."""
+    num = pr_key.rsplit("#", 1)[1]
+    rows = conn.execute(
+        "SELECT title, body, completion_contract FROM tasks "
+        "WHERE title LIKE ? OR body LIKE ? OR title LIKE ? OR body LIKE ?",
+        (f"%#{num}%", f"%/pull/{num}%", f"%#{num}%", f"%/pull/{num}%"),
+    ).fetchall()
+    for row in rows:
+        if not (_card_pr_keys(row["title"], row["body"]) & {pr_key}):
+            continue
+        contract = row["completion_contract"]
+        if contract and _PR_URL_FULL_RE.fullmatch(str(contract)):
+            return contract
+    return None
+
+
+_PR_URL_FULL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+_ESCALATION_OPTIONS = (
+    "merge as-is with the residual findings",
+    "waive this gate for this PR and proceed",
+    "close/abandon the PR",
+)
+
+
+def _open_findings_from_runs(verdict_runs: list) -> list:
+    """The most recent verdict's structured findings (Rule 3) still marked open."""
+    if not verdict_runs:
+        return []
+    findings = _findings_from_metadata(verdict_runs[-1]["metadata"])
+    return [f for f in findings if str(f.get("status", "open")).lower() != "addressed"]
+
+
+def _owner_escalation_summary(
+    conn: sqlite3.Connection, assignee: str, pr: str,
+    cap_kind: str, cap: int, count: int, verdict_runs: list,
+) -> str:
+    """One paragraph for the owner: open findings, head SHA, CI status
+    (best-effort), and the three named options (merge / waive gate / close).
+    Never raises -- a PR/CI lookup failure degrades fields to 'unknown', it
+    never blocks the escalation itself."""
+    findings = _open_findings_from_runs(verdict_runs)
+    findings_txt = (
+        "; ".join(f"[{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')}" for f in findings)
+        if findings else "none recorded"
+    )
+    head_sha = "unknown"
+    ci_txt = "unknown"
+    pr_url = _pr_url_for_key(conn, pr)
+    if pr_url:
+        try:
+            from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
+            receipt = _kb_pr_acceptance.collect_acceptance(pr_url, pr_url, assignee=assignee)
+            head_sha = receipt.get("head_sha") or "unknown"
+            ci_txt = receipt.get("classification") or "unknown"
+        except Exception:  # pragma: no cover - CI lookup is advisory, never blocking
+            pass
+    if cap_kind == "real_rounds":
+        marker, reached = _REVIEW_CAP_MARKER, "3 real review rounds"
+    else:
+        marker, reached = _QUOTA_STALL_CAP_MARKER, "3 quota stalls (429s/stalls with no verdict)"
+    return (
+        f"{marker.capitalize()}: {assignee} hit {count} {cap_kind} on {pr} (cap {cap}; reached {reached}). "
+        f"Open findings: {findings_txt}. Head SHA: {head_sha}. CI: {ci_txt}. "
+        f"Options: (1) {_ESCALATION_OPTIONS[0]}, (2) {_ESCALATION_OPTIONS[1]}, (3) {_ESCALATION_OPTIONS[2]}."
+    )
+
+
 def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) -> int:
     """When the card last (re)entered a spawnable lane: a card that went back to
     the dev and returned must not look older than the verdict that sent it back."""
@@ -1703,6 +1810,7 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
             if _card_pr_keys(other["title"], other["body"]) & keys:
                 return "duplicate_review_running"
         runs = _review_verdict_runs(conn, assignee, keys)
+        quota_runs = _review_quota_stalls(conn, assignee, keys)
         # 2. This gate already gave a verdict on this PR after this card entered its lane.
         entered = _lane_entry_time(conn, task_id, row["created_at"])
         newer = [r for r in runs if r["task_id"] != task_id and int(r["ended_at"]) > entered]
@@ -1716,10 +1824,21 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
                 )
                 _kb.archive_task(conn, task_id)
             return "duplicate_review_superseded"
-        # 3. Round cap: the owner decides whether a further round is worth it.
-        cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
-        cap = _REVIEW_ROUND_CAP
-        if len(runs) < cap:
+        # 3. Two independent round caps, owner decides whether a further round is worth
+        # it either way: a REAL round (a gate actually reviewed and gave an outcome --
+        # owner-tunable per PR via _REVIEW_ROUND_CAP_BY_PR, unchanged) or a QUOTA STALL
+        # (a spawn that 429'd/was scheduled before producing a verdict -- new, fixed cap,
+        # no owner overrides yet since nothing has needed one).
+        real_cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
+        if len(runs) >= real_cap:
+            cap_kind, cap, count, marker, relevant_runs = (
+                "real_rounds", real_cap, len(runs), _REVIEW_CAP_MARKER, runs,
+            )
+        elif len(quota_runs) >= _QUOTA_STALL_CAP:
+            cap_kind, cap, count, marker, relevant_runs = (
+                "quota_stalls", _QUOTA_STALL_CAP, len(quota_runs), _QUOTA_STALL_CAP_MARKER, quota_runs,
+            )
+        else:
             return None
         unblocked = conn.execute(
             "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
@@ -1728,19 +1847,15 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
         capped = conn.execute(
             "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'blocked' "
             "AND payload LIKE ?",
-            (task_id, f"%{_REVIEW_CAP_MARKER}%"),
+            (task_id, f"%{marker}%"),
         ).fetchone()
         ok_at = int((unblocked["t"] if unblocked else 0) or 0)
         cap_at = int((capped["t"] if capped else 0) or 0)
-        if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in runs):
-            return None  # owner unblocked after the cap: exactly one more round
+        if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in relevant_runs):
+            return None  # owner unblocked after this cap: exactly one more round
         if not dry_run:
-            _block_review_for_owner(
-                conn, task_id, row["status"],
-                f"Review round cap: {assignee} already gave {len(runs)} verdicts on {pr} "
-                f"(cap {cap}, owner directive: stop after {cap} rounds). Unblock this "
-                "card to allow ONE more round, or decide merge/close with the residual findings.",
-            )
+            summary = _owner_escalation_summary(conn, assignee, pr, cap_kind, cap, count, runs)
+            _block_review_for_owner(conn, task_id, row["status"], summary)
         return "review_round_cap"
     except Exception as exc:  # pragma: no cover - cost gate must never stop the dispatcher
         _kb._log.warning("review cost gate skipped for %s: %s", task_id, exc)
