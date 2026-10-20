@@ -11,7 +11,6 @@ org's private repos (#122689).
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 from pathlib import Path
@@ -29,17 +28,9 @@ def validate_contract(value: str | None) -> str:
     return value
 
 
-# local patch 2026-09-29, ported 2026-10-07 onto upstream profile-scoped gh (owner-approved) ----
-# The worker PATH has no ~/bin, so a bare "gh" is the unauthenticated /usr/bin/gh.
-# ~/bin/gh mints a GitHub App token per call. HERMES_GH_BIN overrides.
-_GH_WRAPPER = os.path.expanduser("~ubuntu/bin/gh")
-_GH = os.environ.get("HERMES_GH_BIN") or (_GH_WRAPPER if os.access(_GH_WRAPPER, os.X_OK) else "gh")
-_PASSING_WHEN_UNPINNED = {"success", "neutral", "skipped"}
-
-
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
          profile_home: str | None = None):
-    command = [_GH, "api", endpoint, "--hostname", "github.com"]
+    command = ["gh", "api", endpoint, "--hostname", "github.com"]
     if query is not None:
         command += ["-f", "query=" + query]
     if paginate:
@@ -184,19 +175,17 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        try:
-            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                         paginate=True, profile_home=profile_home)
-        except _GateAuthError:
-            # local patch: the PR itself was just read with this login, so a 403/404 on the
-            # branch-rules endpoint is the plan (GitHub Free private repo exposes no rules),
-            # not an identity failure. No rules -> fall back to every check on the head.
-            rules = []
+        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                     paginate=True, profile_home=profile_home)
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
+        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+        if not required:
+            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+            return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -204,14 +193,6 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
-        fallback = not required
-        if fallback:
-            required = {(r["name"], None) for r in runs} | {(s["context"], None) for s in statuses}
-            receipt["required_source"] = "all checks on head (no branch rules available on this plan)"
-        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
-            receipt["detail"] = "No repository-required checks are configured and no checks ran on the head; explicitly use a local-only contract for non-CI tasks."
-            return receipt
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -226,8 +207,6 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
-                if fallback and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
-                    classification = "success"
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
