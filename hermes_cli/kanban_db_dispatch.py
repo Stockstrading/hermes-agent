@@ -102,6 +102,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    scheduled_promoted: int = 0
+    """``scheduled`` cards whose ``resume_at`` timer came due this tick and
+    were promoted to ``ready`` by :func:`recompute_scheduled` (the quota/429
+    backoff path) — distinct from ``promoted`` (``recompute_ready``'s
+    parent-dependency sweep)."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -1554,6 +1559,442 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+# --- Review cost gate (local patch 2026-09-29, owner-approved) ---------------
+# Reviews used ~76% of all Claude tokens (1,384 review runs on 133 PRs in 10
+# days, up to 16 gate-1 rounds on one PR, two review cards per round). The
+# round cap in the SOULs was only checked by the model AFTER a full paid review,
+# so it is enforced here, at spawn time, before any model call.
+_REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
+_REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner (raised 2 -> 4 by the owner 2026-10-08)
+# Owner-granted extra rounds for specific PRs (2026-10-08: 3 more rounds each, then report readiness).
+_REVIEW_ROUND_CAP_BY_PR = {'strategy-api#340': 5, 'strategy-api#334': 5, 'account-pod-provisioner#12': 5, 'strategy-lab#27': 8, 'strategy-lab#28': 7, 'bff-api#141': 11, 'ai-stocktrading#560': 7, 'execution-service#308': 7, 'ai-stocktrading#531': 10, 'strategy-api#276': 7, 'account-pod-provisioner#7': 7, 'ai-stocktrading#535': 7, 'execution-service#326': 9, 'oke-platform-gitops#241': 12, 'ai-stocktrading#546': 6, 'ai-stocktrading#533': 3, 'strategy-lab#33': 7, 'ai-stocktrading#532': 8, 'bff-api#144': 7, 'bff-api#150': 7, 'oke-platform-gitops#228': 18, 'oke-platform-gitops#333': 7, 'oke-platform-gitops#336': 28, 'ai-stocktrading#538': 7, 'ai-stocktrading#551': 8, 'ai-stocktrading#552': 7, 'risk-api#51': 7, 'strategy-api#335': 7, 'strategy-api#298': 8, 'strategy-api#245': 8, 'strategy-api#304': 7, 'account-pod-provisioner#11': 7, 'strategy-api#319': 8, 'strategy-api#243': 16, 'indicator-api#96': 15}  # 2026-10-12 owner: +3 for #141/#560/#533, +2 for #308/#531/#546; 2026-10-12 owner (2nd batch): +3 rounds for strategy-api#276, account-pod-provisioner#7, ai-stocktrading#531/#535, execution-service#326, oke-platform-gitops#241
+_REVIEW_MIN_RUN_SECONDS = 120  # shorter runs are crashes / synthesized block runs
+_REVIEW_LOOKBACK_SECONDS = 30 * 86400
+_REVIEW_CAP_MARKER = "review round cap"
+# Quota-stall cap (card t_480b842d, ADR Rule 4): a spawn that 429'd or got parked via the
+# resume_at scheduling path (t_36404fba) before producing a verdict costs nothing but still
+# occupies a dispatch slot forever if left uncounted. 3 stalls -> same owner escalation as a
+# real round cap hit, via its own marker so the two caps' "owner unblocked -> one more round"
+# grace periods never bleed into each other.
+_QUOTA_STALL_CAP = 3
+_QUOTA_STALL_CAP_MARKER = "quota stall cap"
+_REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_REVIEW_PR_TITLE_RE = re.compile(
+    r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
+_CAPITAL_DENY_SUBSTRINGS = (
+    "strategy", "execution", "risk", "signal", "exit", "entry", "stop-loss",
+    "sizing", "kelly", "profit", "pnl", "orders", "trade",
+)
+_CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
+                  "position-service", "risk-api", "credentials-service")
+_CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
+_CAPITAL_REVIEW_MODEL = ("claude-opus-5", "anthropic")
+
+
+def _norm_repo(name: str) -> str:
+    n = (name or "").lower().removesuffix(".git")
+    return n.removeprefix("etoro-")
+
+
+def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
+    """``repo#n`` keys for the PR a card is ABOUT. The title decides; the body
+    only counts via full PR URLs when the title names none (a body often cites
+    other PRs in passing, which must not merge two PRs' round counts)."""
+    t = _kb._lossy_text(title) or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if not keys:
+        b = _kb._lossy_text(body) or ""
+        keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    return keys
+
+
+def _is_capital_review(task) -> bool:
+    title = _kb._lossy_text(getattr(task, "title", "")) or ""
+    body = (_kb._lossy_text(getattr(task, "body", "")) or "")[:4000]
+    if _CAPITAL_MARKER_RE.search(title) or _CAPITAL_MARKER_RE.search(body):
+        return True
+    repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
+    return any(r in _CAPITAL_REPOS for r in repos)
+
+
+def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
+    """Real verdict runs by ``profile`` on any card about the same PR, oldest first.
+
+    Returns full rows (including ``metadata``) so callers can read the structured
+    findings a prior round stored there (Rule 3 delta review)."""
+    nums = sorted({k.rsplit("#", 1)[1] for k in keys})
+    if not nums:
+        return []
+    like = " OR ".join(["t.title LIKE ? OR t.body LIKE ?"] * len(nums))
+    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, int(time.time()) - _REVIEW_LOOKBACK_SECONDS]
+    for n in nums:
+        params += [f"%#{n}%", f"%/pull/{n}%"]
+    rows = conn.execute(
+        "SELECT r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
+        "AND r.outcome IN ('completed', 'changes_requested', 'blocked', 'review_requested') "
+        "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
+        f"AND ({like}) ORDER BY r.ended_at",
+        params,
+    ).fetchall()
+    return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
+
+
+def _review_quota_stalls(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
+    """Quota-stall runs by ``profile`` on any card about the same PR, oldest first.
+
+    A stall is a spawn that never produced a verdict: either it ran the
+    resume_at scheduling path (``outcome = 'scheduled'``, card t_36404fba) or it
+    ended ``rate_limited``/``blocked`` AND the card is currently typed
+    ``block_kind = 'needs_input'`` -- the SOUL's pre-t_36404fba fallback for a
+    quota wall it could not schedule around. Either way the run must be SHORT
+    (< ``_REVIEW_MIN_RUN_SECONDS``): a long run that happens to end blocked is a
+    real reviewed-and-blocked verdict, already counted by
+    :func:`_review_verdict_runs`, never double-counted here.
+    """
+    nums = sorted({k.rsplit("#", 1)[1] for k in keys})
+    if not nums:
+        return []
+    like = " OR ".join(["t.title LIKE ? OR t.body LIKE ?"] * len(nums))
+    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, int(time.time()) - _REVIEW_LOOKBACK_SECONDS]
+    for n in nums:
+        params += [f"%#{n}%", f"%/pull/{n}%"]
+    rows = conn.execute(
+        "SELECT r.task_id, r.started_at, r.ended_at, t.title, t.body "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
+        "AND (r.outcome = 'scheduled' "
+        "     OR (r.outcome IN ('rate_limited', 'blocked') AND t.block_kind = 'needs_input')) "
+        "AND (r.ended_at - r.started_at) < ? AND r.started_at >= ? "
+        f"AND ({like}) ORDER BY r.ended_at",
+        params,
+    ).fetchall()
+    return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
+
+
+def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
+    """Best-effort ``https://github.com/org/repo/pull/N`` for a ``repo#n`` cap-gate
+    key, read off any task about the same PR whose ``completion_contract`` was bound
+    to the published PR URL (kanban_pr_acceptance_store.prepare_acceptance sets this
+    once a dev's first green completion publishes it). None when no task has ever
+    published one -- CI status degrades to 'unknown' in the escalation summary
+    rather than blocking on it."""
+    num = pr_key.rsplit("#", 1)[1]
+    rows = conn.execute(
+        "SELECT title, body, completion_contract FROM tasks "
+        "WHERE title LIKE ? OR body LIKE ? OR title LIKE ? OR body LIKE ?",
+        (f"%#{num}%", f"%/pull/{num}%", f"%#{num}%", f"%/pull/{num}%"),
+    ).fetchall()
+    for row in rows:
+        if not (_card_pr_keys(row["title"], row["body"]) & {pr_key}):
+            continue
+        contract = row["completion_contract"]
+        if contract and _PR_URL_FULL_RE.fullmatch(str(contract)):
+            return contract
+    return None
+
+
+_PR_URL_FULL_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
+
+_ESCALATION_OPTIONS = (
+    "merge as-is with the residual findings",
+    "waive this gate for this PR and proceed",
+    "close/abandon the PR",
+)
+
+
+def _open_findings_from_runs(verdict_runs: list) -> list:
+    """The most recent verdict's structured findings (Rule 3) still marked open."""
+    if not verdict_runs:
+        return []
+    findings = _findings_from_metadata(verdict_runs[-1]["metadata"])
+    return [f for f in findings if str(f.get("status", "open")).lower() != "addressed"]
+
+
+def _owner_escalation_summary(
+    conn: sqlite3.Connection, assignee: str, pr: str,
+    cap_kind: str, cap: int, count: int, verdict_runs: list,
+) -> str:
+    """One paragraph for the owner: open findings, head SHA, CI status
+    (best-effort), and the three named options (merge / waive gate / close).
+    Never raises -- a PR/CI lookup failure degrades fields to 'unknown', it
+    never blocks the escalation itself."""
+    findings = _open_findings_from_runs(verdict_runs)
+    findings_txt = (
+        "; ".join(f"[{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')}" for f in findings)
+        if findings else "none recorded"
+    )
+    head_sha = "unknown"
+    ci_txt = "unknown"
+    pr_url = _pr_url_for_key(conn, pr)
+    if pr_url:
+        try:
+            from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
+            receipt = _kb_pr_acceptance.collect_acceptance(pr_url, pr_url, assignee=assignee)
+            head_sha = receipt.get("head_sha") or "unknown"
+            ci_txt = receipt.get("classification") or "unknown"
+        except Exception:  # pragma: no cover - CI lookup is advisory, never blocking
+            pass
+    if cap_kind == "real_rounds":
+        marker, reached = _REVIEW_CAP_MARKER, "3 real review rounds"
+    else:
+        marker, reached = _QUOTA_STALL_CAP_MARKER, "3 quota stalls (429s/stalls with no verdict)"
+    return (
+        f"{marker.capitalize()}: {assignee} hit {count} {cap_kind} on {pr} (cap {cap}; reached {reached}). "
+        f"Open findings: {findings_txt}. Head SHA: {head_sha}. CI: {ci_txt}. "
+        f"Options: (1) {_ESCALATION_OPTIONS[0]}, (2) {_ESCALATION_OPTIONS[1]}, (3) {_ESCALATION_OPTIONS[2]}."
+    )
+
+
+def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) -> int:
+    """When the card last (re)entered a spawnable lane: a card that went back to
+    the dev and returned must not look older than the verdict that sent it back."""
+    row = conn.execute(
+        "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind IN "
+        "('created', 'review_requested', 'changes_requested', 'promoted', 'unblocked', "
+        "'status', 'assigned', 'review_reopened')",
+        (task_id,),
+    ).fetchone()
+    return max(int(created_at or 0), int((row["t"] if row else 0) or 0))
+
+
+def _block_review_for_owner(conn: sqlite3.Connection, task_id: str, status: str, reason: str) -> None:
+    # block_task only transitions running/ready; a review-lane card is parked
+    # in ready first so the owner's unblock returns it to a spawnable lane.
+    if status == "review":
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'review'", (task_id,))
+    _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+
+
+def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool) -> Optional[str]:
+    """Return a skip reason for a review-gate spawn that would waste a paid
+    review, else None. Fails open (None) on any error: this is a cost control,
+    not a safety check."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT title, body, created_at, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        keys = _card_pr_keys(row["title"], row["body"])
+        if not keys:
+            return None
+        pr = min(keys)
+        # 1. Another card for the same PR is being reviewed by this gate right now.
+        for other in conn.execute(
+            "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
+            (task_id, assignee),
+        ).fetchall():
+            if _card_pr_keys(other["title"], other["body"]) & keys:
+                return "duplicate_review_running"
+        runs = _review_verdict_runs(conn, assignee, keys)
+        quota_runs = _review_quota_stalls(conn, assignee, keys)
+        # 2. This gate already gave a verdict on this PR after this card entered its lane.
+        entered = _lane_entry_time(conn, task_id, row["created_at"])
+        newer = [r for r in runs if r["task_id"] != task_id and int(r["ended_at"]) > entered]
+        if newer:
+            if not dry_run:
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    f"Duplicate review card: {assignee} already reviewed {pr} after this card was "
+                    f"queued (card {newer[-1]['task_id']}). Archived so the same round is not paid "
+                    "for twice. Unarchive it if it asks for something different.",
+                )
+                _kb.archive_task(conn, task_id)
+            return "duplicate_review_superseded"
+        # 3. Two independent round caps, owner decides whether a further round is worth
+        # it either way: a REAL round (a gate actually reviewed and gave an outcome --
+        # owner-tunable per PR via _REVIEW_ROUND_CAP_BY_PR, unchanged) or a QUOTA STALL
+        # (a spawn that 429'd/was scheduled before producing a verdict -- new, fixed cap,
+        # no owner overrides yet since nothing has needed one).
+        real_cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
+        if len(runs) >= real_cap:
+            cap_kind, cap, count, marker, relevant_runs = (
+                "real_rounds", real_cap, len(runs), _REVIEW_CAP_MARKER, runs,
+            )
+        elif len(quota_runs) >= _QUOTA_STALL_CAP:
+            cap_kind, cap, count, marker, relevant_runs = (
+                "quota_stalls", _QUOTA_STALL_CAP, len(quota_runs), _QUOTA_STALL_CAP_MARKER, quota_runs,
+            )
+        else:
+            return None
+        unblocked = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (task_id,),
+        ).fetchone()
+        capped = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+            "AND payload LIKE ?",
+            (task_id, f"%{marker}%"),
+        ).fetchone()
+        ok_at = int((unblocked["t"] if unblocked else 0) or 0)
+        cap_at = int((capped["t"] if capped else 0) or 0)
+        if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in relevant_runs):
+            return None  # owner unblocked after this cap: exactly one more round
+        if not dry_run:
+            summary = _owner_escalation_summary(conn, assignee, pr, cap_kind, cap, count, runs)
+            _block_review_for_owner(conn, task_id, row["status"], summary)
+        return "review_round_cap"
+    except Exception as exc:  # pragma: no cover - cost gate must never stop the dispatcher
+        _kb._log.warning("review cost gate skipped for %s: %s", task_id, exc)
+        return None
+# --- end review cost gate -----------------------------------------------------
+
+
+# --- Rule 3: structured findings + delta-only review after round 1 ------------
+# (ADR "review-loop convergence", card t_f526b652). Findings are stored by the
+# reviewer/release-reviewer SOUL in each verdict run's ``task_runs.metadata`` as
+# ``{"findings": [{"id", "severity", "file", "line", "status"}, ...], "reviewed_sha": "..."}``.
+_BLOCKING_SEVERITIES = {"MAJOR", "CRITICAL", "BLOCKER"}
+
+
+def _findings_from_metadata(metadata: Optional[str]) -> list:
+    """Parse the ``findings`` list a verdict run stored in its ``metadata``.
+    Empty on any parse failure or absence -- advisory data, never load-bearing."""
+    meta = _kb._json_dict(metadata) if metadata else {}
+    findings = meta.get("findings")
+    return findings if isinstance(findings, list) else []
+
+
+def should_block_on_findings(findings: list) -> bool:
+    """Round >= 2 blocking rule: only a MAJOR-or-higher finding blocks approval.
+    MINOR/NIT are advisory, surfaced in the PR comment but never blocking."""
+    return any(str(f.get("severity", "")).upper() in _BLOCKING_SEVERITIES for f in findings)
+
+
+def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Round >= 2 handoff text: the SHA the prior verdict reviewed plus the prior
+    findings' open/addressed status -- NEVER a "review it all again" instruction.
+    Returns None on round 1 (no prior verdict yet on this PR), so the caller falls
+    back to a normal full review."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    keys = _card_pr_keys(row["title"], row["body"])
+    if not keys:
+        return None
+    runs = _review_verdict_runs(conn, assignee, keys)
+    if not runs:
+        return None  # round 1: no prior verdict, do a normal full review
+    prior = runs[-1]
+    meta = _kb._json_dict(prior["metadata"]) if prior["metadata"] else {}
+    since_sha = meta.get("reviewed_sha")
+    findings = _findings_from_metadata(prior["metadata"])
+    lines = [
+        "Round >= 2 review: this gate already gave a verdict on this PR. Review ONLY the "
+        "diff since the prior verdict's reviewed SHA plus the prior findings below -- do "
+        "not re-review the whole PR from scratch.",
+    ]
+    if since_sha:
+        lines.append(f"Diff since reviewed SHA: {since_sha}")
+    if findings:
+        lines.append("Prior findings (mark each addressed/open in your verdict):")
+        for f in findings:
+            lines.append(
+                f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
+                f"{f.get('id', '')} -- {f.get('status', 'open')}"
+            )
+        lines.append(
+            "Only a MAJOR-or-higher finding may block approval; MINOR/NIT are advisory, "
+            "not blocking -- say so explicitly in the PR comment."
+        )
+    else:
+        lines.append("No prior findings were recorded.")
+    return "\n".join(lines)
+
+
+# --- Rule 5: fallback model for low-risk/text-only review PRs -----------------
+_LOW_RISK_PATH_RE = re.compile(
+    r"(^|/)(docs/|tests/)|\.md$|(^|/)\.github/workflows/|(^|/)\.github/[^/]*\.ya?ml$",
+    re.IGNORECASE,
+)
+_SMALL_PR_LINES = 30  # reuse release-reviewer SOUL.md's existing small_pr threshold
+
+
+def _is_low_risk_review(task, pr_meta: dict) -> bool:
+    """True only for a non-capital, docs/tests/CI-only, small PR -- the ONLY class
+    the dispatcher may ever substitute a fallback model for (Rule 5). Capital-sensitive
+    PRs never qualify, regardless of size or file list -- hard rule, unchanged."""
+    if _is_capital_review(task):
+        return False
+    files = pr_meta.get("files") or []
+    if not files:
+        return False  # unknown file list: fail closed, never low-risk
+    if not all(_LOW_RISK_PATH_RE.search(f) for f in files):
+        return False
+    if any(marker in f.lower() for f in files for marker in _CAPITAL_DENY_SUBSTRINGS):
+        return False
+    additions = int(pr_meta.get("additions") or 0)
+    deletions = int(pr_meta.get("deletions") or 0)
+    return (additions + deletions) <= _SMALL_PR_LINES
+
+
+def _required_gate_unavailable(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
+    """The exact error text when the latest run against this task's REQUIRED gate
+    model is CONFIRMED unavailable (quota/429, auth revoked, infra refusal) -- never
+    merely slow (OWNER-RULES #3). None when the gate looks reachable."""
+    row = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["outcome"] not in ("spawn_failed", "rate_limited"):
+        return None
+    if row["outcome"] == "spawn_failed" and not _kb._json_dict(row["metadata"]).get("infrastructure"):
+        return None
+    return _kb._lossy_text(row["error"]) or row["outcome"]
+
+
+def _review_fallback_model() -> Optional[tuple]:
+    """``auxiliary.review_fallback`` (model, provider), or None when unset."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        cfg = (load_user_config_effective(fail_closed=True) or {}).get("auxiliary", {})
+        fallback = cfg.get("review_fallback") or {}
+    except Exception:
+        return None
+    model = (fallback.get("model") or "").strip()
+    if not model:
+        return None
+    provider = (fallback.get("provider") or "").strip()
+    if not provider or provider == "auto":
+        provider = "anthropic"
+    return (model, provider)
+
+
+def _maybe_review_fallback_model(conn: sqlite3.Connection, task, assignee: str,
+                                  pr_meta: Optional[dict] = None) -> Optional[tuple]:
+    """Rule 5: only for a low-risk review PR, only when the REQUIRED gate model is
+    confirmed unavailable, substitute ``auxiliary.review_fallback`` and disclose it
+    on the card. Capital-sensitive PRs never fall back -- enforced by
+    ``_is_low_risk_review`` itself, not re-checked here."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    if not _is_low_risk_review(task, pr_meta or {}):
+        return None
+    err = _required_gate_unavailable(conn, getattr(task, "id", None))
+    if err is None:
+        return None
+    fallback = _review_fallback_model()
+    if fallback is None:
+        return None
+    _kb.add_comment(
+        conn, task.id, "dispatcher",
+        f"Review gate model unavailable ({err}); this low-risk PR (docs/tests/CI-only, "
+        f"<= {_SMALL_PR_LINES} changed lines) ran on the configured fallback "
+        f"`{fallback[0]}` instead -- owner, please read the diff.",
+    )
+    return fallback
+# --- end Rules 3 & 5 -----------------------------------------------------------
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1576,7 +2017,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, title, body FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1656,6 +2097,221 @@ def check_respawn_guard(
         return "active_pr"
 
     return None
+
+
+def review_dedupe_enabled() -> bool:
+    """Whether a review-column respawn first checks :func:`_review_head_unchanged`
+    and replays a prior verdict instead of re-running the model when the PR's
+    head SHA and findings are unchanged. Default true; disable for boards
+    where every review-lane spawn must re-run regardless (code-level default
+    only — not a live config.yaml write).
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool((load_config() or {}).get("kanban", {}).get("review_dedupe", True))
+    except Exception:
+        return True
+
+
+_REVIEW_DEDUPE_PR_URL_RE = _RESPAWN_GUARD_PR_URL_RE
+
+
+def _task_pr_contract(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Most recent GitHub PR URL mentioned in any comment on ``task_id``, or
+    ``None``. Same signal :func:`check_respawn_guard`'s ``active_pr`` branch
+    uses to recognize "a PR already exists for this card" — reused here to
+    find WHICH PR a reviewer verdict is about. There is no dedicated
+    ``_card_pr_keys`` helper in this codebase; comments are the durable place
+    a worker records the PR it opened.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        match = _REVIEW_DEDUPE_PR_URL_RE.search(_kb._lossy_text(row["body"]) or "")
+        if match:
+            return match.group(0)
+    return None
+
+
+def _review_head_unchanged(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+) -> tuple[bool, Optional[dict]]:
+    """``(True, prior_verdict)`` when ``reviewer_profile``'s prior verdict on
+    this task is still current for the PR's LIVE head SHA — the caller should
+    replay it instead of spawning a fresh reviewer. Otherwise ``(False,
+    None)``: spawn for real.
+
+    Calls :func:`hermes_cli.kanban_pr_acceptance.fetch_pr_head_sha` AT MOST
+    ONCE (one live GraphQL round trip per spawn attempt). Fails open — returns
+    ``(False, None)`` — whenever anything is ambiguous: ``review_dedupe``
+    disabled, no prior verdict (first review always runs), that verdict's
+    metadata has no ``head_sha`` (old data model), no PR reference found on
+    the task, the live head SHA cannot be resolved (network/auth/private
+    repo/closed PR), the live head SHA differs from the verdict's, or a new
+    task comment landed after the verdict closed.
+
+    "No new findings" has no structured findings schema in this codebase
+    yet, so it is judged via comments, not every task event: the normal
+    re-review cycle (implementer does more work at the SAME head and calls
+    ``kanban_request_review`` again — exactly the case this guard exists
+    for) itself produces a ``review_requested`` event, a ``claimed`` event,
+    and an ``assigned`` event strictly after the prior verdict's
+    ``ended_at`` — counting those as "new activity" would make the guard
+    never fire. A durable task comment (the channel ``sdlc-review``'s own
+    procedure uses for reviewer findings and the one a human would use to
+    raise something new) is the signal actually worth failing open on.
+    False positives here (wrongly skipping a real review) are far more
+    expensive than false negatives (an extra, harmless re-review), so every
+    ambiguous branch still spawns for real.
+    """
+    if not review_dedupe_enabled():
+        return False, None
+
+    prior = conn.execute(
+        "SELECT outcome, summary, metadata, ended_at FROM task_runs "
+        "WHERE task_id = ? AND profile = ? AND outcome IN ('completed', 'changes_requested') "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id, reviewer_profile),
+    ).fetchone()
+    if prior is None:
+        return False, None  # first review always runs
+
+    prior_metadata = _kb._json_dict(prior["metadata"])
+    prior_head_sha = prior_metadata.get("head_sha")
+    if not isinstance(prior_head_sha, str) or not prior_head_sha.strip():
+        return False, None  # no declared head_sha (old data model) -- spawn for real
+
+    contract = _task_pr_contract(conn, task_id)
+    if not contract:
+        return False, None  # no PR reference found -- spawn for real
+
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    live_sha = fetch_pr_head_sha(contract, assignee=reviewer_profile)
+    if not live_sha or live_sha != prior_head_sha:
+        # Unresolvable (fail CLOSED) or the head moved -- spawn for real either way.
+        return False, None
+
+    ended_at = _kb._to_epoch(prior["ended_at"])
+    if ended_at is None:
+        return False, None
+    now = int(time.time())
+    # A comment strictly after the verdict closed is treated as a possible new
+    # finding (a human, or the reviewer's own procedure, surfaces findings via
+    # comments). An unreadable timestamp counts as "newer" -- fail closed,
+    # never silently lift the dedupe.
+    if any(_rows_since(conn, "task_comments", task_id, ended_at, strict=True, unreadable=now)):
+        return False, None
+
+    return True, {
+        "summary": prior["summary"],
+        "outcome": prior["outcome"],
+        "metadata": prior_metadata,
+    }
+
+
+def _replay_review_dedupe_verdict(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+    prior_verdict: dict, head_sha: Optional[str],
+) -> bool:
+    """Resolve a review-column task WITHOUT spawning a new reviewer run: the
+    PR's head SHA and findings are unchanged since ``reviewer_profile``'s
+    prior verdict (:func:`_review_head_unchanged`), so this replays that
+    verdict's outcome by hand instead of re-running the model.
+
+    - ``completed`` replays via :func:`hermes_cli.kanban_db.complete_task` —
+      the exact same ``review -> done`` path a human review approval takes
+      (``kanban_db.py`` ~2660; it already accepts ``review`` with no active
+      claim and synthesizes the closing run itself).
+    - ``changes_requested`` has no reusable top-level function: the real
+      :func:`hermes_cli.kanban_db.request_changes` (``kanban_db.py`` ~3432)
+      requires an ACTIVE run claimed from ``review`` — there is none here,
+      since no worker ran this tick. Its ``review -> implementer`` state
+      transition is reproduced by hand below: same target status
+      (``_landing_status_after_parents``), same implementer lookup (latest
+      ``review_requested`` event), same claim-clearing columns, closed with
+      a synthesized run (:func:`hermes_cli.kanban_db._synthesize_ended_run`)
+      instead of ``_end_run`` because there is no active run to end.
+
+    Either branch appends a ``review_dedupe_replayed`` event so the board
+    shows why no new worker spawned. Returns ``True`` on a successful
+    replay; ``False`` if the task changed out from under us (caller should
+    treat this tick as a no-op — it will be retried fresh next tick).
+    """
+    summary = f"[replayed, head unchanged] {prior_verdict.get('summary') or ''}".strip()
+    metadata = prior_verdict.get("metadata") or {}
+    outcome = prior_verdict.get("outcome")
+
+    if outcome == "completed":
+        ok = _kb.complete_task(conn, task_id, summary=summary, metadata=metadata)
+        if not ok:
+            return False
+        with _kb.write_txn(conn):
+            run_row = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=int(run_row["id"]) if run_row else None,
+            )
+        return True
+
+    if outcome == "changes_requested":
+        with _kb.write_txn(conn):
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if task_row is None or task_row["status"] != "review":
+                return False
+            requested_event = _kb._latest_event(conn, task_id, "review_requested")
+            implementer = None
+            if requested_event is not None:
+                implementer = _kb._nonblank_str(
+                    _kb._json_dict(_kb._row_get(requested_event, "payload")).get("implementer"),
+                )
+            if implementer is None:
+                return False
+            new_status = _kb._landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       assignee = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL, worker_started_at = NULL
+                 WHERE id = ? AND status = 'review'
+                """,
+                (new_status, implementer, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _kb._synthesize_ended_run(
+                conn, task_id, outcome="changes_requested", summary=summary, metadata=metadata,
+                profile=reviewer_profile,
+            )
+            _kb._append_event(
+                conn, task_id, "changes_requested",
+                {
+                    "reason": summary,
+                    "implementer": implementer,
+                    "reviewer": reviewer_profile,
+                    "status": new_status,
+                    "replayed": True,
+                },
+                run_id=run_id,
+            )
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=run_id,
+            )
+        return True
+
+    return False
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
@@ -2098,6 +2754,10 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    cost_reason = _review_cost_gate(conn, task_id, assignee, dry_run=dry_run)
+    if cost_reason is not None:
+        result.respawn_guarded.append((task_id, cost_reason))
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2112,6 +2772,23 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Review-lane dedupe: check_respawn_guard never guards the review lane (it is
+    # the handoff's INPUT, not a duplicate-work signal — see its docstring), so this
+    # is the dedicated check for "nothing has changed since the last reviewer
+    # verdict" (#review_dedupe). Only a real check — no DB write — so dry_run can
+    # safely skip the spawn attribution below without the replay side effects.
+    if lane == "review" and not dry_run:
+        unchanged, prior_verdict = _review_head_unchanged(conn, task_id, assignee)
+        if unchanged and prior_verdict is not None:
+            head_sha = (prior_verdict.get("metadata") or {}).get("head_sha")
+            if _replay_review_dedupe_verdict(conn, task_id, assignee, prior_verdict, head_sha):
+                # Resolved without spawning a worker -- the task left ``review``
+                # (approved -> done, or changes_requested -> back to the implementer),
+                # so it is never stuck waiting for a tick that will never come.
+                return False
+            # State changed out from under us (e.g. raced with a real claim) --
+            # fall through and let the normal claim/spawn path below handle it.
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -2148,6 +2825,18 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        # Rule 3: round >= 2 gets a delta-only handoff (diff since the prior
+        # verdict's SHA + prior findings open/addressed), never a full re-review.
+        delta_context = build_round_delta_context(conn, claimed.id, assignee)
+        if delta_context is not None:
+            _kb.add_comment(conn, claimed.id, "dispatcher", delta_context)
+        # Rule 5: only a low-risk (docs/tests/CI-only, small) PR, and only when the
+        # required gate model is confirmed unavailable, may run on a fallback model.
+        # Capital-sensitive PRs never fall back (_is_low_risk_review enforces it).
+        if not claimed.model_override:
+            fallback = _maybe_review_fallback_model(conn, claimed, assignee)
+            if fallback is not None:
+                claimed.model_override, claimed.provider_override = fallback
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2230,6 +2919,10 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Quota/429 backoff timer sweep — runs BEFORE recompute_ready /
+    # ready_rows so a card whose resume_at just came due is spawnable in
+    # this same tick, not one tick later.
+    result.scheduled_promoted = _kb.recompute_scheduled(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2317,6 +3010,18 @@ def _any_spawnable_review(
     assignee already at the per-profile cap, or respawn-guarded — cannot
     consume the reservation, so it must not withhold capacity from an
     otherwise ready task (one such row would pin ``ready_budget`` to 0).
+
+    A row that :func:`_dispatch_lane_task` would instead DEDUPE (replay a
+    prior verdict — see :func:`_review_head_unchanged`) is treated as
+    spawnable here, not skipped: ``_dispatch_lane_task`` resolves it in the
+    SAME tick it is reached (no claim/worker involved), so reserving its
+    slot costs at most one wasted ready-lane slot for one tick, while NOT
+    reserving it risks the opposite — a sustained ready backlog consuming
+    the full ``spawn_budget`` before the review loop runs, so the dedupe row
+    never reaches ``_dispatch_lane_task`` this tick (the loop breaks on
+    ``spawned >= spawn_budget`` BEFORE calling it) and the already-decided
+    verdict sits unreplayed for another tick. Treating it as spawnable keeps
+    the review lane always making progress, which is the safer default.
     """
     if not review_rows:
         return False

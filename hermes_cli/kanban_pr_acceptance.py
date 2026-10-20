@@ -55,6 +55,48 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
     return value
 
 
+def fetch_pr_head_sha(contract: str, published_pr: str | None = None, assignee: str | None = None) -> str | None:
+    """Live head SHA for the PR named by ``contract``/``published_pr``, or ``None``.
+
+    Minimal sibling of :func:`collect_acceptance`: a single GraphQL round
+    trip for just ``headRefOid``, skipping the required-checks machinery
+    entirely. Used by the review-dedupe guard (``kanban_db_dispatch``) to
+    decide whether a prior reviewer verdict is still current — that guard
+    must fail CLOSED (spawn a real reviewer) whenever this cannot prove the
+    head SHA, so every failure mode here (bad contract, private repo,
+    closed PR, network/auth error) returns ``None`` rather than raising.
+    """
+    try:
+        profile_home = _assignee_profile_home(assignee)
+        declared = _PR.fullmatch(contract)
+        url = contract if declared else published_pr
+        match = _PR.fullmatch(url or "")
+        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+            return None
+        repo, number = match[1], int(match[2])
+        owner, name = repo.split("/")
+        query = (
+            f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{'
+            f'pullRequest(number:{number:d}){{headRefOid state}}}}}}'
+        )
+        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+        if repository is None:
+            return None
+        pr = repository.get("pullRequest")
+        if pr is None:
+            return None
+        sha = pr.get("headRefOid")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None
+        if pr.get("state") not in {"OPEN", "MERGED"}:
+            return None
+        return sha
+    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        # Never raise into a dispatcher tick: any resolution failure here must
+        # fail closed into "spawn for real", never into a silent skip.
+        return None
+
+
 class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not

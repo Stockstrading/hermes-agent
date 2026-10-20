@@ -11,8 +11,10 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -849,6 +851,32 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
+_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=(\S+)")
+
+
+def _parse_scheduled_until(reason: Optional[str]) -> Optional[int]:
+    """Extract the ``SCHEDULED_UNTIL=<ISO8601>`` wake-up marker this tool's
+    own schema documents and convert it to epoch seconds for
+    ``schedule_task``'s ``resume_at``. ``None`` (no marker, or an
+    unparsable/past timestamp logged and ignored) keeps the legacy
+    park-forever behaviour — a malformed marker must never silently drop
+    the task into dispatchable 'ready' immediately."""
+    if not reason:
+        return None
+    m = _SCHEDULED_UNTIL_RE.search(reason)
+    if not m:
+        return None
+    raw = m.group(1)
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning("kanban_schedule: unparsable SCHEDULED_UNTIL marker %r, ignoring", raw)
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return int(dt.timestamp())
+
+
 @_kanban_handler("kanban_schedule")
 def _handle_schedule(args: dict, **kw) -> str:
     """Park the current task until an orchestrator re-gates it."""
@@ -856,6 +884,7 @@ def _handle_schedule(args: dict, **kw) -> str:
     raw_reason = args.get("reason")
     _check(raw_reason is None or isinstance(raw_reason, str), "reason must be a string")
     reason = _redact(raw_reason.strip()) if raw_reason and raw_reason.strip() else None
+    resume_at = _parse_scheduled_until(reason)
     with _board(args.get("board")) as (kb, conn):
         # The goal loop treats ``scheduled`` as terminal like ``blocked``, so
         # parking would bypass the completion judge (see kanban_block, #38696).
@@ -865,7 +894,7 @@ def _handle_schedule(args: dict, **kw) -> str:
                f"in {sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} for a genuine external "
                "blocker, or kanban_complete so the completion judge can evaluate it.")
         ok = kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), resume_at=resume_at)
         _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
 
@@ -922,9 +951,14 @@ def _handle_request_changes(args: dict, **kw) -> str:
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
         _require_text(args, "reason", "reason is required — describe the changes needed"))
+    metadata = args.get("metadata")
+    _require_dict_metadata(metadata)
+    if metadata is not None:
+        metadata = _redact_metadata(metadata)
+        _check(metadata is not None, "metadata could not be safely serialized")
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+            conn, tid, reason=reason, expected_run_id=_worker_run_id(tid), metadata=metadata)
         _check(ok, f"could not request changes for {tid}: {detail or 'invalid review state'}")
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 

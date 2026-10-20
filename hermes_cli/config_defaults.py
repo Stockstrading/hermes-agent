@@ -807,6 +807,13 @@ DEFAULT_CONFIG = {
         # kanban_decomposer emits a JSON graph of child tasks (more tokens).
         "triage_specifier": _aux(120),
         "kanban_decomposer": _aux(180),
+        # Rule 5 (review-loop convergence ADR): the ONLY fallback the dispatcher may
+        # substitute for a review/release-reviewer gate, and only when (a) the task's
+        # PR is low-risk (docs/tests/CI-only, <= small_pr threshold, non-capital) and
+        # (b) the REQUIRED gate model is confirmed unavailable (quota/429, auth
+        # revoked) -- never merely slow. Capital-sensitive PRs never fall back,
+        # regardless of this setting. Unset (empty model) = no fallback, ever.
+        "review_fallback": _aux(180),
         "profile_describer": _aux(60),   # 1-2 sentence profile blurb; short, cheap
         "goal_judge": _aux(60),          # /goal satisfaction + contract drafting; JSON calls
         # Curator skill-usage review can take minutes on reasoning models (umbrellas over hundreds
@@ -1912,11 +1919,21 @@ DEFAULT_CONFIG = {
         # Auto-claim tasks in the review column and spawn the assigned profile with the bundled
         # sdlc-review skill. Disable where every review is done manually from the dashboard.
         "review_dispatch": True,
+        # Skip re-spawning a reviewer for a review-column card whose PR head SHA and
+        # findings are unchanged since the last reviewer verdict (completed/changes_requested).
+        # Replays the prior verdict instead of re-running the model. Disable to always
+        # re-review every dispatcher tick (pre-existing behavior).
+        "review_dedupe": True,
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Same-reason block -> unblock -> re-block cycles before a card is escalated from
+        # 'blocked' to 'triage' with a block_loop_detected event (the human-gated escalation;
+        # see hermes_cli.kanban_db.BLOCK_RECURRENCE_LIMIT / _resolve_block_recurrence_limit).
+        # Counts unblock recurrences, NOT dispatcher failures (that's failure_limit above).
+        "block_recurrence_limit": 2,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
@@ -1927,6 +1944,14 @@ DEFAULT_CONFIG = {
         # Assignee when the orchestrator can't match one to an installed profile; "" = default
         # profile. A task never ends up with assignee=None.
         "default_assignee": "",
+        # Profiles that only ever do review work (never implementation). Rule 6 of the
+        # review-loop-convergence ADR (card t_f526b652): decompose/specify classify each card as
+        # a "review request" (title starts with a review verb, or body names an existing PR) vs.
+        # not, and flag — log-only for now, see kanban_specify._routing_guard_mismatch — any
+        # mismatch between this list and the LLM's chosen assignee, in either direction. Rewriting
+        # the assignee instead of just logging is a follow-up once the false-positive rate from
+        # the log-only phase is seen (owner decision, t_4f89767e).
+        "review_only_profiles": ["reviewer", "release-reviewer"],
         # Global cap: positive int = the HOST never has more than N tasks 'running' across all
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.
