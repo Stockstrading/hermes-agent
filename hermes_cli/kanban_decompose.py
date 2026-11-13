@@ -86,9 +86,10 @@ Rules:
     "parents" still expresses ordering for tasks that are not independent,
     but prefer splits that need NO parent link at all.
   - This is a size ESTIMATE from the task description, not a measurement —
-    the CI `pr-size` gate is the actual backstop. When in doubt, split; an
-    unnecessary split costs one extra small PR, a missed split costs a
-    400-800-line PR bounced back to be split after the fact.
+    there is no CI backstop yet (ADR-026 §12's staged pr-size gate is not
+    built), so this estimate is the only check until one ships. When in
+    doubt, split; an unnecessary split costs one extra small PR, a missed
+    split costs a 400-800-line PR bounced back to be split after the fact.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
