@@ -256,3 +256,62 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_schema_endpoint_ui_task_fans_into_ordered_children(kanban_home):
+    """ADR-026 §10: a task describing a schema change + new endpoint + UI
+    screen should fan into >=3 ordered children (refactor/schema -> wiring
+    -> UI), each independently mergeable. The split order itself is an LLM
+    judgement call the prompt only advises on (§5) — this test proves the
+    decompose plumbing honours whatever ordered split the LLM returns: child
+    count >=3, parent edges express the stated sequence, and no two
+    independent-by-design tasks are forced to share a parent edge."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="add watchlist sync: schema + endpoint + UI screen",
+            body=(
+                "Add a watchlist_sync table (schema/contract change), a new "
+                "FastAPI endpoint to read/write it, and a React Native screen "
+                "that calls the endpoint."
+            ),
+            triage=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "schema, then the endpoint wiring, then the UI screen",
+        "tasks": [
+            {"title": "add watchlist_sync schema", "body": "migration",
+             "assignee": "backend-dev", "parents": []},
+            {"title": "wire watchlist endpoint", "body": "FastAPI route",
+             "assignee": "backend-dev", "parents": [0]},
+            {"title": "watchlist screen", "body": "RN screen",
+             "assignee": "frontend-dev", "parents": [1]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "backend-dev", "frontend-dev"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+    assert outcome.child_ids and len(outcome.child_ids) >= 3
+
+    with kbc.connect() as conn:
+        children = [kb.get_task(conn, cid) for cid in outcome.child_ids]
+
+    # First (schema) child has no parent, so it is immediately ready; the
+    # endpoint and UI children are ordered after it per the stated sequence.
+    assert children[0].status == "ready"
+    assert children[1].status == "todo"
+    assert children[2].status == "todo"
+    assert children[0].assignee == "backend-dev"
+    assert children[2].assignee == "frontend-dev"
+
+

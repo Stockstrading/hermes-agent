@@ -74,6 +74,21 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - If the described work plausibly exceeds 400 changed app-code lines, or
+    touches more than one of {schema/contract, new behaviour, wiring/flag-flip,
+    cleanup/refactor}, split it into ordered child tasks along these seams,
+    in this preference order: (1) pure refactor/move, no behaviour change,
+    alone; (2) schema or contract change; (3) behaviour gated behind a flag
+    that defaults OFF; (4) the wiring/flag-flip that turns it on; (5) cleanup.
+    Tests travel with the code they test, as part of the SAME child task that
+    wrote them — never a separate "tests" task. Docs/ADR writing is its own
+    child task. Each child must be independently mergeable (its own PR) —
+    "parents" still expresses ordering for tasks that are not independent,
+    but prefer splits that need NO parent link at all.
+  - This is a size ESTIMATE from the task description, not a measurement —
+    the CI `pr-size` gate is the actual backstop. When in doubt, split; an
+    unnecessary split costs one extra small PR, a missed split costs a
+    400-800-line PR bounced back to be split after the fact.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:

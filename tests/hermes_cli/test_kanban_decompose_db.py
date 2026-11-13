@@ -11,6 +11,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_graph import decompose_triage_task
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_decompose as decomp
 
 
 @pytest.fixture
@@ -90,5 +91,31 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_system_prompt_has_small_pr_split_rule():
+    """Regression guard for ADR-026 §5: the pre-code split-rule paragraph
+    must stay present in the decomposer's system prompt, in the preference
+    order the ADR specifies. Catches an accidental edit/drop of the
+    paragraph, not its exact wording.
+    """
+    prompt = decomp._SYSTEM_PROMPT
 
+    assert "400 changed app-code lines" in prompt
+    assert "schema/contract" in prompt
+    assert "wiring/flag-flip" in prompt
+    assert "cleanup/refactor" in prompt
+
+    # Preference order: refactor -> schema -> flag-off behaviour -> wiring -> cleanup.
+    order_markers = [
+        "pure refactor/move",
+        "schema or contract change",
+        "behaviour gated behind a flag",
+        "the wiring/flag-flip that turns it on",
+        "(5) cleanup.",
+    ]
+    positions = [prompt.index(marker) for marker in order_markers]
+    assert positions == sorted(positions)
+
+    assert "Tests travel with the code they test" in prompt
+    assert "Docs/ADR writing is its own" in prompt
+    assert "independently mergeable" in prompt
 
