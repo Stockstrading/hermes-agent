@@ -5,10 +5,21 @@ from contextlib import closing
 from dataclasses import asdict, replace
 import threading
 import json
+import logging
 from pathlib import Path
 import sqlite3
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
+
+# The review lane always force-loads this skill (kanban.md policy), regardless of the task's own
+# ``skills`` list. It is a convenience preload, not a hard requirement — the kanban lifecycle
+# itself ships in every worker's system prompt via KANBAN_GUIDANCE, so a reviewer that cannot
+# resolve it still has everything it needs to review and must not crash out for that alone
+# (#t_3d8b302d: a stale/unavailable copy exited the worker with "Unknown skill(s): sdlc-review"
+# before a single turn ran, failing the card out from under the dispatcher).
+REVIEW_FORCED_SKILL = 'sdlc-review'
 
 
 def build_kanban_policy(connection, params, config):
@@ -43,9 +54,13 @@ def build_kanban_policy(connection, params, config):
                 raise RuntimeStoreError('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
             skills = list(task.skills or ())
+            forced_review_skill = None
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
-                skills = list(dict.fromkeys([*skills, 'sdlc-review']))
+                # Tracked separately so a failure to resolve it never raises kanban_skills_unavailable
+                # (_run_task_turns) — only the task's OWN requested skills are a hard requirement.
+                forced_review_skill = REVIEW_FORCED_SKILL
+                skills = list(dict.fromkeys([*skills, forced_review_skill]))
     except (ValueError, OSError, sqlite3.Error) as exc:
         raise RuntimeStoreError('invalid_kanban_claim') from exc
     cwd = task.workspace_path
@@ -60,7 +75,8 @@ def build_kanban_policy(connection, params, config):
         policy = replace(policy, model=_resolve_gateway_model(policy.config()))
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
-        skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
+        skills=skills, own_skills=list(task.skills or ()), forced_review_skill=forced_review_skill,
+        goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
     context['db'] = str(path)
@@ -350,10 +366,28 @@ def worker_exit_code(path, params):
 
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
-    skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
+    forced = context.get('forced_review_skill')
+    # own_skills is the task's pre-union requested-skills list, captured in build_kanban_policy
+    # before the review lane's forced skill was unioned in (#t_3d8b302d). Filtering the merged
+    # `skills` list by value equality to `forced` would also strip a task that genuinely requests
+    # the same skill name as a hard requirement, silently downgrading it to fail-open.
+    own_skills = context.get('own_skills', context['skills'])
+    skills_prompt, loaded, missing = build_preloaded_skills_prompt(own_skills, task_id=agent.session_id)
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
-    prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
+    if forced:
+        # Fail-open: the review lane's force-loaded skill is a convenience preload, not a hard
+        # requirement (KANBAN_GUIDANCE already carries the kanban lifecycle). A stale/unresolvable
+        # copy must not crash the review turn before it starts (#t_3d8b302d).
+        forced_prompt, _forced_loaded, forced_missing = build_preloaded_skills_prompt(
+            [forced], task_id=agent.session_id, excluded_loaded_names=set(loaded))
+        if forced_missing:
+            logger.warning(
+                'kanban review lane: forced skill %r unavailable for task %s (%s); continuing without it',
+                forced, context['task_id'], forced_missing)
+        elif forced_prompt:
+            skills_prompt = '\n\n'.join(p for p in (skills_prompt, forced_prompt) if p)
+    prompt = '\n\n'.join(p for p in (skills_prompt, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history)
 
     def recover(nudge):
