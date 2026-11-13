@@ -1845,6 +1845,14 @@ MEMORY_GUARD_MB_PER_WORKER = 512
 DERIVED_MAX_IN_PROGRESS_FLOOR = 2
 DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
+# Systemd worker resource isolation (per-worker cgroup caps).
+# MemoryMax: cgroup v2 absolute memory limit per worker process.
+# Default: 1024 MB (1 GiB). Set kanban.worker_memory_mb to override.
+WORKER_MEMORY_DEFAULT_MB = 1024
+# CPUQuota: systemd cgroup v1 CPU quota as percentage (e.g. "100%" = 1 full CPU).
+# Default: 100% (1 core). Set kanban.worker_cpu_quota to override.
+WORKER_CPU_QUOTA_DEFAULT = "100%"
+
 
 def _system_memory_sample() -> dict:
     """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
@@ -2714,6 +2722,64 @@ def _open_worker_log(task: Task, board: Optional[str]):
     return open(log_path, "ab")
 
 
+def _get_worker_resource_config() -> tuple[int, str]:
+    """Read kanban.worker_memory_mb and kanban.worker_cpu_quota from config.
+
+    Returns (memory_mb, cpu_quota_str) with sensible defaults. Called once per
+    spawn to allow runtime config updates.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        kanban = cfg.get("kanban", {})
+        mem_mb = kanban.get("worker_memory_mb") or WORKER_MEMORY_DEFAULT_MB
+        cpu_quota = kanban.get("worker_cpu_quota") or WORKER_CPU_QUOTA_DEFAULT
+        # Validate and clamp
+        if not isinstance(mem_mb, int) or mem_mb < 64:
+            mem_mb = WORKER_MEMORY_DEFAULT_MB
+        if not isinstance(cpu_quota, str):
+            cpu_quota = WORKER_CPU_QUOTA_DEFAULT
+        return int(mem_mb), str(cpu_quota)
+    except Exception:
+        return WORKER_MEMORY_DEFAULT_MB, WORKER_CPU_QUOTA_DEFAULT
+
+
+def _wrap_worker_with_systemd_scope(task: Task, command: list[str]) -> list[str]:
+    """Wrap a worker command with systemd-run for resource isolation (Unix only).
+
+    Returns a new command list: if systemd-run is available, wraps the original
+    command in [systemd-run --user --scope -p MemoryMax=<N>M -p CPUQuota=<Q> --]
+    to enforce per-worker cgroup memory and CPU limits. On Windows or when
+    systemd is unavailable, returns the command unchanged.
+
+    The memory and CPU limits are configurable via kanban.worker_memory_mb and
+    kanban.worker_cpu_quota (see config_defaults.py).
+    """
+    # Systemd resource limits are a Unix-only feature; Windows has no systemd.
+    if _kb._IS_WINDOWS:
+        return command
+
+    # Check if systemd-run is available before wrapping.
+    import shutil
+    if not shutil.which("systemd-run"):
+        return command
+
+    mem_mb, cpu_quota = _get_worker_resource_config()
+
+    # Build the systemd-run wrapper. --user for unprivileged execution,
+    # --scope for minimal overhead (vs --slice which creates a persistent unit),
+    # -- to mark the end of systemd options before the actual command.
+    wrapper = [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-p", f"MemoryMax={mem_mb}M",
+        "-p", f"CPUQuota={cpu_quota}",
+        "--",
+    ]
+    return wrapper + command
+
+
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     """Wrap a systemd-hosted dispatcher's worker in the shared restart-safe scope.
 
@@ -2872,6 +2938,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
     cmd = _restart_safe_worker_argv(task, cmd)
+    # Wrap the worker with systemd-run for per-worker resource isolation (Unix only).
+    # This applies a MemoryMax and CPUQuota cgroup limit to prevent one runaway
+    # worker from affecting the dispatcher or sibling workers.
+    cmd = _wrap_worker_with_systemd_scope(task, cmd)
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)

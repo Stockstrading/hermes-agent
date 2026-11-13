@@ -1968,6 +1968,18 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Per-worker memory ceiling for systemd cgroup resource isolation (MB). Unix only; ignored on
+        # Windows. When set to a positive int (default 1024 MB), each dispatcher-spawned worker is
+        # wrapped with systemd-run --scope to enforce a MemoryMax cgroup limit, preventing one runaway
+        # worker from exhausting the shared VM. systemd-run must be available on PATH; if absent, no
+        # wrapper is applied. Set to 0 to disable resource isolation entirely; fractional values are
+        # rejected (fallback to default).
+        "worker_memory_mb": None,
+        # Per-worker CPU quota for systemd cgroup resource isolation. Unix only; ignored on Windows.
+        # Format: a percentage string like "100%" (default, 1 full CPU core). When set, each worker
+        # is wrapped with systemd-run --scope to enforce a CPUQuota cgroup limit. Set to "" or None
+        # to disable CPU quota isolation; invalid values fall back to default.
+        "worker_cpu_quota": None,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
