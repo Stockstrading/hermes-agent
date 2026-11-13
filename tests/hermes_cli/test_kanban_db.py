@@ -665,6 +665,55 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_schedule_task_sets_resume_at(kanban_home):
+    """``schedule_task``'s ``resume_at`` kwarg (the quota/429 backoff path)
+    is persisted on the row; omitting it keeps the legacy NULL/park-forever
+    behaviour."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota wait", assignee="a")
+        wake = int(time.time()) + 900
+        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=later", resume_at=wake)
+        task = kb.get_task(conn, tid)
+        assert task.status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == wake
+
+        tid2 = kb.create_task(conn, title="human park", assignee="a")
+        assert kb.schedule_task(conn, tid2, reason="waiting on a human")
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (tid2,),
+        ).fetchone()[0] is None
+
+
+def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home):
+    """A ``resume_at`` in the past is promoted to ``ready`` (and cleared);
+    one still in the future is left ``scheduled``, untouched."""
+    now = int(time.time())
+    with kbc.connect() as conn:
+        due = kb.create_task(conn, title="due", assignee="a")
+        assert kb.schedule_task(conn, due, resume_at=now - 10)
+        not_due = kb.create_task(conn, title="not due", assignee="a")
+        assert kb.schedule_task(conn, not_due, resume_at=now + 3600)
+        parked = kb.create_task(conn, title="parked forever", assignee="a")
+        assert kb.schedule_task(conn, parked, reason="human will unblock")
+
+        promoted = kb.recompute_scheduled(conn)
+        assert promoted == 1
+
+        due_task = kb.get_task(conn, due)
+        assert due_task.status == "ready"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (due,),
+        ).fetchone()[0] is None
+
+        assert kb.get_task(conn, not_due).status == "scheduled"
+        assert kb.get_task(conn, parked).status == "scheduled"
+
+        # Idempotent: nothing left to promote on a second sweep.
+        assert kb.recompute_scheduled(conn) == 0
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1642,7 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
 
 
+
 def test_resolve_hermes_argv_module_actually_runs():
     """The fallback module name must be importable + runnable.
 
@@ -1611,8 +1661,7 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    offline = {**os.environ, "HTTPS_PROXY": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9", "NO_PROXY": "", "no_proxy": ""}
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False, env=offline)
+    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30, check=False)
     assert r.returncode == 0, (
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
@@ -1620,15 +1669,15 @@ def test_resolve_hermes_argv_module_actually_runs():
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):
-    """The dispatcher's worker must carry the import context of the install that spawned it.
+    """A module-form worker must carry the import context that selected it.
 
-    The worker is always ``sys.executable -m hermes_cli.kanban_worker_client`` (it only submits
-    the claim to the profile owner), and the worker env scrub strips Hermes-owned PYTHONPATH
-    entries, so a bare module child died on import and the board auto-blocked (#122299,
-    #122487, #122500). The spawned env must put the running install's root first on
-    PYTHONPATH. Main's carve-out for a resolved ``hermes`` shim path does not apply here: the
-    worker never runs the resolved CLI argv, so a ``$HERMES_BIN``/PATH shim can neither replace
-    the module child nor drop the pin.
+    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in the gateway,
+    where a store-python shim has the repo root on ``sys.path`` in-process;
+    the worker env scrub strips Hermes-owned PYTHONPATH entries, so the bare
+    ``sys.executable -m hermes_cli.main`` child died on import and the board
+    auto-blocked (#122299, #122487, #122500). The spawned env must put the
+    running install's root first on PYTHONPATH — and never for a resolved shim
+    path, which owns its own imports.
     """
     import os
     import sys
@@ -1662,11 +1711,13 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
         claim_expires=None, tenant=None, branch_name=None,
     )
 
-    for resolved in ([sys.executable, "-m", "hermes_cli.main"], ["/opt/hermes/bin/hermes"]):
-        monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda resolved=resolved: resolved)
-        kbd._default_spawn(task, str(tmp_path / "ws"))
-        assert captured["cmd"][-3:] == [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
-        assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: [sys.executable, "-m", "hermes_cli.main"])
+    kbd._default_spawn(task, str(tmp_path / "ws"))
+    assert captured["env"]["PYTHONPATH"].split(os.pathsep)[0] == root
+
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["/opt/hermes/bin/hermes"])
+    kbd._default_spawn(task, str(tmp_path / "ws"))
+    assert root not in captured["env"].get("PYTHONPATH", "").split(os.pathsep)
 
 
 # ---------------------------------------------------------------------------

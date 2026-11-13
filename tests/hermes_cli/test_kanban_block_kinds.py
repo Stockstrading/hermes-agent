@@ -86,6 +86,46 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_block_recurrence_limit_config_override_raises_threshold(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``kanban.block_recurrence_limit`` raises the escalation threshold above
+    the hardcoded ``BLOCK_RECURRENCE_LIMIT`` default: the same re-block count
+    that trips the default stays ``blocked`` under the higher configured
+    limit."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"block_recurrence_limit": 5}},
+    )
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Second same-kind re-block: recurrences == kb.BLOCK_RECURRENCE_LIMIT (2),
+        # which would trip the hardcoded default but must stay under limit=5.
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+
+
+def test_block_recurrence_limit_config_override_lowers_threshold(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured limit BELOW the hardcoded default escalates earlier."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"block_recurrence_limit": 1}},
+    )
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        # First block ever: recurrences == 1, which already meets limit=1.
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert events and events[-1].payload.get("limit") == 1
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------

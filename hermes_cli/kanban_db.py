@@ -324,6 +324,34 @@ def _resolve_rate_limit_cooldown_seconds() -> int:
     return _env_int("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS)
 
 
+# build_worker_context() caps, sized for a ~100k-char prompt with headroom.
+_CTX_MAX_PRIOR_ATTEMPTS = 10      # most recent N prior runs shown in full
+_CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
+_CTX_MAX_FIELD_BYTES    = 4 * 1024   # per summary/error/metadata/result
+_CTX_MAX_BODY_BYTES     = 8 * 1024   # per task.body (opening post)
+_CTX_MAX_COMMENT_BYTES  = 2 * 1024   # per comment
+
+
+def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
+    """``just now`` / ``18h ago`` / ``3d ago``; "" for a missing/invalid ts. An LLM
+    reads a bare absolute timestamp as current fact — the relative age is what
+    prompts a worker to re-verify stale sibling work."""
+    try:
+        ts = int(ts)
+    except (TypeError, ValueError):
+        return ""
+    if now is None:
+        now = int(time.time())
+    delta = now - ts
+    if delta < 60:  # includes negative = clock skew across machines; never claim "in the future"
+        return "just now"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        return f"{delta // 3600}h ago"
+    return f"{delta // 86400}d ago"
+
+
 # --- Paths ---
 
 DEFAULT_BOARD = "default"
@@ -873,7 +901,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Epoch seconds a 'scheduled' task auto-wakes to 'ready'. NULL = no
+    -- timer (legacy schedule_task behaviour; parked until an explicit
+    -- unblock_task). Set by quota/429 backoff scheduling (schedule_task's
+    -- resume_at kwarg); cleared by recompute_scheduled once it fires.
+    resume_at            INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1423,7 +1456,13 @@ def list_tasks(
     tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
     limit: Optional[int] = None, order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+    exclude_block_loop: bool = False,
 ) -> list[Task]:
+    """``exclude_block_loop=True`` drops tasks whose MOST RECENT ``task_events``
+    row is ``block_loop_detected`` -- a human-gated escalation that a sweep
+    (auto-decompose, auto-specify) must never re-touch. Correlated on the
+    latest event only, so a card unblocked and later re-escalated for an
+    unrelated reason (a fresh, later event) is still returned."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
@@ -1438,6 +1477,15 @@ def list_tasks(
             params.append(val)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    if exclude_block_loop:
+        query += (
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM task_events e"
+            "   WHERE e.task_id = tasks.id"
+            "     AND e.id = (SELECT MAX(id) FROM task_events e2 WHERE e2.task_id = tasks.id)"
+            "     AND e.kind = 'block_loop_detected'"
+            " )"
+        )
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -2352,10 +2400,7 @@ def release_stale_claims(
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in stale:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = _to_epoch(row["last_heartbeat_at"])
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2378,10 +2423,6 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
-            # Again under the write lock: an interpreter that bound since the check above
-            # changes neither claim_lock nor worker_pid, so the CAS below cannot see it.
-            if owner_reclaim_blocked(conn, row["id"]):
-                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -3182,6 +3223,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            recurrence_limit=_resolve_block_recurrence_limit(),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3215,9 +3257,24 @@ def block_task(
     return True
 
 
+def _resolve_block_recurrence_limit() -> int:
+    """``kanban.block_recurrence_limit`` config override (default
+    ``BLOCK_RECURRENCE_LIMIT``). A missing/invalid/non-positive value falls
+    back to the hardcoded default rather than raising -- this guards a
+    circuit breaker, so a bad config value must never disable it."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        raw = cfg_get(load_config_readonly(), "kanban", "block_recurrence_limit", default=BLOCK_RECURRENCE_LIMIT)
+        limit = int(raw)
+        return limit if limit >= 1 else BLOCK_RECURRENCE_LIMIT
+    except Exception:
+        return BLOCK_RECURRENCE_LIMIT
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, recurrence_limit: Optional[int] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3230,16 +3287,18 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``recurrence_limit`` (``kanban.block_recurrence_limit`` config, default
+    ``BLOCK_RECURRENCE_LIMIT``) the task routes to ``triage`` for a human.
     """
+    limit = recurrence_limit if recurrence_limit is not None else BLOCK_RECURRENCE_LIMIT
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
-        payload["limit"] = BLOCK_RECURRENCE_LIMIT
+    if recurrences >= limit:
+        payload["limit"] = limit
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
@@ -3410,10 +3469,16 @@ def _nonblank_str(value: Any) -> Optional[str]:
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
-    gating reapplied. Returns ``(ok, implementer | reason)``."""
+    gating reapplied. Returns ``(ok, implementer | reason)``.
+
+    ``metadata`` persists onto the closed run exactly like ``complete_task``'s
+    ``metadata`` — a reviewer's ``changes_requested`` verdict can carry a
+    ``head_sha`` key so a later dispatcher tick can tell whether this verdict
+    is still current for the PR before respawning a fresh reviewer run."""
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
@@ -3462,6 +3527,7 @@ def request_changes(
             return False, "task changed during review handoff"
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
+            metadata=metadata,
         )
         _append_event(
             conn,
@@ -3867,18 +3933,22 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, resume_at: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it, or — when ``resume_at`` (epoch
+    seconds) is given — until :func:`recompute_scheduled` auto-promotes it
+    back to ``ready`` on its own. ``resume_at`` is the quota/429 backoff
+    path's timer; omit it to keep the old park-forever behaviour."""
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [None if resume_at is None else int(resume_at), task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   resume_at    = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -3894,6 +3964,34 @@ def schedule_task(
         return True
 
 
+def recompute_scheduled(conn: sqlite3.Connection) -> int:
+    """Promote ``scheduled`` tasks whose ``resume_at`` timer has arrived back
+    to ``ready``; returns the count. Sibling of :func:`recompute_ready`,
+    opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+
+    A ``scheduled`` row with no ``resume_at`` (the legacy / human-driven
+    path) is left alone forever, exactly as before this timer existed —
+    only ``unblock_task`` moves it.
+    """
+    now = int(time.time())
+    promoted = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'scheduled' "
+            "AND resume_at IS NOT NULL AND resume_at <= ?", (now,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            if conn.execute(
+                "UPDATE tasks SET status = 'ready', resume_at = NULL "
+                "WHERE id = ? AND status = 'scheduled'", (task_id,),
+            ).rowcount != 1:
+                continue
+            _append_event(conn, task_id, "promoted", {"status": "ready", "reason": "resume_at_due"})
+            promoted += 1
+    return promoted
+
+
 # --- Worker context builder (what a spawned worker sees) ---
 
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
@@ -3904,10 +4002,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
-    from hermes_cli.kanban_db_context import (
-        _ctx_attachments, _ctx_comments, _ctx_header, _ctx_parent_results, _ctx_prior_attempts,
-        _ctx_role_history,
-    )
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
@@ -3918,6 +4012,198 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     _ctx_role_history(lines, conn, task, now)
     _ctx_comments(lines, list_comments(conn, task_id), now)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
+    """Truncate to ``limit`` chars with a visible ellipsis."""
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_stamp(ts: int, now: int) -> str:
+    """``YYYY-MM-DD HH:MM`` plus a relative age when one is available."""
+    disp = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    age = _relative_age(ts, now)
+    return f"{disp}, {age}" if age else disp
+
+
+def _ctx_metadata_line(metadata: Any) -> Optional[str]:
+    if not metadata:
+        return None
+    try:
+        return f"_metadata_: `{_ctx_cap(json.dumps(metadata, ensure_ascii=False, sort_keys=True))}`"
+    except Exception:
+        return None
+
+
+def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
+    """Keep the newest ``cap`` items; describe the omitted head, if any."""
+    omitted = max(0, len(items) - cap)
+    if not omitted:
+        return items, None
+    return items[-cap:], (
+        f"_({omitted} earlier {noun}{'s' if omitted != 1 else ''} "
+        f"omitted; showing most recent {cap})_"
+    )
+
+
+def _ctx_header(lines: list[str], task: Task) -> None:
+    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append("")
+    lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
+    lines.append(f"Status:   {task.status}")
+    if task.tenant:
+        lines.append(f"Tenant:   {task.tenant}")
+    lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")
+    if task.max_runtime_seconds is not None:
+        terminal_timeout = _worker_terminal_timeout_env(
+            task.max_runtime_seconds, os.environ.get("TERMINAL_TIMEOUT"),
+        )
+        effective_terminal_timeout = terminal_timeout or os.environ.get("TERMINAL_TIMEOUT")
+        lines.append(f"Max runtime: {task.max_runtime_seconds}s")
+        if effective_terminal_timeout:
+            lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
+    if task.branch_name:
+        lines.append(f"Branch:   {task.branch_name}")
+    lines.append("")
+    if task.body and task.body.strip():
+        lines.append("## Body")
+        lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+
+def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:
+    """Absolute on-disk paths so the worker's file tools read them directly
+    (remote terminal backends need the attachments dir mounted)."""
+    if not attachments:
+        return
+    lines.append("## Attachments")
+    lines.append(
+        "Files attached to this task. Read them with the file/terminal "
+        "tools at the absolute paths below:"
+    )
+    for att in attachments:
+        size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
+        size_str = f", {size_kb} KB" if size_kb else ""
+        ctype = f", {att.content_type}" if att.content_type else ""
+        lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+    lines.append("")
+
+
+def _ctx_prior_attempts(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Closed runs on this task (the active run is this worker), newest
+    ``_CTX_MAX_PRIOR_ATTEMPTS`` in full, older ones as a one-line marker."""
+    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    shown, omitted_note = _ctx_tail(all_prior, _CTX_MAX_PRIOR_ATTEMPTS, "attempt")
+    if not shown:
+        return
+    first_shown_idx = len(all_prior) - len(shown) + 1
+    lines.append("## Prior attempts on this task")
+    if omitted_note:
+        lines.append(omitted_note)
+    for offset, run in enumerate(shown):
+        profile = run.profile or "(unknown)"
+        outcome = run.outcome or run.status
+        lines.append(
+            f"### Attempt {first_shown_idx + offset} — {outcome} ({profile}, {_ctx_stamp(run.started_at, now)})"
+        )
+        if run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        if run.error and run.error.strip():
+            lines.append(f"_error_: {_ctx_cap(run.error)}")
+        meta_line = _ctx_metadata_line(run.metadata)
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_parent_results(lines: list[str], conn: sqlite3.Connection, task_id: str, now: int) -> None:
+    """Done-parent handoffs: newest ``completed`` run's summary+metadata,
+    falling back to ``task.result`` for pre-runs-table data. Stamped with a
+    relative age so the worker re-verifies stale upstream results."""
+    parent_rows = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,),
+    ).fetchall()
+    wrote_header = False
+    for pid in (r["parent_id"] for r in parent_rows):
+        pt = get_task(conn, pid)
+        if not pt or pt.status != "done":
+            continue
+        runs = [r for r in list_runs(conn, pid) if r.outcome == "completed"]
+        runs.sort(key=lambda r: r.started_at, reverse=True)
+        run = runs[0] if runs else None
+        if not wrote_header:
+            lines.append("## Parent task results")
+            lines.append(
+                "_Handoffs from upstream tasks, captured when each parent "
+                "completed (see age below). These are point-in-time "
+                "snapshots, not live state — if a result drives your "
+                "current work and it's not recent, re-verify against the "
+                "source before acting on it as current._"
+            )
+            wrote_header = True
+        done_ts = run.ended_at if run is not None and run.ended_at else (pt.completed_at or None)
+        age = _relative_age(done_ts, now)
+        lines.append(f"### {pid}" + (f" (completed {age})" if age else ""))
+        if run is not None and run.summary and run.summary.strip():
+            lines.append(_ctx_cap(run.summary))
+        elif pt.result:
+            lines.append(_ctx_cap(pt.result))
+        else:
+            lines.append("(no result recorded)")
+        meta_line = _ctx_metadata_line(run.metadata) if run is not None else None
+        if meta_line:
+            lines.append(meta_line)
+        lines.append("")
+
+
+def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, now: int) -> None:
+    """The assignee's 5 most recent completed runs on OTHER tasks — implicit
+    role continuity without wiring anything into SOUL.md / MEMORY.md."""
+    if not task.assignee:
+        return
+    role_rows = conn.execute(
+        "SELECT t.id, t.title, r.summary, r.ended_at "
+        "FROM task_runs r JOIN tasks t ON r.task_id = t.id "
+        "WHERE r.profile = ? AND r.task_id != ? "
+        "  AND r.outcome = 'completed' "
+        "ORDER BY r.ended_at DESC LIMIT 5", (task.assignee, task.id),
+    ).fetchall()
+    if not role_rows:
+        return
+    lines.append(f"## Recent work by @{task.assignee}")
+    for row in role_rows:
+        first = _first_line(row["summary"], 200) or "(no summary)"
+        lines.append(
+            f"- {row['id']} — {row['title']} ({_ctx_stamp(_to_epoch(row['ended_at']) or 0, now)}): {first}"
+        )
+    lines.append("")
+
+
+def _ctx_comments(lines: list[str], comments: list[Comment], now: int) -> None:
+    """Newest ``_CTX_MAX_COMMENTS`` comments. The explicit "comment from
+    worker" framing stops an operator-controlled HERMES_PROFILE like
+    "hermes-system" being read as a system directive above an
+    attacker-influenceable body (defense-in-depth)."""
+    shown, omitted_note = _ctx_tail(comments, _CTX_MAX_COMMENTS, "comment")
+    if not shown:
+        return
+    lines.append("## Comment thread")
+    if omitted_note:
+        lines.append(omitted_note)
+    for c in shown:
+        # Render author with explicit "comment from worker" framing so operator-controlled HERMES_PROFILE
+        # values like "hermes-system" or "operator" can't be misread by the next worker as a system
+        # directive above the (attacker-influenceable) comment body. Defense-in-depth — the LLM-controlled
+        # author-forgery surface was already closed in #22435. See #22452.
+        safe_author = (c.author or "").replace("`", "")
+        lines.append(f"comment from worker `{safe_author}` at {_ctx_stamp(c.created_at, now)}:")
+        lines.append(_ctx_cap(c.body, _CTX_MAX_COMMENT_BYTES))
+        lines.append("")
 
 
 # --- Stats + SLA helpers ---
