@@ -1853,6 +1853,17 @@ def _append_event(
     )
 
 
+# Outcomes that supersede any earlier failure stamp: once a run ends with one of
+# these, the card has moved on (review handoff, operator verdict, or success) and
+# a stale ``last_failure_error`` from a prior rate-limit/failure requeue must stop
+# being read as a live blocker. Kept here (not in kanban_db_dispatch) because
+# ``_end_run`` is the single write seam for every outcome and clears the stamp for
+# every caller, not just ``complete_task`` (#119070 follow-up).
+_SUPERSEDING_RUN_OUTCOMES = frozenset({
+    "completed", "review_requested", "changes_requested", "blocked", "cancelled",
+})
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -1863,7 +1874,13 @@ def _end_run(
     ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
     row: they are the only evidence left of the OS process once the task row
     is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
-    to end a worker that survived its own terminal transition."""
+    to end a worker that survived its own terminal transition.
+
+    An outcome in ``_SUPERSEDING_RUN_OUTCOMES`` also clears ``tasks.last_failure_error``:
+    without this, a rate-limited run's stamped quota text survives past the handoff it
+    was meant to be neutral for, and ``check_respawn_guard`` reads it as a live auth/quota
+    blocker on the next tick even though a review verdict or completion already superseded
+    it (#119070 follow-up)."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
@@ -1884,6 +1901,8 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    if outcome in _SUPERSEDING_RUN_OUTCOMES:
+        conn.execute("UPDATE tasks SET last_failure_error = NULL WHERE id = ?", (task_id,))
     return run_id
 
 

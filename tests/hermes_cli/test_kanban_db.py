@@ -469,6 +469,77 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+@pytest.mark.parametrize("outcome", ["review_requested", "changes_requested", "blocked", "completed"])
+def test_respawn_guard_ignores_stale_rate_limit_stamp_after_a_superseding_run(
+    kanban_home, monkeypatch, outcome,
+):
+    """#119070 follow-up: a rate-limited requeue stamps ``last_failure_error`` with
+    quota-flavored text so the immediate retry skips ``blocker_auth``. If the card's
+    NEXT run ends with a review verdict, a fresh block, or a completion — i.e. it moved
+    on — that stale stamp must not resurrect itself as a permanent auth blocker on a
+    later tick just because the latest outcome is no longer literally ``rate_limited``."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rl-then-superseded", assignee="a")
+
+        # Run 1: rate_limited, stamps the quota-flavored error (as the real requeue does).
+        kb.claim_task(conn, tid)
+        rl_run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', ended_at=? WHERE id=?",
+            (now, rl_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued without counting a failure", tid),
+        )
+        conn.commit()
+
+        # Run 2: ends with a superseding outcome via the real write seam (_end_run),
+        # exactly as kanban_db_dispatch's own handoff paths do.
+        kb.claim_task(conn, tid)
+        kb._end_run(conn, tid, outcome=outcome, status=outcome, summary="moved on")
+        conn.commit()
+
+        # _end_run already cleared last_failure_error for a superseding outcome — the
+        # regression this guards is a stamp written by any path that predates/bypasses
+        # that clear, so re-stamp it directly to prove the GUARD itself, not just the
+        # write seam, treats a superseded stamp as inert.
+        conn.execute(
+            "UPDATE tasks SET last_failure_error=? WHERE id=?",
+            ("pid 1 exited rate-limited (quota wall) — requeued without counting a failure", tid),
+        )
+        conn.commit()
+
+        # ``completed`` can still legitimately return ``recent_success`` (a different,
+        # time-bounded guard) — what this regression forbids is ``blocker_auth``.
+        guard = kbd.check_respawn_guard(conn, tid)
+        assert guard != "blocker_auth", (
+            f"stale rate-limit stamp parked a card whose latest run was '{outcome}' as blocker_auth"
+        )
+        if outcome != "completed":
+            assert guard is None, guard
+
+
+def test_end_run_clears_last_failure_error_on_superseding_outcomes(kanban_home):
+    """``_end_run`` itself clears the stale stamp for every superseding outcome, not only
+    on ``complete_task`` — the fix's second half (#119070 follow-up)."""
+    with kbc.connect() as conn:
+        for outcome in sorted(kb._SUPERSEDING_RUN_OUTCOMES):
+            tid = kb.create_task(conn, title=f"clear-{outcome}", assignee="a")
+            kb.claim_task(conn, tid)
+            conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", ("stale quota text", tid))
+            conn.commit()
+            kb._end_run(conn, tid, outcome=outcome, status=outcome)
+            conn.commit()
+            row = conn.execute("SELECT last_failure_error FROM tasks WHERE id=?", (tid,)).fetchone()
+            assert row["last_failure_error"] is None, f"outcome={outcome} left a stale stamp"
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
