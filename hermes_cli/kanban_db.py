@@ -3947,6 +3947,42 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
+        "guard_events_24h": guard_event_counts(conn, window_seconds=86400),
+    }
+
+
+def guard_event_counts(conn: sqlite3.Connection, *, window_seconds: int = 86400) -> dict:
+    """Counts of dispatcher guard/churn event kinds in the trailing window.
+
+    Surfaces the same signals used to diagnose kanban churn (F10: 32,788
+    ``respawn_guarded`` / 280 ``block_loop_detected`` / 835 ``unblocked``
+    events in 30 days) so a daily digest can show the trend instead of
+    requiring an ad-hoc SQL query after the fact.
+    """
+    cutoff = int(time.time()) - int(window_seconds)
+    counts: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT kind, COUNT(*) AS n FROM task_events "
+        "WHERE created_at >= ? AND kind IN "
+        "('respawn_guarded', 'block_loop_detected', 'unblocked', "
+        "'auto_blocked', 'rate_limited') "
+        "GROUP BY kind",
+        (cutoff,),
+    ):
+        counts[row["kind"]] = int(row["n"])
+    distinct_guarded = conn.execute(
+        "SELECT COUNT(DISTINCT task_id) AS n FROM task_events "
+        "WHERE created_at >= ? AND kind = 'respawn_guarded'",
+        (cutoff,),
+    ).fetchone()
+    return {
+        "window_seconds": int(window_seconds),
+        "respawn_guarded": counts.get("respawn_guarded", 0),
+        "respawn_guarded_distinct_tasks": int(distinct_guarded["n"]) if distinct_guarded else 0,
+        "block_loop_detected": counts.get("block_loop_detected", 0),
+        "unblocked": counts.get("unblocked", 0),
+        "auto_blocked": counts.get("auto_blocked", 0),
+        "rate_limited": counts.get("rate_limited", 0),
     }
 
 
