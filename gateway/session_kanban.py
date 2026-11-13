@@ -75,7 +75,7 @@ def build_kanban_policy(connection, params, config):
         policy = replace(policy, model=_resolve_gateway_model(policy.config()))
     context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
-        skills=skills, forced_review_skill=forced_review_skill,
+        skills=skills, own_skills=list(task.skills or ()), forced_review_skill=forced_review_skill,
         goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
@@ -367,7 +367,11 @@ def worker_exit_code(path, params):
 def _run_task_turns(agent, frame, history, context):
     from agent.skill_commands import build_preloaded_skills_prompt
     forced = context.get('forced_review_skill')
-    own_skills = [s for s in context['skills'] if s != forced]
+    # own_skills is the task's pre-union requested-skills list, captured in build_kanban_policy
+    # before the review lane's forced skill was unioned in (#t_3d8b302d). Filtering the merged
+    # `skills` list by value equality to `forced` would also strip a task that genuinely requests
+    # the same skill name as a hard requirement, silently downgrading it to fail-open.
+    own_skills = context.get('own_skills', context['skills'])
     skills_prompt, loaded, missing = build_preloaded_skills_prompt(own_skills, task_id=agent.session_id)
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')

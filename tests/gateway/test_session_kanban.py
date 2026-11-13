@@ -114,6 +114,47 @@ def test_review_lane_forces_sdlc_review_tracked_separately(tmp_path, monkeypatch
     assert context['forced_review_skill'] == REVIEW_FORCED_SKILL
 
 
+def test_review_lane_overlap_keeps_own_requested_forced_skill_as_hard_requirement(tmp_path, monkeypatch):
+    """A task that itself requests ``sdlc-review`` (not just the review lane's auto-add) must keep
+    it in ``own_skills`` so it stays a hard requirement — #t_3d8b302d round 1's value-equality
+    filter on the merged list silently reclassified this overlap case as the fail-open forced
+    copy, which would have hidden a genuinely broken preload for a task that asked for it."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import REVIEW_FORCED_SKILL
+    from contextlib import closing
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    kb.create_board('owned')
+    with closing(connect(board='owned')) as conn:
+        task_id = kb.create_task(conn, title='Reviewed deliverable', assignee='default',
+            workspace_kind='dir', workspace_path=str(workspace), skills=[REVIEW_FORCED_SKILL])
+        kb.recompute_ready(conn)
+        implementer_run = kb.claim_task(conn, task_id)
+        kb.request_review(conn, task_id, summary='done', expected_run_id=implementer_run.current_run_id)
+        task = kb.claim_review_task(conn, task_id)
+        assert task is not None
+    actor = Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
+    params = dict(board='owned', task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    from gateway.session_kanban import build_kanban_policy
+    config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal', 'file']}}
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    context = json.loads(policy.kanban_json)
+    # Deduped union still shows one entry; own_skills (pre-union) still carries it as the task's
+    # own hard requirement, independent of forced_review_skill also naming it.
+    assert context['skills'] == [REVIEW_FORCED_SKILL]
+    assert context['own_skills'] == [REVIEW_FORCED_SKILL]
+    assert context['forced_review_skill'] == REVIEW_FORCED_SKILL
+
+
 def test_forced_review_skill_failure_is_fail_open_but_own_skill_failure_still_raises(monkeypatch):
     """A reviewer whose task carries no skills of its own never hard-fails on a missing
     ``sdlc-review`` (fail-open); a task with its OWN unresolvable skill still raises so a genuinely
@@ -136,8 +177,8 @@ def test_forced_review_skill_failure_is_fail_open_but_own_skill_failure_still_ra
             return '', [], ['sdlc-review']
         return '', [], []
     monkeypatch.setattr(sc, 'build_preloaded_skills_prompt', fake_build_only_forced_missing)
-    context = {'skills': ['sdlc-review'], 'forced_review_skill': 'sdlc-review', 'context': '',
-               'task_id': 't1', 'goal_mode': False}
+    context = {'skills': ['sdlc-review'], 'own_skills': [], 'forced_review_skill': 'sdlc-review',
+               'context': '', 'task_id': 't1', 'goal_mode': False}
     result = session_kanban._run_task_turns(_Agent(), frame, [], context)
     assert result['completed'] is True
 
@@ -151,6 +192,19 @@ def test_forced_review_skill_failure_is_fail_open_but_own_skill_failure_still_ra
                 'task_id': 't1', 'goal_mode': False}
     with pytest.raises(ValueError, match='kanban_skills_unavailable'):
         session_kanban._run_task_turns(_Agent(), frame, [], context2)
+
+    # Case 3: overlap — the task's own requested skills ALSO include the forced review skill
+    # name. own_skills (pre-union, as build_kanban_policy now stores it) must still be treated
+    # as a hard requirement even though forced_review_skill names the same skill.
+    def fake_build_overlap_missing(identifiers, task_id=None, excluded_loaded_names=None):
+        if identifiers == ['sdlc-review']:
+            return '', [], ['sdlc-review']
+        return '', [], []
+    monkeypatch.setattr(sc, 'build_preloaded_skills_prompt', fake_build_overlap_missing)
+    context3 = {'skills': ['sdlc-review'], 'own_skills': ['sdlc-review'],
+                'forced_review_skill': 'sdlc-review', 'context': '', 'task_id': 't1', 'goal_mode': False}
+    with pytest.raises(ValueError, match='kanban_skills_unavailable'):
+        session_kanban._run_task_turns(_Agent(), frame, [], context3)
 
 
 def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
