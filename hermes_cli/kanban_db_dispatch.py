@@ -66,6 +66,18 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# A card parked on "active_pr" (waiting on review/merge) or "recent_success"
+# (waiting on the owner to act on a just-finished run) can sit for the full
+# guard window while the dispatcher re-checks it every tick. Re-checking is
+# cheap; writing a fresh ``respawn_guarded`` event every tick is not — it is
+# the single largest source of task_events churn (finding F10: 32,788
+# respawn_guarded events / 30 days, almost all repeats of the same reason for
+# the same still-parked card). Treat "same reason, same task, within this
+# window" as the equivalent of a dedicated waiting_on_pr/waiting_on_owner
+# state: still skip the spawn every tick, but only log the reason once per
+# window instead of once per tick.
+_RESPAWN_GUARD_EVENT_REANNOUNCE_SECONDS = 3600  # 1 hour
+
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
@@ -1122,6 +1134,34 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _respawn_guard_event_due(
+    conn: sqlite3.Connection, task_id: str, reason: str, *, now: int,
+) -> bool:
+    """True iff a fresh ``respawn_guarded`` event for ``reason`` is worth logging.
+
+    Equivalent of a waiting_on_pr/waiting_on_owner state (see
+    ``_RESPAWN_GUARD_EVENT_REANNOUNCE_SECONDS``): the dispatcher still skips
+    the spawn every tick, but the SAME reason for the SAME task logs at most
+    once per reannounce window. A reason CHANGE (e.g. ``active_pr`` ->
+    ``recent_success``) always logs immediately — that is new information.
+    """
+    row = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'respawn_guarded' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return True
+    last_payload = _kb._json_or(row["payload"]) or {}
+    if last_payload.get("reason") != reason:
+        return True
+    last_at = row["created_at"]
+    if last_at is None:
+        return True
+    return (now - int(last_at)) >= _RESPAWN_GUARD_EVENT_REANNOUNCE_SECONDS
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1532,7 +1572,12 @@ def _dispatch_lane_task(
         # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
-        if not dry_run:
+        #
+        # Only PERSIST the event when it carries new information (see
+        # ``_respawn_guard_event_due``) — the dispatch tick still skips the spawn
+        # every time (correctness is unaffected), but a card parked on the same
+        # reason for hours/days no longer writes one row per tick.
+        if not dry_run and _respawn_guard_event_due(conn, task_id, guard_reason, now=int(time.time())):
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False

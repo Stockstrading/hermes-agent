@@ -515,6 +515,109 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_respawn_guard_event_logged_once_per_tick_then_suppressed(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """F10: a card parked on ``active_pr`` must not write one ``respawn_guarded``
+    event per dispatch tick for hours/days — only once per reannounce window.
+    The task is still correctly skipped (never spawned) on every tick.
+    """
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append(task.id)
+        return 42
+
+    now = 10_000_000
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="has-open-pr", assignee="alice")
+        kb.add_comment(conn, tid, author="worker", body="Opened https://github.com/org/repo/pull/7")
+
+        for _ in range(5):
+            res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
+            assert res.respawn_guarded == [(tid, "active_pr")]
+
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
+
+    assert not spawns, "guarded task must never spawn"
+    assert len(events) == 1, "same reason, same tick-window -> logged once, not per tick"
+    assert events[0].payload == {"reason": "active_pr"}
+
+
+def test_respawn_guard_event_reannounces_after_window_elapses(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """After the reannounce window elapses, the SAME guard reason logs again
+    (the dispatcher must not go permanently silent about a still-stuck card)."""
+    now = 10_000_000
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="has-open-pr", assignee="alice")
+        kb.add_comment(conn, tid, author="worker", body="Opened https://github.com/org/repo/pull/7")
+
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 42)
+
+        monkeypatch.setattr(
+            kbd.time, "time", lambda: now + kbd._RESPAWN_GUARD_EVENT_REANNOUNCE_SECONDS + 1,
+        )
+        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 42)
+
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "respawn_guarded"]
+
+    assert len(events) == 2
+
+
+def test_respawn_guard_event_logs_immediately_on_reason_change(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A guard reason CHANGE (e.g. active_pr -> recent_success) is new
+    information and must log right away, not wait out the reannounce window."""
+    now = 10_000_000
+    monkeypatch.setattr(kbd.time, "time", lambda: now)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "respawn_guarded", {"reason": "rate_limit_cooldown"})
+
+        assert kbd._respawn_guard_event_due(conn, tid, "active_pr", now=now) is True
+        assert kbd._respawn_guard_event_due(conn, tid, "rate_limit_cooldown", now=now) is False
+
+
+def test_guard_event_counts_window(kanban_home):
+    """``guard_event_counts`` only counts events inside the requested window,
+    and distinguishes raw event volume from distinct affected tasks."""
+    with kbc.connect() as conn:
+        t1 = kb.create_task(conn, title="a", assignee="alice")
+        t2 = kb.create_task(conn, title="b", assignee="bob")
+        with kb.write_txn(conn):
+            kb._append_event(conn, t1, "respawn_guarded", {"reason": "active_pr"})
+            kb._append_event(conn, t1, "respawn_guarded", {"reason": "active_pr"})
+            kb._append_event(conn, t2, "respawn_guarded", {"reason": "recent_success"})
+            kb._append_event(conn, t2, "block_loop_detected", {"kind": "needs_input"})
+        # Push one more respawn_guarded event for t2 outside the window —
+        # it must NOT be counted.
+        now = int(time.time())
+        with kb.write_txn(conn):
+            kb._append_event(conn, t2, "respawn_guarded", {"reason": "active_pr"})
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'respawn_guarded' "
+            "AND id = (SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded')",
+            (now - 100_000, t2, t2),
+        )
+        conn.commit()
+
+        counts = kb.guard_event_counts(conn, window_seconds=3600)
+
+    assert counts["block_loop_detected"] == 1
+    # 2 (t1) + 1 (t2's in-window one) = 3; the pushed-out-of-window t2 row excluded.
+    assert counts["respawn_guarded"] == 3
+    assert counts["respawn_guarded_distinct_tasks"] == 2
+
 
 
 

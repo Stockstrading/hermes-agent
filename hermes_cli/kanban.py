@@ -1070,6 +1070,15 @@ def _cmd_stats(args: argparse.Namespace) -> int:
     age = stats["oldest_ready_age_seconds"]
     if age is not None:
         print(f"\nOldest ready task age: {int(age)}s")
+    guard = stats.get("guard_events_24h") or {}
+    if guard:
+        print("\nGuard events (last 24h):")
+        print(f"  respawn_guarded      {guard.get('respawn_guarded', 0)}"
+              f"  ({guard.get('respawn_guarded_distinct_tasks', 0)} distinct tasks)")
+        print(f"  block_loop_detected  {guard.get('block_loop_detected', 0)}")
+        print(f"  unblocked            {guard.get('unblocked', 0)}")
+        print(f"  auto_blocked         {guard.get('auto_blocked', 0)}")
+        print(f"  rate_limited         {guard.get('rate_limited', 0)}")
     return 0
 
 
