@@ -28,6 +28,7 @@ import pytest
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_dispatch_review_contract as kbd_review_contract
 
 
 @pytest.fixture
@@ -69,20 +70,81 @@ _EVIDENCE_OK = (
 )
 
 
-def _insert_review_requested(conn, task_id, *, summary):
+def _insert_review_requested(conn, task_id, *, summary, metadata=None, started_at=None):
+    started_at = int(time.time()) - 60 if started_at is None else started_at
     conn.execute(
-        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
-        "VALUES (?, 'backend-dev', 'done', ?, ?, 'review_requested', ?)",
-        (task_id, int(time.time()) - 60, int(time.time()) - 30, summary),
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary, metadata) "
+        "VALUES (?, 'backend-dev', 'done', ?, ?, 'review_requested', ?, ?)",
+        (task_id, started_at, started_at + 30, summary,
+         kb._json_or_null(metadata) if metadata else None),
     )
     conn.commit()
 
 
 # --- Rule 1: evidence-gated hand-off, bounce doesn't count --------------------
+#
+# ADR-review-contract-v2.md §3: "Do not make the evidence gate retroactive --
+# only applies to request_review calls made after this ships." The rollout
+# cutover is ``kbd_review_contract.EVIDENCE_GATE_ROLLOUT_AT`` (module
+# constant, ``None`` until the owner flips it once the SOUL.md diffs that
+# teach backend-dev/frontend-dev the new hand-off format are live). Tests
+# that exercise enforcement set it explicitly; tests that exercise the
+# default/pre-cutover state leave it alone.
 
-def test_handoff_missing_all_evidence_bounces_without_spawning(conn):
-    task_id = kb.create_task(conn, title="review strategy-lab#200", assignee="reviewer")
-    _insert_review_requested(conn, task_id, summary="fixed the thing, trust me")
+# Standard gate1->gate2 hand-off shape mandated by the reviewer/release-reviewer
+# system prompt TODAY (before the SOUL.md diffs in PR #5 land) -- no Scope/
+# Files/Commands-run/base lines at all. This must never be bounced while the
+# gate is disabled or while the hand-off predates the rollout cutover.
+_GATE1_TO_GATE2_SUMMARY = (
+    "gate 1 (Sonnet) clean at head abc1234: ruff/pytest pass, no capital-scope "
+    "findings; PR https://github.com/Stockstrading/example-repo/pull/9"
+)
+_GATE1_TO_GATE2_METADATA = {
+    "published_pr": "https://github.com/Stockstrading/example-repo/pull/9",
+    "gate1": "clean",
+    "head": "abc1234",
+}
+
+
+def test_gate_disabled_by_default_never_bounces_standard_handoff(conn):
+    """Default state (no owner cutover yet): the gate must be fully inert, even
+    against the EXACT hand-off format reviewer/release-reviewer produce today."""
+    assert kbd_review_contract.EVIDENCE_GATE_ROLLOUT_AT is None
+    task_id = kb.create_task(conn, title="review strategy-lab#199", assignee="reviewer")
+    _insert_review_requested(
+        conn, task_id, summary=_GATE1_TO_GATE2_SUMMARY, metadata=_GATE1_TO_GATE2_METADATA,
+    )
+
+    ok, missing = kbd._handoff_has_evidence(conn, task_id)
+    assert ok is True
+    assert missing is None
+    assert kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False) is None
+
+
+def test_handoff_predating_cutover_is_grandfathered_in(conn, monkeypatch):
+    """Once the owner flips the cutover, a hand-off written BEFORE it (already
+    sitting in the queue) must still pass -- not retroactive."""
+    cutover = int(time.time())
+    monkeypatch.setattr(kbd_review_contract, "EVIDENCE_GATE_ROLLOUT_AT", cutover)
+    task_id = kb.create_task(conn, title="review strategy-lab#204", assignee="reviewer")
+    _insert_review_requested(
+        conn, task_id, summary=_GATE1_TO_GATE2_SUMMARY, metadata=_GATE1_TO_GATE2_METADATA,
+        started_at=cutover - 3600,
+    )
+
+    ok, missing = kbd._handoff_has_evidence(conn, task_id)
+    assert ok is True
+    assert missing is None
+
+
+def test_handoff_after_cutover_is_enforced(conn, monkeypatch):
+    """A hand-off written AFTER the owner's cutover is held to the new bar."""
+    cutover = int(time.time()) - 3600
+    monkeypatch.setattr(kbd_review_contract, "EVIDENCE_GATE_ROLLOUT_AT", cutover)
+    task_id = kb.create_task(conn, title="review strategy-lab#205", assignee="reviewer")
+    _insert_review_requested(
+        conn, task_id, summary="fixed the thing, trust me", started_at=cutover + 60,
+    )
 
     reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
 
@@ -91,13 +153,15 @@ def test_handoff_missing_all_evidence_bounces_without_spawning(conn):
     assert task.status == "blocked"
     assert task.block_kind == "needs_input"
     # No verdict run was created -- the bounce must never be counted as a round.
-    assert kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#200"}) == []
+    assert kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#205"}) == []
 
 
-def test_handoff_missing_base_sha_names_that_item(conn):
+def test_handoff_missing_base_sha_names_that_item(conn, monkeypatch):
+    cutover = int(time.time()) - 3600
+    monkeypatch.setattr(kbd_review_contract, "EVIDENCE_GATE_ROLLOUT_AT", cutover)
     task_id = kb.create_task(conn, title="review strategy-lab#201", assignee="reviewer")
     missing_base = _EVIDENCE_OK.replace("base: origin/main@abcdef1234567890\n", "")
-    _insert_review_requested(conn, task_id, summary=missing_base)
+    _insert_review_requested(conn, task_id, summary=missing_base, started_at=cutover + 60)
 
     ok, missing = kbd._handoff_has_evidence(conn, task_id)
 
@@ -105,9 +169,11 @@ def test_handoff_missing_base_sha_names_that_item(conn):
     assert "base: origin/main@" in missing
 
 
-def test_handoff_with_full_evidence_is_not_bounced(conn):
+def test_handoff_with_full_evidence_is_not_bounced(conn, monkeypatch):
+    cutover = int(time.time()) - 3600
+    monkeypatch.setattr(kbd_review_contract, "EVIDENCE_GATE_ROLLOUT_AT", cutover)
     task_id = kb.create_task(conn, title="review strategy-lab#202", assignee="reviewer")
-    _insert_review_requested(conn, task_id, summary=_EVIDENCE_OK)
+    _insert_review_requested(conn, task_id, summary=_EVIDENCE_OK, started_at=cutover + 60)
 
     ok, missing = kbd._handoff_has_evidence(conn, task_id)
     assert ok is True
@@ -117,9 +183,10 @@ def test_handoff_with_full_evidence_is_not_bounced(conn):
     assert reason is None
 
 
-def test_no_recorded_handoff_never_bounces(conn):
+def test_no_recorded_handoff_never_bounces(conn, monkeypatch):
     """A card with no review_requested run on record (e.g. owner/test-created)
-    must not be bounced for evidence this gate cannot see."""
+    must not be bounced for evidence this gate cannot see, even post-cutover."""
+    monkeypatch.setattr(kbd_review_contract, "EVIDENCE_GATE_ROLLOUT_AT", int(time.time()) - 3600)
     task_id = kb.create_task(conn, title="review strategy-lab#203", assignee="reviewer")
     ok, missing = kbd._handoff_has_evidence(conn, task_id)
     assert ok is True
