@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -68,6 +68,22 @@ Determine the current round from the history the task record already gives you: 
 
 The baseline duties in the Procedure section still apply on every round; the lens sets which inspection you lead with and weight most heavily.
 
+### Structured findings (delta-only review after round 1)
+
+Every verdict — approve or request-changes — records its findings as structured JSON in the `kanban_complete`/`kanban_request_changes` metadata, not only as comment prose:
+
+```json
+{
+  "findings": [
+    {"id": "F1", "severity": "MAJOR", "file": "app/core/handler.py", "line": 42, "status": "open"},
+    {"id": "F2", "severity": "MINOR", "file": "tests/test_handler.py", "line": 10, "status": "open"}
+  ],
+  "reviewed_sha": "<the commit SHA you actually reviewed>"
+}
+```
+
+`severity` is one of `NIT`, `MINOR`, `MAJOR`, `CRITICAL`, `BLOCKER`. On round 1 you review the whole PR and emit this list fresh. From round 2 on, the dispatcher posts a comment on the card containing the diff since your prior `reviewed_sha` plus your prior findings' `status` — review ONLY that delta, not the whole PR again: mark each prior finding `addressed` or `open`, and append any new one you find in the delta. Only a `MAJOR`-or-higher open finding blocks approval; `MINOR`/`NIT` findings are advisory — state explicitly in your verdict comment that they do not block ("advisory, not blocking").
+
 ### Lens variation for ad-hoc review fan-outs
 
 The same principle applies outside the Kanban review lane. When spawning multiple parallel reviewers via `delegate_task`, give each reviewer a different lens — one diff-only brief, one full-context brief, one checkout-and-run brief — rather than identical briefs. Identical briefs produce correlated verdicts and duplicate findings; varied briefs cover more defect classes for the same review spend.
@@ -113,11 +129,15 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 ```text
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    metadata={"review_outcome": "approved", "reviewer_checks": [...], "head_sha": "<40-char PR head commit SHA>"}
+    metadata={
+        "review_outcome": "approved", "reviewer_checks": [...],
+        "findings": [...], "reviewed_sha": "<sha you reviewed>",
+    }
 )
 ```
 
-Include the exact checks that passed and any bounded caveat that does not block acceptance.
+Include the exact checks that passed and any bounded caveat that does not block acceptance. Always include `head_sha` (the PR's head commit SHA you reviewed) in `metadata` — the dispatcher uses it to recognize when a later review spawn would be reviewing an unchanged head and skip the redundant run.
 
 #### Request changes
 
@@ -134,9 +154,13 @@ Then return the same task to its implementer:
 
 ```text
 kanban_request_changes(
-    reason="<concise summary of the required corrections>"
+    reason="<concise summary of the required corrections>",
+    metadata={"head_sha": "<40-char PR head commit SHA>"}
 )
 ```
+
+State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting. Include `head_sha` in `metadata` here too — the dispatcher dedupe applies to `changes_requested` verdicts the same way it applies to approvals.
+Include the same structured `findings`/`reviewed_sha` shape (see "Structured findings" above) in this transition's metadata so a round >= 2 re-review gets the delta, not a full re-read.
 
 State where the defect is, how it reproduces, why it violates the task, and what minimum outcome would resolve it. The transition does not use blocker recurrence accounting.
 
