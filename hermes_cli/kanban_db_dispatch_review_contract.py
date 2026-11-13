@@ -76,24 +76,48 @@ _EVIDENCE_FILES_RE = re.compile(r"(?im)^\s*files?\s*:")
 _EVIDENCE_COMMANDS_RE = re.compile(r"(?im)^\s*commands?[ -]?run\s*:")
 _EVIDENCE_BASE_RE = re.compile(r"base\s*:\s*origin/main@[0-9a-f]{6,40}", re.IGNORECASE)
 
+# Rule 1 cutover (ADR-review-contract-v2.md §3: "Do not make the evidence gate
+# retroactive -- only applies to request_review calls made after this ships").
+# ``None`` means the gate is fully disabled -- the state this constant must
+# ship in, because the SOUL.md diffs that teach backend-dev/frontend-dev to
+# actually produce a Scope/Files/Commands-run/base hand-off are "written out
+# in the PR for the owner to apply," not live yet (ground rule 9: SOUL.md is
+# owner-edited, never live-patched by an agent). Enforcing today would bounce
+# every card already sitting in the reviewer/release-reviewer queue across
+# all repos -- those hand-offs were written under the OLD contract and have
+# no way to know the new fields exist. The owner flips this to
+# ``int(time.time())`` (its own commit, once the SOUL diffs are confirmed
+# live) so only hand-offs written AFTER that moment are held to the new bar;
+# anything already in flight is grandfathered in by comparing its
+# ``review_requested`` run's ``started_at`` against the cutoff.
+EVIDENCE_GATE_ROLLOUT_AT: Optional[int] = None
+
 
 def _handoff_has_evidence(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
     """Rule 1: the ``kanban_request_review`` hand-off that put this card in the
     review lane must carry a scope line, a file list, a commands-run block
     with output, and a ``base: origin/main@<sha>`` freshness statement -- else
     the reviewer spends a paid round on a hand-off it cannot act on. Returns
-    ``(True, None)`` when all four are present (or no hand-off is on record,
-    e.g. an owner/test-created card -- never bounce on absence of data this
-    gate cannot see), else ``(False, <missing item>)`` naming the FIRST
-    missing item for an actionable bounce reason. Fails open on any lookup
-    error: this is a hand-off quality gate, not a safety check."""
+    ``(True, None)`` when all four are present, when the gate is not yet
+    rolled out (``EVIDENCE_GATE_ROLLOUT_AT`` is ``None``), when the hand-off
+    predates the rollout cutover (not retroactive -- ADR §3), or when no
+    hand-off is on record at all (e.g. an owner/test-created card -- never
+    bounce on absence of data this gate cannot see). Else ``(False, <missing
+    item>)`` naming the FIRST missing item for an actionable bounce reason.
+    Fails open on any lookup error: this is a hand-off quality gate, not a
+    safety check."""
+    if EVIDENCE_GATE_ROLLOUT_AT is None:
+        return True, None
     try:
         row = conn.execute(
-            "SELECT summary, metadata FROM task_runs WHERE task_id = ? "
+            "SELECT summary, metadata, started_at FROM task_runs WHERE task_id = ? "
             "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         if row is None:
+            return True, None
+        started_at = row["started_at"]
+        if started_at is None or started_at < EVIDENCE_GATE_ROLLOUT_AT:
             return True, None
         text = "\n".join(filter(None, [
             _kb._lossy_text(row["summary"]) or "",
