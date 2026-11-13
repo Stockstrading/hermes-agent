@@ -496,6 +496,112 @@ def test_finding_with_no_id_still_freezes_by_fallback_hash():
     ) is True
 
 
+def test_finding_identity_survives_line_drift_via_note_not_line():
+    """F3: the fallback hash basis is (file, severity, note) -- a legitimate
+    upstream edit that shifts the finding's line number must not change its
+    identity (unlike the old (file, line, severity, text) basis, which lost
+    the finding's frozen status whenever line drifted)."""
+    verdict_runs = [
+        {"metadata": kb._json_or_null({"findings": [
+            {"file": "a.py", "line": 10, "severity": "MAJOR", "note": "sql injection"},
+        ]})},
+        {"metadata": kb._json_or_null({"findings": []})},
+    ]
+    frozen = kbd_review_contract._frozen_finding_ids(verdict_runs)
+    assert len(frozen) == 1
+    drifted_round3 = {
+        "file": "a.py", "line": 14, "severity": "MAJOR", "note": "sql injection",
+        "category": "style",
+    }
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        drifted_round3, round_no=3, frozen_ids=frozen,
+    ) is True
+
+
+def test_malformed_non_string_category_fails_closed():
+    """F4: a malformed category (list/dict from an upstream schema slip) must
+    fail closed exactly like a missing/blank category -- not silently fall
+    through str() coercion into a never-matching, non-blocking verdict."""
+    finding = {"id": "F7", "severity": "MAJOR", "category": ["capital-safety"]}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        finding, round_no=3, frozen_ids=set(),
+    ) is True
+    finding_dict_category = {"id": "F8", "severity": "MAJOR", "category": {"name": "style"}}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        finding_dict_category, round_no=3, frozen_ids=set(),
+    ) is True
+
+
+# --- F10 (gate-2 round): PR URL resolves from the review card's OWN body, no --
+# completion_contract binding ever required, and a mismatched contract is never
+# trusted. --------------------------------------------------------------------
+
+def test_pr_meta_resolves_pr_url_from_review_cards_own_body_no_contract_bound(conn, monkeypatch):
+    """F10: the ordinary single-card kanban_request_review/kanban_request_changes
+    cycle never binds completion_contract to a PR URL. pr_meta_for_review_cap
+    must still reach the docs-only cap by reading the PR URL straight out of
+    the review card's own body (the common 'PR: https://...' hand-off shape)."""
+    pr_key = "bff-api#9341"
+    task_id = kb.create_task(
+        conn, title=f"review {pr_key}",
+        body="PR: https://github.com/Stockstrading/bff-api/pull/9341 -- docs only change.",
+        assignee="reviewer",
+    )
+    task = kb.get_task(conn, task_id)
+    assert task.completion_contract == "local-only"  # never bound -- F10's premise
+    monkeypatch.setattr(
+        kb_pr_acceptance, "fetch_pr_files",
+        lambda *_a, **_k: {"files": ["docs/readme.md"], "additions": 5, "deletions": 5},
+    )
+
+    meta = kbd_review_contract.pr_meta_for_review_cap(
+        conn, pr_key, "reviewer", card_text=f"{task.title}\n{task.body}",
+    )
+
+    assert meta == {"files": ["docs/readme.md"], "additions": 5, "deletions": 5}
+
+
+def test_pr_url_for_key_never_trusts_contract_bound_to_a_different_pr(conn):
+    """F10 part 2: a completion_contract found on a same-repo card must encode
+    THIS pr_key's own number before it is trusted -- a contract that resolved
+    to a different PR in the same repo (scope changed mid-flight) is treated
+    exactly like no contract found, never fed into this PR's classification."""
+    pr_key = "bff-api#9341"
+    other_task_id = kb.create_task(conn, title=f"dev work for {pr_key}", assignee="backend-dev")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/Stockstrading/bff-api/pull/8888", other_task_id),
+    )
+    conn.commit()
+
+    resolved = kbd._pr_url_for_key(conn, pr_key)
+
+    assert resolved is None
+
+
+def test_live_review_cost_gate_reaches_docs_only_cap_via_card_body_pr_url(conn, monkeypatch):
+    """End-to-end F10: a docs-only PR whose dev task never bound a
+    completion_contract still hits the docs-only cap of 1 at the live
+    _review_cost_gate call site, because the PR URL is read from the review
+    card's own body."""
+    pr_key = "bff-api#9441"
+    task_id = kb.create_task(
+        conn, title=f"review {pr_key}",
+        body="PR: https://github.com/Stockstrading/bff-api/pull/9441",
+        assignee="reviewer",
+    )
+    monkeypatch.setattr(
+        kb_pr_acceptance, "fetch_pr_files",
+        lambda *_a, **_k: {"files": ["docs/readme.md"], "additions": 5, "deletions": 5},
+    )
+    _insert_real_round(conn, task_id, "reviewer")  # 1 round already meets the docs-only cap of 1
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+
+    assert reason == "review_round_cap"
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
 # --- F5 (gate-2 round): deterministic round ordering on an ended_at tie -------
 
 def test_review_verdict_runs_tiebreaks_deterministically_on_ended_at_tie(conn):

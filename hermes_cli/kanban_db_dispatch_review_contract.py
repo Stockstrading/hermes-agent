@@ -72,22 +72,27 @@ def _review_round_cap_for(task, pr_meta: Optional[dict] = None) -> int:
     return REVIEW_ROUND_CAP_DEFAULT
 
 
-def pr_meta_for_review_cap(conn: sqlite3.Connection, pr: str, assignee: str) -> dict:
+def pr_meta_for_review_cap(
+    conn: sqlite3.Connection, pr: str, assignee: str, *, card_text: Optional[str] = None,
+) -> dict:
     """Real ``{"files", "additions", "deletions"}`` for Rule 6's
     ``_is_docs_only_review`` at the live ``_review_cost_gate`` call site (F2,
     hermes-agent PR #5 gate-2): before this, no ``pr_meta`` was ever fetched
     there, so ``_is_docs_only_review`` always saw ``files=[]`` and the
     docs-only cap was unreachable in production. Resolves the published PR
     URL the same way :func:`hermes_cli.kanban_db_dispatch._owner_escalation_summary`
-    already does, then one GraphQL round trip via ``kanban_pr_acceptance``.
+    already does -- falling back to ``card_text`` (the review card's OWN
+    title/body, F10) when no task's ``completion_contract`` has ever been
+    bound to this PR, which is the normal state for an ordinary single-card
+    review-lane cycle -- then one GraphQL round trip via ``kanban_pr_acceptance``.
     Fails closed to ``{}`` (identical behaviour to before this was wired in)
-    whenever no PR has been published yet or the lookup fails for any
+    whenever no PR URL resolves at all or the lookup fails for any
     reason -- both classifiers already treat an empty file list as "never
     docs-only/low-risk"."""
     from hermes_cli import kanban_db_dispatch as _kbd
     from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
 
-    pr_url = _kbd._pr_url_for_key(conn, pr)
+    pr_url = _kbd._pr_url_for_key(conn, pr, fallback_text=card_text)
     if not pr_url:
         return {}
     try:
@@ -185,13 +190,17 @@ def _finding_is_addressed(finding: dict) -> bool:
 def _finding_key(finding: dict) -> str:
     """Stable identity for a finding across review rounds: its explicit
     ``id`` when the reviewer set one, else a deterministic fallback hash of
-    ``(file, line, severity, text)`` (F3, hermes-agent PR #5 gate-2) -- without
-    this, a round-2 finding with no ``id`` silently lost its frozen/blocking
-    status by round 3, because nothing requires a reviewer to set one."""
+    ``(file, severity, note)`` (F3, hermes-agent PR #5 gate-2 round 2). The
+    findings schema actually used throughout this pipeline is ``id, severity,
+    file, line, status, category, found_by, note`` -- there is no ``text``
+    field, so hashing it always contributed an empty string. ``line`` is
+    deliberately excluded from the basis too: a legitimate upstream edit that
+    shifts a line number must not change an id-less finding's identity and
+    silently drop its frozen/blocking status by round 3."""
     fid = str(finding.get("id") or "").strip()
     if fid:
         return fid
-    basis = "|".join(str(finding.get(k) or "") for k in ("file", "line", "severity", "text"))
+    basis = "|".join(str(finding.get(k) or "") for k in ("file", "severity", "note"))
     return "fallback:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
@@ -214,18 +223,19 @@ def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[
     instead of silently losing its status -- F3) only counts (stays eligible
     to block THIS PR) if its ``category`` is capital-safety, data-loss, or
     security. A frozen-list finding is always eligible -- Rule 4 gates NEW
-    findings only. A ``category`` that is missing/blank fails closed (treated
+    findings only. A ``category`` that is missing/blank, OR not a string at
+    all (e.g. a list/dict from an upstream schema slip), fails closed (treated
     as blocking, same convention as ``_is_docs_only_review``/
     ``_is_low_risk_review``'s "unknown data is never safe") until a reviewer
-    explicitly classifies it as something else (F4)."""
+    explicitly classifies it as a recognised string category (F4)."""
     if round_no <= _FREEZE_ROUND_CUTOFF:
         return True
     if _finding_key(finding) in frozen_ids:
         return True
     raw_category = finding.get("category")
-    if raw_category is None or not str(raw_category).strip():
-        return True  # unclassified: fail closed, stays blocking
-    category = str(raw_category).strip().lower()
+    if raw_category is None or not isinstance(raw_category, str) or not raw_category.strip():
+        return True  # unclassified or malformed (non-string): fail closed, stays blocking
+    category = raw_category.strip().lower()
     return category in _FREEZE_ALLOWED_CATEGORIES
 
 
