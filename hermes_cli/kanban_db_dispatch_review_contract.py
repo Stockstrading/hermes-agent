@@ -1,0 +1,174 @@
+"""Review contract v2 helpers (ADR-review-contract-v2.md, card t_cca086d6 /
+t_3183cd6d): round-cap classification, evidence-gated hand-off, and the
+frozen-findings rule. Split out of ``hermes_cli.kanban_db_dispatch`` (that
+facade's ``FILE_LINES`` budget is already over target) -- origin-resident
+predicates (``_is_capital_review``, ``_findings_from_metadata``) are reached
+late-bound via a function-local import of the facade (import-cycle breaking),
+same convention the facade itself uses for ``kanban_db``.
+"""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+from dataclasses import dataclass
+from typing import Optional
+
+from hermes_cli import kanban_db as _kb
+
+# Rule 7 (single source of truth): three named round caps replace the single
+# flat ``_REVIEW_ROUND_CAP`` that used to live in kanban_db_dispatch.py. Every
+# other place that states a cap (SOUL.md prose, the review-round-cap.py cron)
+# must read one of these three, never restate a digit of its own -- numbers
+# pending explicit owner sign-off, see the ADR.
+REVIEW_ROUND_CAP_DEFAULT = 3    # non-capital PR: round 3 unapproved -> owner queue
+REVIEW_ROUND_CAP_CAPITAL = 2    # _CAPITAL_REPOS / [CAPITAL] marker: round 2 unapproved -> owner queue
+REVIEW_ROUND_CAP_DOCS_ONLY = 1  # Rule 6 (_is_docs_only_review): one gate, one round
+
+
+@dataclass
+class _TaskLike:
+    """Minimal (id, title, body) shim so dispatch-time code holding only a raw
+    sqlite3.Row can reuse the Task-shaped predicates below without
+    constructing a real ``Task``."""
+
+    id: Optional[str] = None
+    title: str = ""
+    body: str = ""
+
+
+_DOCS_ONLY_PATH_RE = re.compile(r"(^|/)docs/|\.md$", re.IGNORECASE)
+
+
+def _is_docs_only_review(task, pr_meta: dict) -> bool:
+    """Rule 6: True only for a non-capital PR touching EXCLUSIVELY docs/** or
+    *.md files -- size-independent (stricter than ``_is_low_risk_review``,
+    which also allows tests/CI paths and caps at ``_SMALL_PR_LINES``).
+    Capital-sensitive PRs never qualify regardless of file list; an unknown
+    file list fails closed (never docs-only), same convention as
+    ``_is_low_risk_review``."""
+    from hermes_cli.kanban_db_dispatch import _CAPITAL_DENY_SUBSTRINGS, _is_capital_review
+
+    if _is_capital_review(task):
+        return False
+    files = pr_meta.get("files") or []
+    if not files:
+        return False
+    if not all(_DOCS_ONLY_PATH_RE.search(f) for f in files):
+        return False
+    return not any(marker in f.lower() for f in files for marker in _CAPITAL_DENY_SUBSTRINGS)
+
+
+def _review_round_cap_for(task, pr_meta: Optional[dict] = None) -> int:
+    """Rule 7: the base round cap for this PR's class, before any
+    ``_REVIEW_ROUND_CAP_BY_PR`` owner override is applied on top."""
+    from hermes_cli.kanban_db_dispatch import _is_capital_review
+
+    if _is_docs_only_review(task, pr_meta or {}):
+        return REVIEW_ROUND_CAP_DOCS_ONLY
+    if _is_capital_review(task):
+        return REVIEW_ROUND_CAP_CAPITAL
+    return REVIEW_ROUND_CAP_DEFAULT
+
+
+_EVIDENCE_SCOPE_RE = re.compile(r"(?im)^\s*scope\s*:")
+_EVIDENCE_FILES_RE = re.compile(r"(?im)^\s*files?\s*:")
+_EVIDENCE_COMMANDS_RE = re.compile(r"(?im)^\s*commands?[ -]?run\s*:")
+_EVIDENCE_BASE_RE = re.compile(r"base\s*:\s*origin/main@[0-9a-f]{6,40}", re.IGNORECASE)
+
+
+def _handoff_has_evidence(conn: sqlite3.Connection, task_id: str) -> tuple[bool, Optional[str]]:
+    """Rule 1: the ``kanban_request_review`` hand-off that put this card in the
+    review lane must carry a scope line, a file list, a commands-run block
+    with output, and a ``base: origin/main@<sha>`` freshness statement -- else
+    the reviewer spends a paid round on a hand-off it cannot act on. Returns
+    ``(True, None)`` when all four are present (or no hand-off is on record,
+    e.g. an owner/test-created card -- never bounce on absence of data this
+    gate cannot see), else ``(False, <missing item>)`` naming the FIRST
+    missing item for an actionable bounce reason. Fails open on any lookup
+    error: this is a hand-off quality gate, not a safety check."""
+    try:
+        row = conn.execute(
+            "SELECT summary, metadata FROM task_runs WHERE task_id = ? "
+            "AND outcome = 'review_requested' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return True, None
+        text = "\n".join(filter(None, [
+            _kb._lossy_text(row["summary"]) or "",
+            _kb._lossy_text(row["metadata"]) or "",
+        ]))
+        if not _EVIDENCE_SCOPE_RE.search(text):
+            return False, "a scope line (Scope: ...)"
+        if not _EVIDENCE_FILES_RE.search(text):
+            return False, "a file list (Files: ...)"
+        if not _EVIDENCE_COMMANDS_RE.search(text):
+            return False, "a commands-run block with output (Commands run: ...)"
+        if not _EVIDENCE_BASE_RE.search(text):
+            return False, "a freshness statement (base: origin/main@<sha>)"
+        return True, None
+    except Exception as exc:  # health: allow BLE001 -- evidence gate must never stop the dispatcher; fails open
+        _kb._log.warning("handoff evidence check skipped for %s: %s", task_id, exc)
+        return True, None
+
+
+# --- Rule 2/3 extension + Rule 4: proof-of-fix and frozen findings ------------
+# Two independent gaps on top of the existing delta-only review: an
+# "addressed" finding needs proof (test_ref), and after round 2 a brand-new
+# finding only reopens the PR's blocking list when it is genuinely
+# safety-critical -- everything else is a follow-up.
+_FREEZE_ROUND_CUTOFF = 2
+_FREEZE_ALLOWED_CATEGORIES = {"capital-safety", "data-loss", "security"}
+
+
+def _finding_is_addressed(finding: dict) -> bool:
+    """Rule 2/3: an 'addressed' finding only counts as resolved when it
+    carries a non-blank ``test_ref`` (the test that failed before, passes
+    now); missing ``test_ref`` keeps it open regardless of the reported
+    ``status``."""
+    if str(finding.get("status", "open")).lower() != "addressed":
+        return False
+    return bool(str(finding.get("test_ref") or "").strip())
+
+
+def _frozen_finding_ids(verdict_runs: list) -> set[str]:
+    """IDs reported in round 1 and round 2 (the first two verdict runs) -- the
+    frozen list Rule 4 locks in after round 2."""
+    from hermes_cli.kanban_db_dispatch import _findings_from_metadata
+
+    ids: set[str] = set()
+    for run in verdict_runs[:_FREEZE_ROUND_CUTOFF]:
+        for f in _findings_from_metadata(run["metadata"]):
+            fid = f.get("id")
+            if fid:
+                ids.add(str(fid))
+    return ids
+
+
+def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[str]) -> bool:
+    """Rule 4: for ``round_no`` > 2, a finding not already present in the
+    round-1/round-2 frozen list only counts (stays eligible to block THIS PR)
+    if its ``category`` is capital-safety, data-loss, or security. A
+    frozen-list finding (matched by id) is always eligible -- Rule 4 gates NEW
+    findings only. Missing/unknown category on a new finding fails closed
+    (never exempt)."""
+    if round_no <= _FREEZE_ROUND_CUTOFF:
+        return True
+    if str(finding.get("id") or "") in frozen_ids:
+        return True
+    category = str(finding.get("category") or "").strip().lower()
+    return category in _FREEZE_ALLOWED_CATEGORIES
+
+
+def filter_blocking_findings(findings: list, round_no: int, frozen_ids: set[str]) -> tuple[list, list]:
+    """Rule 4: split a round's findings into (still eligible for
+    ``should_block_on_findings``, follow-up only -- never reopens this PR's
+    blocking list, surfaced as a ``Follow-ups:`` line / separate card
+    instead)."""
+    eligible: list = []
+    followups: list = []
+    for f in findings:
+        (eligible if _finding_allowed_after_freeze(f, round_no, frozen_ids) else followups).append(f)
+    return eligible, followups
+# --- end Rule 2/3 extension + Rule 4 -------------------------------------------

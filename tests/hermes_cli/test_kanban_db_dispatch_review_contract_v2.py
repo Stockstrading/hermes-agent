@@ -1,0 +1,327 @@
+"""Review contract v2 (ADR-review-contract-v2.md, card t_cca086d6 / t_3183cd6d):
+delta reviews, frozen findings, ONE synced round cap.
+
+Rule 1 -- evidence-gated hand-off: a ``kanban_request_review`` hand-off missing
+a scope line / file list / commands-run block / ``base: origin/main@<sha>``
+freshness statement bounces the card instead of spawning a reviewer, and the
+bounce is never counted as a round.
+
+Rule 2/3 extension -- an "addressed" finding needs a ``test_ref`` to count as
+resolved; missing it keeps the finding open.
+
+Rule 4 -- frozen findings: after round 2, a brand-new (non frozen-list)
+finding only stays eligible to block the PR if its category is
+capital-safety, data-loss, or security; everything else becomes a follow-up.
+
+Rule 7 -- single source of truth: three named round caps (default/capital/
+docs-only) replace the single flat ``_REVIEW_ROUND_CAP``, with the owner's
+per-PR override (``_REVIEW_ROUND_CAP_BY_PR``) still taking precedence.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    db_path = kb.kanban_db_path(board="default")
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    kb.init_db()
+    return home
+
+
+@pytest.fixture
+def conn(kanban_home):
+    with kbc.connect() as c:
+        yield c
+
+
+def _insert_real_round(conn, task_id, profile, *, metadata=None, started_at=None, ended_at=None):
+    now = int(time.time())
+    started_at = now - 600 if started_at is None else started_at
+    ended_at = now - 400 if ended_at is None else ended_at
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, ?, 'done', ?, ?, 'completed', ?)",
+        (task_id, profile, started_at, ended_at, kb._json_or_null(metadata) if metadata else None),
+    )
+    conn.commit()
+
+
+_EVIDENCE_OK = (
+    "Scope: fix the review round cap.\n"
+    "Files: hermes_cli/kanban_db_dispatch.py, tests/hermes_cli/test_x.py\n"
+    "Commands run: scripts/run_tests.sh tests/hermes_cli/test_x.py -> 4 passed\n"
+    "base: origin/main@abcdef1234567890\n"
+)
+
+
+def _insert_review_requested(conn, task_id, *, summary):
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, summary) "
+        "VALUES (?, 'backend-dev', 'done', ?, ?, 'review_requested', ?)",
+        (task_id, int(time.time()) - 60, int(time.time()) - 30, summary),
+    )
+    conn.commit()
+
+
+# --- Rule 1: evidence-gated hand-off, bounce doesn't count --------------------
+
+def test_handoff_missing_all_evidence_bounces_without_spawning(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#200", assignee="reviewer")
+    _insert_review_requested(conn, task_id, summary="fixed the thing, trust me")
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+
+    assert reason == "handoff_missing_evidence"
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    # No verdict run was created -- the bounce must never be counted as a round.
+    assert kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#200"}) == []
+
+
+def test_handoff_missing_base_sha_names_that_item(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#201", assignee="reviewer")
+    missing_base = _EVIDENCE_OK.replace("base: origin/main@abcdef1234567890\n", "")
+    _insert_review_requested(conn, task_id, summary=missing_base)
+
+    ok, missing = kbd._handoff_has_evidence(conn, task_id)
+
+    assert ok is False
+    assert "base: origin/main@" in missing
+
+
+def test_handoff_with_full_evidence_is_not_bounced(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#202", assignee="reviewer")
+    _insert_review_requested(conn, task_id, summary=_EVIDENCE_OK)
+
+    ok, missing = kbd._handoff_has_evidence(conn, task_id)
+    assert ok is True
+    assert missing is None
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+    assert reason is None
+
+
+def test_no_recorded_handoff_never_bounces(conn):
+    """A card with no review_requested run on record (e.g. owner/test-created)
+    must not be bounced for evidence this gate cannot see."""
+    task_id = kb.create_task(conn, title="review strategy-lab#203", assignee="reviewer")
+    ok, missing = kbd._handoff_has_evidence(conn, task_id)
+    assert ok is True
+    assert missing is None
+
+
+# --- Rule 2/3 extension: test_ref required for "addressed" --------------------
+
+def test_addressed_finding_without_test_ref_counts_as_open():
+    finding = {"id": "F1", "severity": "MAJOR", "status": "addressed"}
+    assert kbd._finding_is_addressed(finding) is False
+
+
+def test_addressed_finding_with_test_ref_counts_as_resolved():
+    finding = {"id": "F1", "severity": "MAJOR", "status": "addressed", "test_ref": "tests/test_x.py::test_f1"}
+    assert kbd._finding_is_addressed(finding) is True
+
+
+def test_open_findings_from_runs_excludes_addressed_with_test_ref(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#210", assignee="reviewer")
+    findings = [
+        {"id": "F1", "severity": "MAJOR", "status": "addressed", "test_ref": "tests/test_x.py::test_f1"},
+        {"id": "F2", "severity": "MAJOR", "status": "addressed"},  # no test_ref -> still open
+    ]
+    _insert_real_round(conn, task_id, "reviewer", metadata={"findings": findings})
+    runs = kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#210"})
+
+    open_findings = kbd._open_findings_from_runs(runs)
+
+    assert [f["id"] for f in open_findings] == ["F2"]
+
+
+# --- Rule 4: frozen findings after round 2 -------------------------------------
+
+def test_round1_and_round2_are_never_frozen():
+    findings = [{"id": "F1", "severity": "MAJOR", "category": "style"}]
+    assert kbd._finding_allowed_after_freeze(findings[0], round_no=1, frozen_ids=set()) is True
+    assert kbd._finding_allowed_after_freeze(findings[0], round_no=2, frozen_ids=set()) is True
+
+
+def test_round3_new_non_safety_finding_is_excluded_after_freeze():
+    finding = {"id": "F3", "severity": "MAJOR", "category": "style"}
+    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids=set()) is False
+
+
+def test_round3_new_capital_safety_finding_stays_eligible():
+    finding = {"id": "F9", "severity": "CRITICAL", "category": "capital-safety"}
+    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids=set()) is True
+
+
+def test_round3_frozen_list_finding_stays_eligible_regardless_of_category():
+    finding = {"id": "F1", "severity": "MAJOR", "category": "style"}
+    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids={"F1"}) is True
+
+
+def test_round3_missing_category_on_new_finding_fails_closed():
+    finding = {"id": "F5", "severity": "MAJOR"}
+    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids=set()) is False
+
+
+def test_filter_blocking_findings_splits_eligible_and_followups():
+    findings = [
+        {"id": "F1", "severity": "MAJOR", "category": "style"},       # frozen -> eligible
+        {"id": "F3", "severity": "MAJOR", "category": "style"},       # new, non-safety -> followup
+        {"id": "F9", "severity": "CRITICAL", "category": "security"},  # new, safety -> eligible
+    ]
+    eligible, followups = kbd.filter_blocking_findings(findings, round_no=3, frozen_ids={"F1"})
+    assert [f["id"] for f in eligible] == ["F1", "F9"]
+    assert [f["id"] for f in followups] == ["F3"]
+
+
+def test_frozen_finding_ids_reads_only_round_1_and_2():
+    runs = [
+        {"metadata": kb._json_or_null({"findings": [{"id": "F1"}]})},
+        {"metadata": kb._json_or_null({"findings": [{"id": "F2"}]})},
+        {"metadata": kb._json_or_null({"findings": [{"id": "F3"}]})},  # round 3: NOT frozen
+    ]
+    frozen = kbd._frozen_finding_ids(runs)
+    assert frozen == {"F1", "F2"}
+
+
+def test_build_round_delta_context_round4_moves_new_non_safety_finding_to_followups(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#220", assignee="reviewer")
+    _insert_real_round(conn, task_id, "reviewer", metadata={"findings": [{"id": "F1", "severity": "MAJOR", "category": "style"}]})
+    _insert_real_round(conn, task_id, "reviewer", metadata={"findings": [{"id": "F1", "severity": "MAJOR", "category": "style"}]})
+    _insert_real_round(conn, task_id, "reviewer", metadata={
+        "findings": [{"id": "F3", "severity": "MAJOR", "category": "style"}],
+        "reviewed_sha": "cafef00d",
+    })
+
+    context = kbd.build_round_delta_context(conn, task_id, "reviewer")
+
+    assert context is not None
+    assert "Follow-ups" in context
+    # F3 is new in round 3 and non-safety -> it must appear in the follow-ups
+    # section, never in the "Prior findings" (blocking) section.
+    followups_idx = context.index("Follow-ups")
+    f3_idx = context.index("F3")
+    assert f3_idx > followups_idx
+    prior_section = context[:followups_idx]
+    assert "F3" not in prior_section
+
+
+# --- Rule 7: single source of truth for the base round cap --------------------
+
+def test_non_capital_pr_base_cap_is_default():
+    task = kbd._TaskLike(title="review strategy-lab#230", body="")
+    assert kbd._review_round_cap_for(task) == kbd.REVIEW_ROUND_CAP_DEFAULT
+    assert kbd.REVIEW_ROUND_CAP_DEFAULT == 3
+
+
+def test_capital_repo_pr_base_cap_is_capital():
+    task = kbd._TaskLike(title="review strategy-api#276", body="")
+    assert kbd._review_round_cap_for(task) == kbd.REVIEW_ROUND_CAP_CAPITAL
+    assert kbd.REVIEW_ROUND_CAP_CAPITAL == 2
+
+
+def test_capital_marker_pr_base_cap_is_capital():
+    task = kbd._TaskLike(title="[CAPITAL] review bff-api#999", body="")
+    assert kbd._review_round_cap_for(task) == kbd.REVIEW_ROUND_CAP_CAPITAL
+
+
+def test_docs_only_pr_base_cap_is_one():
+    task = kbd._TaskLike(title="review bff-api#141", body="")
+    pr_meta = {"files": ["docs/readme.md"], "additions": 50, "deletions": 50}
+    assert kbd._review_round_cap_for(task, pr_meta) == kbd.REVIEW_ROUND_CAP_DOCS_ONLY
+    assert kbd.REVIEW_ROUND_CAP_DOCS_ONLY == 1
+
+
+def test_is_docs_only_review_has_no_size_cap_unlike_is_low_risk_review():
+    task = kbd._TaskLike(title="review bff-api#141", body="")
+    pr_meta = {"files": ["docs/readme.md"], "additions": 500, "deletions": 500}
+    assert kbd._is_docs_only_review(task, pr_meta) is True
+    assert kbd._is_low_risk_review(task, pr_meta) is False  # over _SMALL_PR_LINES
+
+
+def test_is_docs_only_review_rejects_test_file():
+    task = kbd._TaskLike(title="review bff-api#141", body="")
+    pr_meta = {"files": ["docs/readme.md", "tests/test_x.py"]}
+    assert kbd._is_docs_only_review(task, pr_meta) is False
+
+
+def test_capital_pr_never_docs_only_regardless_of_files():
+    task = kbd._TaskLike(title="[CAPITAL] review strategy-api#276", body="")
+    pr_meta = {"files": ["docs/readme.md"]}
+    assert kbd._is_docs_only_review(task, pr_meta) is False
+
+
+def test_capital_round_2_escalates_non_capital_round_3_does_not(conn):
+    """Regression guard for Rule 7: a capital PR escalates at round 2; the
+    SAME round count on a non-capital PR must not escalate yet (cap 3)."""
+    capital_task = kb.create_task(conn, title="review strategy-api#276", assignee="reviewer")
+    for _ in range(2):
+        _insert_real_round(conn, capital_task, "reviewer")
+    # strategy-api#276 carries an owner override of 7 in _REVIEW_ROUND_CAP_BY_PR --
+    # use a capital PR with no override to exercise the base cap of 2.
+    assert kbd._REVIEW_ROUND_CAP_BY_PR.get("strategy-api#276") == 7
+    capital_task2 = kb.create_task(conn, title="review risk-api#999", assignee="reviewer")
+    for _ in range(2):
+        _insert_real_round(conn, capital_task2, "reviewer")
+
+    non_capital_task = kb.create_task(conn, title="review strategy-lab#240", assignee="reviewer")
+    for _ in range(2):
+        _insert_real_round(conn, non_capital_task, "reviewer")
+
+    capital_reason = kbd._review_cost_gate(conn, capital_task2, "reviewer", dry_run=False)
+    non_capital_reason = kbd._review_cost_gate(conn, non_capital_task, "reviewer", dry_run=False)
+
+    assert capital_reason == "review_round_cap"
+    assert non_capital_reason is None
+
+
+def test_by_pr_override_still_honoured_on_top_of_new_base_caps(conn):
+    """Regression guard (same bug class fixed once already in PR #1): the
+    owner's per-PR override must still raise the cap above the new base of 3,
+    not be silently discarded by the new constant."""
+    pr_key = "strategy-lab#27"  # owner override of 8 in _REVIEW_ROUND_CAP_BY_PR
+    assert kbd._REVIEW_ROUND_CAP_BY_PR.get(pr_key) == 8
+    task_id = kb.create_task(conn, title=f"review {pr_key}", assignee="reviewer")
+    for _ in range(5):  # above the new base default (3), below the override (8)
+        _insert_real_round(conn, task_id, "reviewer")
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+
+    assert reason is None
+    assert kb.get_task(conn, task_id).status != "blocked"
+
+
+# --- Rule 5: exactly 3-line owner escalation summary ---------------------------
+
+def test_owner_escalation_summary_is_exactly_three_lines(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#250", assignee="reviewer")
+    for _ in range(3):
+        _insert_real_round(conn, task_id, "reviewer")
+    runs = kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#250"})
+
+    summary = kbd._owner_escalation_summary(
+        conn, "reviewer", "strategy-lab#250", "real_rounds", 3, 3, runs,
+    )
+
+    lines = summary.split("\n")
+    assert len(lines) == 3
+    assert "open findings after freeze" in lines[0].lower()
+    assert "head sha" in lines[1].lower() and "ci" in lines[1].lower()
+    assert "merge" in lines[2].lower() and "waive" in lines[2].lower() and "close" in lines[2].lower()
