@@ -230,3 +230,65 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- fetch_pr_files (F2, hermes-agent PR #5 gate-2): feeds the review-cost-gate's --
+# docs-only/low-risk classifiers with a real file list. ---------------------------
+
+def test_fetch_pr_files_returns_real_file_list(monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as kb_pr_acceptance
+
+    def _api(endpoint, *, query=None, paginate=False, profile_home=None):
+        assert endpoint == "graphql"
+        return {"data": {"repository": {"pullRequest": {
+            "additions": 5, "deletions": 5, "changedFiles": 1,
+            "files": {"nodes": [{"path": "docs/readme.md"}]},
+        }}}}
+    monkeypatch.setattr(kb_pr_acceptance, "_api", _api)
+
+    url = "https://github.com/acme/repo/pull/7"
+    meta = kb_pr_acceptance.fetch_pr_files(url, url)
+
+    assert meta == {"files": ["docs/readme.md"], "additions": 5, "deletions": 5}
+
+
+def test_fetch_pr_files_fails_closed_when_page_is_truncated(monkeypatch):
+    """GraphQL's files connection pages at 100: a PR with more changed files
+    than the page returned must yield None (unknown list), never a silently
+    partial one that could misclassify a non-docs-only PR as docs-only."""
+    from hermes_cli import kanban_pr_acceptance as kb_pr_acceptance
+
+    def _api(endpoint, *, query=None, paginate=False, profile_home=None):
+        return {"data": {"repository": {"pullRequest": {
+            "additions": 500, "deletions": 500, "changedFiles": 150,
+            "files": {"nodes": [{"path": f"f{i}.py"} for i in range(100)]},
+        }}}}
+    monkeypatch.setattr(kb_pr_acceptance, "_api", _api)
+
+    url = "https://github.com/acme/repo/pull/7"
+    assert kb_pr_acceptance.fetch_pr_files(url, url) is None
+
+
+def test_fetch_pr_files_fails_closed_on_lookup_error(monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as kb_pr_acceptance
+
+    def _api(*_a, **_k):
+        raise ValueError("boom")
+    monkeypatch.setattr(kb_pr_acceptance, "_api", _api)
+
+    url = "https://github.com/acme/repo/pull/7"
+    assert kb_pr_acceptance.fetch_pr_files(url, url) is None
+
+
+def test_fetch_pr_files_fails_closed_on_pr_url_mismatch(monkeypatch):
+    """contract/published_pr naming two different PRs must never resolve --
+    same convention as fetch_pr_head_sha."""
+    from hermes_cli import kanban_pr_acceptance as kb_pr_acceptance
+
+    def _boom(*_a, **_k):
+        raise AssertionError("_api must not be called on a mismatched contract")
+    monkeypatch.setattr(kb_pr_acceptance, "_api", _boom)
+
+    assert kb_pr_acceptance.fetch_pr_files(
+        "acme/repo", "https://github.com/other/repo/pull/9",
+    ) is None

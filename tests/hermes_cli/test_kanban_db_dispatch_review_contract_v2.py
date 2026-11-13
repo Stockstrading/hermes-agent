@@ -29,6 +29,7 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_dispatch_review_contract as kbd_review_contract
+from hermes_cli import kanban_pr_acceptance as kb_pr_acceptance
 
 
 @pytest.fixture
@@ -243,8 +244,10 @@ def test_round3_frozen_list_finding_stays_eligible_regardless_of_category():
 
 
 def test_round3_missing_category_on_new_finding_fails_closed():
+    """F4 (gate-2 round): missing category must fail CLOSED (stay blocking),
+    not be silently treated as a safe/non-blocking category."""
     finding = {"id": "F5", "severity": "MAJOR"}
-    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids=set()) is False
+    assert kbd._finding_allowed_after_freeze(finding, round_no=3, frozen_ids=set()) is True
 
 
 def test_filter_blocking_findings_splits_eligible_and_followups():
@@ -392,3 +395,125 @@ def test_owner_escalation_summary_is_exactly_three_lines(conn):
     assert "open findings after freeze" in lines[0].lower()
     assert "head sha" in lines[1].lower() and "ci" in lines[1].lower()
     assert "merge" in lines[2].lower() and "waive" in lines[2].lower() and "close" in lines[2].lower()
+
+
+# --- F2 (gate-2 round): pr_meta is now wired into the live _review_cost_gate --
+# call site, so Rule 6's docs-only cap is actually reachable in production. ---
+
+def test_pr_meta_for_review_cap_short_circuits_with_no_published_pr(conn, monkeypatch):
+    """No completion_contract on record yet: pr_meta_for_review_cap must return
+    {} WITHOUT ever touching the network -- identical behaviour to before this
+    was wired in, and no new network dependency for the common no-PR-yet case."""
+    def _boom(*_a, **_k):
+        raise AssertionError("fetch_pr_files must not be called with no published PR")
+    monkeypatch.setattr(kb_pr_acceptance, "fetch_pr_files", _boom)
+    task_id = kb.create_task(conn, title="review bff-api#200", assignee="reviewer")
+
+    assert kbd_review_contract.pr_meta_for_review_cap(conn, "bff-api#200", "reviewer") == {}
+    assert kb.get_task(conn, task_id).status != "blocked"
+
+
+def test_pr_meta_for_review_cap_resolves_published_pr(conn, monkeypatch):
+    """A published PR URL (completion_contract) resolves through to a real
+    fetch_pr_files() call -- the gap F2 flagged as unreachable."""
+    pr_key = "bff-api#9141"  # no _REVIEW_ROUND_CAP_BY_PR override -- exercises the base cap
+    task_id = kb.create_task(conn, title=f"review {pr_key}", assignee="reviewer")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/Stockstrading/bff-api/pull/9141", task_id),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        kb_pr_acceptance, "fetch_pr_files",
+        lambda *_a, **_k: {"files": ["docs/readme.md"], "additions": 5, "deletions": 5},
+    )
+
+    meta = kbd_review_contract.pr_meta_for_review_cap(conn, pr_key, "reviewer")
+
+    assert meta == {"files": ["docs/readme.md"], "additions": 5, "deletions": 5}
+
+
+def test_live_review_cost_gate_reaches_docs_only_cap_via_pr_meta(conn, monkeypatch):
+    """End-to-end: a published docs-only PR now actually hits the docs-only
+    cap of 1 at the live _review_cost_gate call site -- before the F2 fix this
+    classifier always saw files=[] and never returned True here."""
+    pr_key = "bff-api#9241"  # no _REVIEW_ROUND_CAP_BY_PR override -- exercises the docs-only base cap
+    task_id = kb.create_task(conn, title=f"review {pr_key}", assignee="reviewer")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/Stockstrading/bff-api/pull/9241", task_id),
+    )
+    conn.commit()
+    monkeypatch.setattr(
+        kb_pr_acceptance, "fetch_pr_files",
+        lambda *_a, **_k: {"files": ["docs/readme.md"], "additions": 5, "deletions": 5},
+    )
+    _insert_real_round(conn, task_id, "reviewer")  # 1 round already meets the docs-only cap of 1
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+
+    assert reason == "review_round_cap"
+    assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_live_review_cost_gate_stays_non_docs_cap_when_pr_meta_lookup_fails(conn, monkeypatch):
+    """fetch_pr_files failing (network/auth error, returns None) must fall back
+    to the default non-capital cap of 3, never silently escalate early."""
+    pr_key = "bff-api#142"
+    task_id = kb.create_task(conn, title=f"review {pr_key}", assignee="reviewer")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/Stockstrading/bff-api/pull/142", task_id),
+    )
+    conn.commit()
+    monkeypatch.setattr(kb_pr_acceptance, "fetch_pr_files", lambda *_a, **_k: None)
+    _insert_real_round(conn, task_id, "reviewer")
+
+    reason = kbd._review_cost_gate(conn, task_id, "reviewer", dry_run=False)
+
+    assert reason is None
+
+
+# --- F3/F4 (gate-2 round): finding identity + fail-closed category --------------
+
+def test_finding_with_no_id_still_freezes_by_fallback_hash():
+    """F3: a round-1/2 finding with no explicit id must still be recognised as
+    frozen in round 3 -- it does not silently lose its blocking status just
+    because the reviewer forgot to set an id."""
+    verdict_runs = [
+        {"metadata": kb._json_or_null({"findings": [
+            {"file": "a.py", "line": 10, "severity": "MAJOR", "text": "leak"},
+        ]})},
+        {"metadata": kb._json_or_null({"findings": []})},
+    ]
+    frozen = kbd_review_contract._frozen_finding_ids(verdict_runs)
+    assert len(frozen) == 1
+    same_finding_round3 = {
+        "file": "a.py", "line": 10, "severity": "MAJOR", "text": "leak", "category": "style",
+    }
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        same_finding_round3, round_no=3, frozen_ids=frozen,
+    ) is True
+
+
+# --- F5 (gate-2 round): deterministic round ordering on an ended_at tie -------
+
+def test_review_verdict_runs_tiebreaks_deterministically_on_ended_at_tie(conn):
+    """Two verdict runs ending in the exact same second must not swap which
+    one is round 1 vs round 2 -- r.id is the deterministic secondary key."""
+    task_id = kb.create_task(conn, title="review bff-api#300", assignee="reviewer")
+    now = int(time.time())
+    _insert_real_round(
+        conn, task_id, "reviewer", started_at=now - 600, ended_at=now - 400,
+        metadata={"findings": [{"id": "first"}]},
+    )
+    _insert_real_round(
+        conn, task_id, "reviewer", started_at=now - 600, ended_at=now - 400,
+        metadata={"findings": [{"id": "second"}]},
+    )
+
+    runs = kbd._review_verdict_runs(conn, "reviewer", {"bff-api#300"})
+
+    assert len(runs) == 2
+    assert kb._json_dict(runs[0]["metadata"])["findings"][0]["id"] == "first"
+    assert kb._json_dict(runs[1]["metadata"])["findings"][0]["id"] == "second"

@@ -97,6 +97,51 @@ def fetch_pr_head_sha(contract: str, published_pr: str | None = None, assignee: 
         return None
 
 
+def fetch_pr_files(contract: str, published_pr: str | None = None, assignee: str | None = None) -> dict | None:
+    """Real ``{"files", "additions", "deletions"}`` for the PR named by
+    ``contract``/``published_pr``, or ``None``.
+
+    Minimal sibling of :func:`fetch_pr_head_sha`, same resolution/auth rules.
+    Feeds the review-cost-gate's file-based classifiers (``_is_docs_only_review``
+    / ``_is_low_risk_review`` in ``kanban_db_dispatch``), which previously never
+    received a real file list at their live call site (F2, hermes-agent PR #5
+    gate-2). GraphQL's ``files`` connection pages at 100; a PR with more changed
+    files than returned is NOT docs-only/low-risk by definition anyway, but to
+    stay fail-closed this returns ``None`` (unknown file list) rather than a
+    silently truncated one whenever the page did not cover every changed file.
+    """
+    try:
+        profile_home = _assignee_profile_home(assignee)
+        declared = _PR.fullmatch(contract)
+        url = contract if declared else published_pr
+        match = _PR.fullmatch(url or "")
+        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+            return None
+        repo, number = match[1], int(match[2])
+        owner, name = repo.split("/")
+        query = (
+            f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{'
+            f'pullRequest(number:{number:d}){{additions deletions changedFiles '
+            f'files(first:100){{nodes{{path}}}}}}}}}}'
+        )
+        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+        if repository is None:
+            return None
+        pr = repository.get("pullRequest")
+        if pr is None:
+            return None
+        changed = pr.get("changedFiles")
+        nodes = ((pr.get("files") or {}).get("nodes")) or []
+        if not isinstance(changed, int) or len(nodes) != changed:
+            return None  # paginated/truncated: unknown full file list, fail closed
+        files = [n["path"] for n in nodes if isinstance(n, dict) and n.get("path")]
+        if len(files) != changed:
+            return None
+        return {"files": files, "additions": pr.get("additions") or 0, "deletions": pr.get("deletions") or 0}
+    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        return None
+
+
 class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
