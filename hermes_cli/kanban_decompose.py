@@ -28,6 +28,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _routing_guard_mismatch, review_only_profiles_from_config,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -199,6 +200,7 @@ class _Routing:
     auto_promote: bool
     roster: list[dict]
     valid_names: set[str]
+    review_only_profiles: set[str]
 
 
 def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
@@ -215,6 +217,7 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
+        review_only_profiles=review_only_profiles_from_config(cfg),
     )
 
 
@@ -232,6 +235,20 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
+        if ok:
+            # Rule 6 routing guard (log-only phase): check the assignee that actually
+            # lands (freshly chosen, or the task's pre-existing one) against the final
+            # title/body.
+            final_assignee = assignee_val if assignee_val is not None else task.assignee
+            mismatch = _routing_guard_mismatch(
+                final_assignee,
+                title_val if title_val is not None else task.title,
+                body_val if body_val is not None else task.body,
+                review_only_profiles=routing.review_only_profiles,
+                default_assignee=routing.default_assignee,
+            )
+            if mismatch:
+                kb.add_comment(conn, task.id, author, mismatch)
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
@@ -239,7 +256,8 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
 
 def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[list[dict], str]:
     """Validate/normalise the LLM's ``tasks`` list; ``(children, "")`` or ``([], reason)``.
-    Unknown assignees route to the default; never assignee=None."""
+    Unknown assignees route to the default; never assignee=None. Each cleaned child also
+    carries ``_guard_comment`` (rule 6 log-only routing guard; popped before DB insert)."""
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
@@ -261,12 +279,18 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
+        clean_body = body.strip() if isinstance(body, str) else ""
         children.append({
             "title": title.strip()[:200],
-            "body": body.strip() if isinstance(body, str) else "",
+            "body": clean_body,
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
+            "_guard_comment": _routing_guard_mismatch(
+                chosen, title, clean_body,
+                review_only_profiles=routing.review_only_profiles,
+                default_assignee=routing.default_assignee,
+            ),
         })
     return children, ""
 
@@ -278,6 +302,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     children, reason = _clean_children(task_id, raw_tasks, routing)
     if reason:
         return DecomposeOutcome(task_id, False, reason)
+    guard_comments = [child.pop("_guard_comment", None) for child in children]
     try:
         with kbc.connect_closing() as conn:
             child_ids = decompose_triage_task(
@@ -288,6 +313,10 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 author=author,
                 auto_promote=routing.auto_promote,
             )
+            if child_ids:
+                for child_id, comment in zip(child_ids, guard_comments):
+                    if comment:
+                        kb.add_comment(conn, child_id, author, comment)
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
@@ -337,7 +366,13 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Excludes cards whose most recent event is ``block_loop_detected`` -- that
+    escalation is for a human (or ``kanban_unblock``), not for this sweep. A
+    card unblocked and later re-escalated for an unrelated, newer reason is
+    still returned (see ``kb.list_tasks(exclude_block_loop=True)``).
+    """
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000, exclude_block_loop=True)
     return [row.id for row in rows]
