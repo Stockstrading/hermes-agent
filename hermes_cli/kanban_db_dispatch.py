@@ -1566,7 +1566,12 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern; the breaker still trips eventually, but only when the
+    LATEST run is itself unresolved — a later run landing in
+    ``kanban_db._SUPERSEDING_RUN_OUTCOMES`` (``completed``, ``review_requested``,
+    ``changes_requested``, ``blocked``, ``cancelled``) means the stale stamp was
+    already superseded and must not park the handoff as a permanent auth blocker,
+    #119070 follow-up), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1620,7 +1625,13 @@ def check_respawn_guard(
     # benign commands such as ``claude auth status`` (#117097).
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    # A later run that already superseded the rate-limit/failure stamp (a review
+    # verdict, a fresh block, or a completion) means the card moved on — the stale
+    # quota/auth text is history, not a live blocker (#119070 follow-up). ``_end_run``
+    # also clears the stamp on these outcomes going forward; this check covers rows
+    # written before that fix shipped, or by any path that bypasses ``_end_run``.
+    superseded = latest_outcome in _kb._SUPERSEDING_RUN_OUTCOMES
+    if err and not superseded and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
