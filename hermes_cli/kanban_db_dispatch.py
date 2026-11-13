@@ -28,6 +28,19 @@ from typing import Optional
 from typing import TYPE_CHECKING
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
+from hermes_cli.kanban_db_dispatch_review_contract import (
+    REVIEW_ROUND_CAP_CAPITAL,
+    REVIEW_ROUND_CAP_DEFAULT,
+    REVIEW_ROUND_CAP_DOCS_ONLY,
+    _TaskLike,
+    _finding_allowed_after_freeze,
+    _finding_is_addressed,
+    _frozen_finding_ids,
+    _handoff_has_evidence,
+    _is_docs_only_review,
+    _review_round_cap_for,
+    filter_blocking_findings,
+)
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -1608,7 +1621,13 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 # round cap in the SOULs was only checked by the model AFTER a full paid review,
 # so it is enforced here, at spawn time, before any model call.
 _REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
-_REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner (raised 2 -> 4 by the owner 2026-10-08)
+# Review contract v2 (card t_cca086d6 / t_3183cd6d, ADR-review-contract-v2.md): ONE synced cap
+# constant per PR class (REVIEW_ROUND_CAP_DEFAULT/_CAPITAL/_DOCS_ONLY, imported above from
+# kanban_db_dispatch_review_contract), replacing the single flat _REVIEW_ROUND_CAP. Every other
+# place that states a cap (SOUL.md prose, the review-round-cap.py cron) must read one of these
+# three, never restate a digit of its own -- numbers pending explicit owner sign-off, see the ADR.
+# Compat alias only (older tests/tools read this name); the gate itself never uses it.
+_REVIEW_ROUND_CAP = REVIEW_ROUND_CAP_DEFAULT
 # Owner-granted extra rounds for specific PRs (2026-10-08: 3 more rounds each, then report readiness).
 # 2026-10-27 11:58 IDT owner decision 259: review cap 8 for ADR-037 sub-second perf PRs (marketdata/candle/indicator + gitops#397)
 # 2026-10-27 owner: ai-stocktrading#589 review cap 12 (more than 10 rounds, make it ready to merge)
@@ -1643,6 +1662,16 @@ _REVIEW_PR_TITLE_RE = re.compile(
 _REVIEW_PAID_OUTCOMES = ("completed", "changes_requested", "blocked", "review_requested")
 # Only these outcomes are a reviewer VERDICT that a delta review (Rule 3) can build on.
 _REVIEW_VERDICT_OUTCOMES = ("completed", "changes_requested")
+# Capital-PR detection for the Rule 7 round cap (REVIEW_ROUND_CAP_CAPITAL) and the
+# Rule 6 docs-only exclusion. Re-added by the PR #5 recut (t_b523cae4) with a real
+# caller, ``_review_round_cap_for``.
+_CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
+                  "position-service", "risk-api", "credentials-service")
+_CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
+_CAPITAL_DENY_SUBSTRINGS = (
+    "strategy", "execution", "risk", "signal", "exit", "entry", "stop-loss",
+    "sizing", "kelly", "profit", "pnl", "orders", "trade",
+)
 
 
 def _norm_repo(name: str) -> str:
@@ -1669,6 +1698,25 @@ def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
         keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
         keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
     return keys
+
+
+def _is_capital_review(task) -> bool:
+    """True when the card is about a capital PR: a capital marker anywhere in the
+    FULL title+body, a capital repo in its PR keys, or (PR#1 MAJOR #2, ported from
+    8d943f35d1) a bare capital-repo token anywhere in the full text. The last scan
+    is the fail-closed fallback for a card that names the repo AFTER the PR number
+    (``_card_pr_keys`` then finds no key) or past the old 4000-char cut: a missed
+    capital card would silently get the larger non-capital cap."""
+    title = _kb._lossy_text(getattr(task, "title", "")) or ""
+    body = _kb._lossy_text(getattr(task, "body", "")) or ""
+    text = f"{title}\n{body}"
+    if _CAPITAL_MARKER_RE.search(text):
+        return True
+    repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
+    if any(r in _CAPITAL_REPOS for r in repos):
+        return True
+    lowered = text.lower()
+    return any(re.search(rf"\b{re.escape(repo)}\b", lowered) for repo in _CAPITAL_REPOS)
 
 
 _BARE_PR_REF_RE = re.compile(
@@ -1954,25 +2002,37 @@ def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
 
 
 def _open_findings_from_runs(verdict_runs: list) -> list:
-    """The most recent verdict's structured findings (Rule 3) still marked open.
+    """The most recent verdict's structured findings (Rule 3) still open --
+    Rule 2/3's ``test_ref`` requirement means an 'addressed' finding missing a
+    ``test_ref`` counts as open too -- filtered through Rule 4's post-freeze
+    scope (a new, non capital-safety/data-loss/security finding reported after
+    round 2 is a follow-up, never an open blocker on THIS PR). A plain-string
+    finding (decision 312) is always open.
 
     "Most recent verdict" is :func:`_latest_verdict_run`, not ``verdict_runs[-1]``:
     a newer handoff/block with no findings must not report "none recorded" to the
-    owner while the prior verdict still has open MAJORs (PR#1 MAJOR #4)."""
+    owner while the prior verdict still has open MAJORs (PR#1 MAJOR #4). Its round
+    number for the freeze is its own position in ``verdict_runs``."""
     prior = _latest_verdict_run(verdict_runs)
     if prior is None:
         return []
     findings = _findings_from_metadata(prior["metadata"])
-    return [f for f in findings if str(f.get("status", "open") if isinstance(f, dict) else "open").lower() != "addressed"]
+    open_findings = [f for f in findings if not _finding_is_addressed(f)]
+    round_no = next(i for i, r in enumerate(verdict_runs, 1) if r is prior)
+    eligible, _followups = filter_blocking_findings(
+        open_findings, round_no=round_no, frozen_ids=_frozen_finding_ids(verdict_runs),
+    )
+    return eligible
 
 
 def _owner_escalation_summary(
     conn: sqlite3.Connection, assignee: str, pr: str,
     cap_kind: str, cap: int, count: int, verdict_runs: list,
 ) -> str:
-    """One paragraph for the owner: open findings, head SHA, CI status (best-effort),
-    and the three named options (merge / waive gate / close). Never raises -- a PR/CI
-    lookup failure degrades fields to 'unknown', it never blocks the escalation itself."""
+    """Rule 5: exactly 3 lines for the owner -- (1) open findings after the
+    Rule 4 freeze, (2) head SHA + CI status (best-effort), (3) the three named
+    options (merge / waive gate / close). Never raises -- a PR/CI lookup
+    failure degrades fields to 'unknown', it never blocks the escalation."""
     findings = _open_findings_from_runs(verdict_runs)
 
     def _fmt(f):
@@ -1996,11 +2056,13 @@ def _owner_escalation_summary(
         marker, reached = _REVIEW_CAP_MARKER, f"{cap} real review rounds"
     else:
         marker, reached = _QUOTA_STALL_CAP_MARKER, f"{cap} quota stalls (429s/stalls with no verdict)"
-    return (
+    line1 = (
         f"{marker.capitalize()}: {assignee} hit {count} {cap_kind} on {pr} (cap {cap}; reached {reached}). "
-        f"Open findings: {findings_txt}. Head SHA: {head_sha}. CI: {ci_txt}. "
-        f"Options: (1) {_ESCALATION_OPTIONS[0]}, (2) {_ESCALATION_OPTIONS[1]}, (3) {_ESCALATION_OPTIONS[2]}."
+        f"Open findings after freeze: {findings_txt}."
     )
+    line2 = f"Head SHA: {head_sha}. CI: {ci_txt}."
+    line3 = f"Options: (1) {_ESCALATION_OPTIONS[0]}, (2) {_ESCALATION_OPTIONS[1]}, (3) {_ESCALATION_OPTIONS[2]}."
+    return "\n".join([line1, line2, line3])
 
 
 def _latest_verdict_run(runs: list):
@@ -2092,6 +2154,19 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
                 )
             return "review_pr_ambiguous"
         pr = min(keys)
+        # 0. Rule 1 (evidence-gated hand-off): a bounce for missing evidence never
+        # spawns the reviewer and is never counted as a round (no run is created).
+        has_evidence, missing = _handoff_has_evidence(conn, task_id)
+        if not has_evidence:
+            if not dry_run:
+                _block_review_for_owner(
+                    conn, task_id, row["status"],
+                    f"Hand-off evidence missing: {missing}. The kanban_request_review summary/"
+                    f"metadata for {pr} must include a scope line, a file list, a commands-run "
+                    f"block with output, and a base: origin/main@<sha> freshness statement before "
+                    f"this gate spends a round on it. This bounce is not counted as a review round.",
+                )
+            return "handoff_missing_evidence"
         # 1. Another card for the same PR is being reviewed by this gate right now.
         # (Re-checked inside the claim txn by _duplicate_review_veto.)
         if _duplicate_review_running(conn, task_id, assignee, keys):
@@ -2114,9 +2189,12 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
         # it either way: a REAL round (a gate actually reviewed and gave an outcome --
         # owner-tunable per PR via _REVIEW_ROUND_CAP_BY_PR, unchanged) or a QUOTA STALL
         # (a spawn that 429'd/was scheduled before producing a verdict -- fixed cap, no
-        # owner overrides yet since nothing has needed one).
+        # owner overrides yet since nothing has needed one). The real-round base cap is
+        # per PR class (Rule 7, _review_round_cap_for); _REVIEW_ROUND_CAP_BY_PR overrides it.
         quota_runs = _review_quota_stalls(conn, assignee, keys)
-        cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
+        cap = _REVIEW_ROUND_CAP_BY_PR.get(
+            str(pr).lower(), _review_round_cap_for(_TaskLike(id=task_id, title=row["title"], body=row["body"])),
+        )
         if len(runs) >= cap:
             cap_kind, marker, count, relevant_runs = "real_rounds", _REVIEW_CAP_MARKER, len(runs), runs
         elif len(quota_runs) >= _QUOTA_STALL_CAP:
@@ -2194,9 +2272,12 @@ def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: 
     prior = _latest_verdict_run(runs)
     if prior is None:
         return None  # round 1, or no prior run ended as a verdict: do a normal full review
+    round_no = len(runs) + 1
+    frozen_ids = _frozen_finding_ids(runs)
     meta = _kb._json_dict(prior["metadata"]) if prior["metadata"] else {}
     since_sha = meta.get("reviewed_sha")
     findings = _findings_from_metadata(prior["metadata"])
+    eligible, followups = filter_blocking_findings(findings, round_no, frozen_ids)
     lines = [
         "Round >= 2 review: this gate already gave a verdict on this PR. Review ONLY the "
         "diff since the prior verdict's reviewed SHA plus the prior findings below -- do "
@@ -2204,15 +2285,19 @@ def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: 
     ]
     if since_sha:
         lines.append(f"Diff since reviewed SHA: {since_sha}")
-    if findings:
-        lines.append("Prior findings (mark each addressed/open in your verdict):")
-        for f in findings:
-            if not isinstance(f, dict):  # decision 312: plain-string finding = the finding's text
-                lines.append(f"- {str(f).strip()}")
+    if eligible:
+        lines.append("Prior findings (mark each addressed/open in your verdict, with a test_ref "
+                      "when you mark one addressed):")
+        for f in eligible:
+            if not isinstance(f, dict):  # decision 312: plain-string finding = the finding's text, always open
+                lines.append(f"- {str(f).strip()} -- open")
                 continue
+            status_label = f.get("status", "open")
+            if str(status_label).lower() == "addressed" and not str(f.get("test_ref") or "").strip():
+                status_label = "open (addressed with no test_ref -- still open)"
             lines.append(
                 f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
-                f"{f.get('id', '')} -- {f.get('status', 'open')}"
+                f"{f.get('id', '')} -- {status_label}"
             )
         lines.append(
             "Only a MAJOR-or-higher finding may block approval; MINOR/NIT are advisory, "
@@ -2220,6 +2305,16 @@ def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: 
         )
     else:
         lines.append("No prior findings were recorded.")
+    if followups:
+        lines.append(
+            "Follow-ups (frozen after round 2 -- not capital-safety/data-loss/security, "
+            "never reopens this PR's blocking list; file a separate card instead):"
+        )
+        for f in followups:
+            lines.append(
+                f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
+                f"{f.get('id', '')} (category: {f.get('category', 'none')})"
+            )
     return "\n".join(lines)
 # --- end Rule 3 ---------------------------------------------------------------
 
