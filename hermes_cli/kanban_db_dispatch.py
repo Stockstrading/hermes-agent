@@ -1692,13 +1692,23 @@ def _review_quota_stalls(conn: sqlite3.Connection, profile: str, keys: set[str])
     return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
 
 
-def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
+def _pr_url_for_key(
+    conn: sqlite3.Connection, pr_key: str, fallback_text: Optional[str] = None,
+) -> Optional[str]:
     """Best-effort ``https://github.com/org/repo/pull/N`` for a ``repo#n`` cap-gate
     key, read off any task about the same PR whose ``completion_contract`` was bound
     to the published PR URL (kanban_pr_acceptance_store.prepare_acceptance sets this
-    once a dev's first green completion publishes it). None when no task has ever
-    published one -- CI status degrades to 'unknown' in the escalation summary
-    rather than blocking on it."""
+    once a dev's first green completion publishes it). F10 (hermes-agent PR #5
+    gate-2): that binding only ever happens for a task created with an
+    ``OWNER/REPO`` completion_contract, so an ordinary single-card
+    ``kanban_request_review``/``kanban_request_changes`` cycle never produces one --
+    ``fallback_text`` (the review card's OWN title/body, most hand-offs literally
+    contain ``PR: https://github.com/...``) is tried next before giving up. A
+    contract string that resolves to a DIFFERENT ``repo#n`` than ``pr_key`` is
+    never trusted (fail closed, same as no contract found) -- it would otherwise
+    feed one PR's file list into another PR's docs-only/low-risk classification.
+    None when nothing resolves -- CI status degrades to 'unknown' in the
+    escalation summary rather than blocking on it."""
     num = pr_key.rsplit("#", 1)[1]
     rows = conn.execute(
         "SELECT title, body, completion_contract FROM tasks "
@@ -1709,8 +1719,17 @@ def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
         if not (_card_pr_keys(row["title"], row["body"]) & {pr_key}):
             continue
         contract = row["completion_contract"]
-        if contract and _PR_URL_FULL_RE.fullmatch(str(contract)):
-            return contract
+        if not contract or not _PR_URL_FULL_RE.fullmatch(str(contract)):
+            continue
+        m = _REVIEW_PR_URL_RE.search(str(contract))
+        if not m or f"{_norm_repo(m.group(1))}#{m.group(2)}" != pr_key:
+            continue  # contract encodes a different PR -- fail closed, keep looking
+        return contract
+    if fallback_text:
+        text = _kb._lossy_text(fallback_text) or ""
+        for m in _REVIEW_PR_URL_RE.finditer(text):
+            if f"{_norm_repo(m.group(1))}#{m.group(2)}" == pr_key:
+                return "https://" + m.group(0)
     return None
 
 
@@ -1857,7 +1876,10 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
         if real_cap is None:
             real_cap = _review_round_cap_for(
                 _TaskLike(id=task_id, title=row["title"], body=row["body"]),
-                pr_meta_for_review_cap(conn, pr, assignee),
+                pr_meta_for_review_cap(
+                    conn, pr, assignee,
+                    card_text=f"{row['title'] or ''}\n{row['body'] or ''}",
+                ),
             )
         if len(runs) >= real_cap:
             cap_kind, cap, count, marker, relevant_runs = (

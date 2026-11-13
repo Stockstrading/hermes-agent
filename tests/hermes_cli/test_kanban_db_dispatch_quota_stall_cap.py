@@ -78,7 +78,8 @@ def test_third_quota_stall_escalates_with_required_summary_fields(conn, monkeypa
         _insert_quota_stall(conn, task_id, "reviewer", via="scheduled")
 
     monkeypatch.setattr(
-        kbd, "_pr_url_for_key", lambda c, pr: "https://github.com/Stockstrading/strategy-lab/pull/99"
+        kbd, "_pr_url_for_key",
+        lambda c, pr, fallback_text=None: "https://github.com/Stockstrading/strategy-lab/pull/99",
     )
 
     from hermes_cli import kanban_pr_acceptance as kpa
