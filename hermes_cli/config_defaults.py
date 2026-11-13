@@ -323,9 +323,11 @@ DEFAULT_CONFIG = {
         # Bounded linger (seconds) for one-shot CLI runs (-q/-Q/-z) that exit while background processes
         # spawned with notify_on_complete=true are still running. See #90879.
         "oneshot_completion_wait_seconds": 600.0,
+        "process_wait_auto_notify": True,  # 2 unchanged wait/poll -> notify_on_complete + stop; False = old polling
         # Env vars passed into sandboxed terminal/execute_code (skill-declared
         # required_environment_variables pass through automatically).
         "env_passthrough": [],
+        "client_env_passthrough": [],  # Extra non-secret toolchain names a CLI/TUI client sends for its tools
         # Remote-backend sync-back refuses to extract a downloaded state archive larger than this
         # (bytes); raise it for a ~/.hermes tree that legitimately exceeds 2 GiB.
         "sync_back_max_bytes": 2 * 1024 * 1024 * 1024,
@@ -492,6 +494,22 @@ DEFAULT_CONFIG = {
         # registration also requires the API server bearer key. developer_mode gates the privileged
         # browser_cdp / browser_evaluate capabilities.
         "extension_control": {"enabled": False, "developer_mode": False},
+    },
+    # Stale git worktree lifecycle (`hermes -w`, `/worktree new`, subagent isolation, Desktop). The
+    # sweep runs at `hermes -w` startup and every 6h from the cron ticker over every repo Hermes made
+    # a worktree in. Trees idle past their tier (hermes-*/subagent-* 24h, named 72h) that are clean
+    # and merged are removed; dirty or unpushed ones are archived to refs/hermes/archive/<tree>
+    # first (`hermes worktree restore <name>`). Live trees and Kanban t_<hex> trees are never touched.
+    "worktrees": {
+        # false = never remove a dirty/unpushed tree (the pre-archive behaviour, exactly).
+        "archive_dirty": True,
+        # Untracked files larger than this (MB) are not archived, so a tree holding one is kept.
+        "archive_max_file_mb": 50,
+        # The sweep deletes archive refs older than this many days. 0 keeps them forever.
+        "archive_retention_days": 30,
+        # Optional size budget (GB) for idle trees: past it the oldest idle trees are archived and
+        # removed first. Live, young and Kanban trees are never counted or touched. 0 = off.
+        "max_total_gb": 0,
     },
     # Filesystem checkpoints: snapshot the working directory once per turn (on the first
     # write_file/patch call); restore with /rollback. Opt-in via `hermes chat --checkpoints` or
@@ -2743,7 +2761,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 50,  # Config schema version - bump this when adding new required fields
+    "_config_version": 51,  # Config schema version - bump this when adding new required fields
 }
 
 

@@ -719,7 +719,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
+        if owner_reclaim_blocked(conn, row["id"]):
+            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -754,6 +757,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
+            # Again under the write lock, after the kill wait: an interpreter that bound
+            # meanwhile is invisible to the pid/claim CAS below.
+            if owner_reclaim_blocked(conn, tid):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -827,7 +834,10 @@ def detect_stale_running(
         "WHERE t.status = 'running'"
     ).fetchall()
 
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
+        if owner_reclaim_blocked(conn, row["id"]):
+            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never reclaim
@@ -856,6 +866,9 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            # Again under the write lock, after the termination wait (see enforce_max_runtime).
+            if owner_reclaim_blocked(conn, tid):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -911,7 +924,10 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
+    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
+        if owner_reclaim_blocked(conn, row["id"]):
+            continue
         tid = row["id"]
         pid = row["worker_pid"]
         if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
@@ -922,6 +938,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            if owner_reclaim_blocked(conn, tid):
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1097,7 +1115,8 @@ class _DeadWorker:
 
 
 def _classify_dead_worker(
-    pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1105,7 +1124,7 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1117,20 +1136,24 @@ def _classify_dead_worker(
 def _classify_dead_worker_exit(
     pid: int,
     claimer: Optional[str],
+    exit_code=None,
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
-    The reap registry only knows children of THIS process; a per-tick dispatcher
-    reads the exit trailer the worker left in its log instead, so the same death
-    gets the same booking (protocol violation / rate-limit requeue / crash) as
-    under the gateway-embedded dispatcher. A worker that never reached its exit
-    epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+    ``exit_code`` is the authority's exact-run result for a managed worker (a child of the
+    profile owner, never of this dispatcher, so it cannot be reaped here). Otherwise the reap
+    registry only knows children of THIS process; a per-tick dispatcher reads the exit trailer
+    the worker left in its log instead, so the same death gets the same booking (protocol
+    violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
+    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
-    if kind == "unknown" and task_id:
+    if exit_code is not None:
+        kind, code = _exit_code_kind(int(exit_code))
+    elif kind == "unknown" and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
@@ -1205,6 +1228,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
+        from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1216,9 +1240,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
+            # An ambiguous receipt holds the card while the attempt may still run; once nothing
+            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
+            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+                continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
+            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
+            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
