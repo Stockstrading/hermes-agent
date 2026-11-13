@@ -36,6 +36,10 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Worker log files larger than this at spawn time are rotated.
+DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
+DEFAULT_LOG_BACKUP_COUNT = 1
+
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
 # before max_runtime_seconds kills it.
@@ -84,6 +88,52 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RESPAWN_GUARD_PR_URL_PARTS_RE = re.compile(
+    r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_RESPAWN_GUARD_PR_SHORTHAND_RE = re.compile(r"\bPR\s*#?\s*(\d+)", re.IGNORECASE)
+
+
+def _pr_refs(text: Optional[str]) -> set[str]:
+    """Return the PR references in ``text`` as a comparable set.
+
+    A full URL yields BOTH ``owner/repo#n`` (lowercased) and the bare ``#n``; a
+    shorthand ``PR #n`` / ``PR n`` / ``PR#n`` yields ``#n``. Empty/None text
+    yields an empty set.
+
+    Bare numbers are compared too on purpose: a card titled "review PR #50" and
+    a worker comment linking ``.../pull/50`` are the SAME PR, and treating them
+    as two different PRs makes the respawn guard starve the card forever (see
+    step 4 of :func:`check_respawn_guard`). The repo-qualified form is kept as
+    well so two different repos' ``#50`` can still be told apart when both
+    sides spell the URL out.
+    """
+    if not text:
+        return set()
+    refs: set[str] = set()
+    for repo, num in _RESPAWN_GUARD_PR_URL_PARTS_RE.findall(text):
+        refs.add(f"{repo.lower()}#{num}")
+        refs.add(f"#{num}")
+    for num in _RESPAWN_GUARD_PR_SHORTHAND_RE.findall(text):
+        refs.add(f"#{num}")
+    return refs
+
+def _pr_url_refs(text: Optional[str]) -> set[str]:
+    """``_pr_refs`` restricted to refs spelled as a full PR URL.
+
+    Used on the COMMENT side of the respawn guard: the bare ``PR #n`` shorthand
+    that ``_pr_refs`` accepts is right for reading what a card is about, but on
+    a comment it makes any passing mention of another PR ("same bug as PR #107")
+    look like a brand-new PR and re-arm the 24h window.
+    """
+    if not text:
+        return set()
+    refs: set[str] = set()
+    for repo, num in _RESPAWN_GUARD_PR_URL_PARTS_RE.findall(text):
+        refs.add(f"{repo.lower()}#{num}")
+        refs.add(f"#{num}")
+    return refs
+
+
 
 @dataclass
 class DispatchResult:
@@ -102,6 +152,11 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    scheduled_promoted: int = 0
+    """``scheduled`` cards whose ``resume_at`` timer came due this tick and
+    were promoted to ``ready`` by :func:`recompute_scheduled` (the quota/429
+    backoff path) — distinct from ``promoted`` (``recompute_ready``'s
+    parent-dependency sweep)."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -664,10 +719,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -702,10 +754,6 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
-            # Again under the write lock, after the kill wait: an interpreter that bound
-            # meanwhile is invisible to the pid/claim CAS below.
-            if owner_reclaim_blocked(conn, tid):
-                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -779,10 +827,7 @@ def detect_stale_running(
         "WHERE t.status = 'running'"
     ).fetchall()
 
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - (_kb._to_epoch(row["active_started_at"]) or now)  # unreadable clock: never reclaim
@@ -811,9 +856,6 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
-            # Again under the write lock, after the termination wait (see enforce_max_runtime).
-            if owner_reclaim_blocked(conn, tid):
-                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -869,10 +911,7 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
-    from hermes_cli.kanban_owner_recovery import owner_reclaim_blocked
     for row in rows:
-        if owner_reclaim_blocked(conn, row["id"]):
-            continue
         tid = row["id"]
         pid = row["worker_pid"]
         if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
@@ -883,8 +922,6 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
-            if owner_reclaim_blocked(conn, tid):
-                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -1060,8 +1097,7 @@ class _DeadWorker:
 
 
 def _classify_dead_worker(
-    pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
-    board: Optional[str] = None,
+    pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1069,7 +1105,7 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1081,24 +1117,20 @@ def _classify_dead_worker(
 def _classify_dead_worker_exit(
     pid: int,
     claimer: Optional[str],
-    exit_code=None,
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
-    ``exit_code`` is the authority's exact-run result for a managed worker (a child of the
-    profile owner, never of this dispatcher, so it cannot be reaped here). Otherwise the reap
-    registry only knows children of THIS process; a per-tick dispatcher reads the exit trailer
-    the worker left in its log instead, so the same death gets the same booking (protocol
-    violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
-    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+    The reap registry only knows children of THIS process; a per-tick dispatcher
+    reads the exit trailer the worker left in its log instead, so the same death
+    gets the same booking (protocol violation / rate-limit requeue / crash) as
+    under the gateway-embedded dispatcher. A worker that never reached its exit
+    epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
-    if exit_code is not None:
-        kind, code = _exit_code_kind(int(exit_code))
-    elif kind == "unknown" and task_id:
+    if kind == "unknown" and task_id:
         logged = _worker_log_exit_code(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
@@ -1173,7 +1205,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
-        from hermes_cli.kanban_owner_recovery import managed_run_exit_code, owner_reclaim_blocked
         for row in rows:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -1185,15 +1216,9 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
-            # An ambiguous receipt holds the card while the attempt may still run; once nothing
-            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
-                continue
 
             pid = int(row["worker_pid"])
-            # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
-            exit_code = managed_run_exit_code(conn, row["id"], pid, row["claim_lock"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], exit_code, task_id=row["id"], board=board)
+            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -1492,23 +1517,18 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
-    """Publish the launcher only while this claim has no executing worker yet, together with its
-    restart-stable fingerprint (``_process_fingerprint``); the ``spawned`` event carries both. The
-    fingerprint is what lets every later liveness/kill decision tell OUR worker from a process that
-    recycled the PID after a reboot. A failed capture is persisted as ``UNVERIFIED_WORKER_FINGERPRINT``,
-    never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
-    not inherit."""
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
+    """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
+    emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
+    decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
+    persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
+    whose bare-PID kill authority a new spawn must not inherit."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
-        if run_id is None:
-            run_id = _kb._current_run_id(conn, task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ? AND status = 'running' "
-            "AND current_run_id IS ? AND worker_pid IS NULL "
-            "AND (? IS NULL OR claim_lock = ?)",
-            (int(pid), started_at, task_id, run_id, claim_lock, claim_lock))
-        if cur.rowcount:
+        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
+                     (int(pid), started_at, task_id))
+        run_id = _kb._current_run_id(conn, task_id)
+        if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
                          (int(pid), started_at, run_id))
         _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
@@ -1554,6 +1574,538 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+# --- Review cost gate (local patch 2026-09-29, owner-approved) ---------------
+# Reviews used ~76% of all Claude tokens (1,384 review runs on 133 PRs in 10
+# days, up to 16 gate-1 rounds on one PR, two review cards per round). The
+# round cap in the SOULs was only checked by the model AFTER a full paid review,
+# so it is enforced here, at spawn time, before any model call.
+_REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
+_REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner (raised 2 -> 4 by the owner 2026-10-08)
+# Owner-granted extra rounds for specific PRs (2026-10-08: 3 more rounds each, then report readiness).
+# 2026-10-27 11:58 IDT owner decision 259: review cap 8 for ADR-037 sub-second perf PRs (marketdata/candle/indicator + gitops#397)
+# 2026-10-27 owner: ai-stocktrading#589 review cap 12 (more than 10 rounds, make it ready to merge)
+_REVIEW_ROUND_CAP_BY_PR = {'strategy-api#431': 6, 'instruments-api#101': 9, 'oke-platform-gitops#267': 9, 'indicator-api#133': 8, 'risk-api#56': 6, 'execution-service#337': 7, 'strategy-api#356': 6, 'strategy-api#355': 6, 'backtest-api#47': 8, 'credentials-service#25': 7, 'trading-config-api#32': 5, 'strategy-api#346': 7, 'strategy-api#340': 7, 'strategy-api#334': 7, 'account-pod-provisioner#12': 7, 'strategy-lab#27': 8, 'strategy-lab#28': 7, 'bff-api#141': 11, 'ai-stocktrading#560': 7, 'execution-service#308': 7, 'ai-stocktrading#531': 10, 'strategy-api#276': 9, 'account-pod-provisioner#7': 7, 'ai-stocktrading#535': 9, 'execution-service#326': 9, 'oke-platform-gitops#241': 12, 'ai-stocktrading#546': 6, 'ai-stocktrading#533': 3, 'strategy-lab#33': 10, 'ai-stocktrading#532': 8, 'bff-api#144': 7, 'bff-api#150': 7, 'oke-platform-gitops#228': 18, 'oke-platform-gitops#333': 7, 'oke-platform-gitops#336': 28, 'ai-stocktrading#538': 7, 'ai-stocktrading#551': 8, 'ai-stocktrading#552': 7, 'risk-api#51': 7, 'strategy-api#335': 7, 'strategy-api#298': 8, 'strategy-api#245': 11, 'strategy-api#304': 9, 'account-pod-provisioner#11': 7, 'strategy-api#319': 9, 'strategy-api#243': 16, 'indicator-api#96': 15, 'strategy-api#237': 16, 'strategy-api#339': 6, 'strategy-api#313': 7, 'strategy-api#352': 5, 'execution-service#329': 9, 'strategy-lab#37': 7, 'indicator-api#118': 10, 'ai-stocktrading#558': 5, 'bff-api#157': 10, 'strategy-api#342': 7, 'execution-service#332': 6, 'trading-router#18': 10, 'bff-api#156': 6, 'bff-api#162': 6, 'candle-api#63': 7, 'oke-platform-gitops#343': 5, 'strategy-api#381': 9, 'strategy-api#382': 9, 'strategy-api#383': 9, 'strategy-api#414': 8, 'strategy-lab#46': 8, 'candle-api#68': 9, 'strategy-api#360': 9, 'oke-platform-gitops#373': 7, 'oke-platform-gitops#376': 7, 'external-data-service#144': 7, 'bff-api#170': 7, 'ai-stocktrading#570': 8, 'bff-api#164': 10, 'bff-api#165': 8, 'bff-api#166': 8, 'strategy-api#387': 8, 'strategy-api#391': 8, 'strategy-api#397': 8, 'oke-platform-gitops#383': 6, 'strategy-api#440': 12, 'bff-api#178': 6, 'trading-config-api#39': 6, 'marketdata-api#126': 8, 'marketdata-api#130': 8, 'candle-api#74': 8, 'candle-api#76': 8, 'candle-api#77': 9, 'candle-api#78': 9, 'indicator-api#142': 8, 'indicator-api#143': 11, 'oke-platform-gitops#397': 10, 'ai-stocktrading#589': 12, 'oke-platform-gitops#393': 9, 'oke-platform-gitops#400': 8, 'candle-api#86': 7, 'indicator-api#156': 7, 'marketdata-api#131': 9, 'oke-platform-gitops#404': 8, 'oke-platform-gitops#398': 5, 'indicator-api#152': 7, 'indicator-api#149': 6, 'indicator-api#153': 7, 'candle-api#80': 5, 'candle-api#89': 6, 'candle-api#85': 6, 'candle-api#83': 6, 'indicator-api#151': 6, 'oke-platform-gitops#391': 6, 'oke-platform-gitops#396': 6, 'oke-platform-gitops#384': 6, 'oke-platform-gitops#349': 6, 'oke-platform-gitops#316': 6, 'oke-platform-gitops#310': 6, 'oke-platform-gitops#299': 6, 'ai-stocktrading#591': 6, 'oke-platform-gitops#424': 9, 'oke-platform-gitops#425': 9, 'oke-platform-gitops#418': 10, 'oke-platform-gitops#419': 11, 'candle-api#106': 10, 'candle-api#107': 9, 'indicator-api#163': 9, 'indicator-api#181': 9, 'strategy-api#469': 9, 'strategy-api#462': 9, 'strategy-api#463': 9, 'strategy-api#464': 9, 'candle-api#109': 10, 'candle-api#110': 9, 'candle-api#111': 9, 'candle-api#112': 9, 'candle-api#113': 9, 'candle-api#114': 9, 'indicator-api#189': 10, 'indicator-api#190': 9, 'strategy-api#470': 10, 'strategy-api#472': 9, 'strategy-api#473': 9, 'oke-platform-gitops#430': 9, 'oke-platform-gitops#433': 9}  # 2026-10-28 owner decisions 307 (#149 5->6), 308 (#153 4->5), 309 (#131 6->7), 310 (#80 4->5); 2026-10-24 owner: two additional review rounds for every still-open PR currently blocked by the round cap
+  # 2026-10-30 owner: +5 review rounds for the open latency-plan PRs (candle-api#109 4->10, candle-api#110 4->9, candle-api#111 4->9, candle-api#112 4->9, candle-api#113 4->9, candle-api#114 4->9, indicator-api#189 4->10, indicator-api#190 4->9, strategy-api#470 4->10, strategy-api#472 4->9, strategy-api#473 4->9, oke-platform-gitops#430 4->9, oke-platform-gitops#433 4->9)
+  # 2026-10-30 owner: +5 review rounds for the open latency-plan PRs (oke-platform-gitops#424 4->9, oke-platform-gitops#425 4->9, oke-platform-gitops#418 4->10, oke-platform-gitops#419 4->11, candle-api#106 4->10, candle-api#107 4->9, indicator-api#163 4->9, indicator-api#181 4->9, strategy-api#469 4->9, strategy-api#440 6->12, strategy-api#462 4->9, strategy-api#463 4->9, strategy-api#464 4->9)
+  # 2026-10-12 owner: +3 for #141/#560/#533, +2 for #308/#531/#546; 2026-10-12 owner (2nd batch): +3 rounds for strategy-api#276, account-pod-provisioner#7, ai-stocktrading#531/#535, execution-service#326, oke-platform-gitops#241; 2026-10-18 13:06 owner: +1 #245/#237/#304/#339/#313/#352/#346/#276, exec #337/#329, backtest #47, lab #33/#37, indicator #118, AI #558, bff #157; +2 strategy #342, exec #332, router #18, bff #156/#162 (cap = rounds used + N); 2026-10-18 14:13 owner: +1 indicator-api#118 and execution-service#329 (post-fix reviews); 2026-10-19 owner: candle-api#63 -> 7, credentials-service#25 -> 7, oke-platform-gitops#343 -> 5; 2026-10-19 owner (2nd): strategy-api#381/#382/#383 -> 6; 2026-10-21 owner (Option A): +3 rounds on today's active PRs; 2026-10-28 owner decisions 273-278: gitops#400 -> 5, candle#78 -> 9, candle#77 -> 9, indicator#143 -> 9, gitops#393 -> 9
+  # 2026-10-28 21:59 IDT owner request d372 (push indicator/candle/gitops/AI PRs to review, more rounds): +2 for PRs at or near cap: candle-api#89 4->6, candle-api#85 4->6, candle-api#83 4->6, indicator-api#143 9->11, indicator-api#156 5->7, indicator-api#153 5->7, indicator-api#152 5->7, indicator-api#151 4->6, marketdata-api#131 7->9, oke-platform-gitops#404 6->8, oke-platform-gitops#400 6->8, oke-platform-gitops#397 8->10, oke-platform-gitops#391 4->6, oke-platform-gitops#396 4->6, oke-platform-gitops#384 4->6, oke-platform-gitops#349 4->6, oke-platform-gitops#316 4->6, oke-platform-gitops#310 4->6, oke-platform-gitops#299 4->6, ai-stocktrading#591 4->6
+_REVIEW_MIN_RUN_SECONDS = 120  # shorter runs are crashes / synthesized block runs
+_REVIEW_LOOKBACK_SECONDS = 0  # 0 = no window: owner caps are absolute ("rounds used + N"); a 30-day window let #237's 14 rounds expire (2026-10-19 owner fix)
+_REVIEW_CAP_MARKER = "review round cap"
+_REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_REVIEW_PR_TITLE_RE = re.compile(
+    r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
+_CAPITAL_DENY_SUBSTRINGS = (
+    "strategy", "execution", "risk", "signal", "exit", "entry", "stop-loss",
+    "sizing", "kelly", "profit", "pnl", "orders", "trade",
+)
+_CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
+                  "position-service", "risk-api", "credentials-service")
+_CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
+_CAPITAL_REVIEW_MODEL = ("claude-opus-5", "anthropic")
+
+
+def _norm_repo(name: str) -> str:
+    n = (name or "").lower().removesuffix(".git")
+    return n.removeprefix("etoro-")
+
+
+def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
+    """``repo#n`` keys for the PR a card is ABOUT. The title decides; the body
+    only counts via a repo-qualified reference (full PR URL or textual
+    ``repo PR #n``) when the title names none (a body often cites other PRs
+    in passing, which must not merge two PRs' round counts).
+
+    Both qualified forms are checked in the body fallback (not just the URL
+    form) so this stays in lockstep with ``_resolve_card_pr_keys`` -- a
+    diverging, URL-only body fallback here let a capital-affecting card with
+    a bare ``PR #n`` title and a textual (non-URL) repo mention in the body
+    silently miss the capital-model gate (round-2 finding F3)."""
+    t = _kb._lossy_text(title) or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if not keys:
+        b = _kb._lossy_text(body) or ""
+        keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+        keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    return keys
+
+
+_BARE_PR_REF_RE = re.compile(
+    r"(?:\bPR\s*#|pull\s*request\s*#?|/pull/)(\d+)", re.IGNORECASE)
+
+
+def _body_repo_pr_keys(body: Optional[str]) -> set[str]:
+    """Repo-qualified PR mentions anywhere in a body (full URLs and ``repo PR #n``)."""
+    b = _kb._lossy_text(body) or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    return keys
+
+
+def _unconsumed_text(text: str) -> str:
+    """``text`` with spans already matched by the repo-qualified PR regexes
+    (full URL, textual ``repo PR #n``) blanked out, so a bare-number scan
+    never re-derives a number from inside a qualified mention it has already
+    been credited for (and never treats a relative ``/pull/N`` inside a full
+    ``github.com/.../pull/N`` URL as a second, separate bare reference)."""
+    spans = [m.span() for m in _REVIEW_PR_URL_RE.finditer(text)]
+    spans += [m.span() for m in _REVIEW_PR_TITLE_RE.finditer(text)]
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for i in range(start, end):
+            chars[i] = " "
+    return "".join(chars)
+
+
+def _resolve_card_pr_keys(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                          title: Optional[str], body: Optional[str]) -> tuple[set[str], bool]:
+    """``(keys, ambiguous)`` for the PR a card is about.
+
+    Resolution order: a repo-qualified PR reference in the TITLE always decides,
+    full stop. Only when the title names none do we fall back to a bare ``PR #n``
+    on the card (title or body), confirmed ONLY by a STRUCTURAL source: a full PR
+    URL (someone pasted the actual link) or a parent card's own resolved PR key
+    (system-maintained linkage). A purely textual ``repo PR #n`` body mention is
+    never enough to confirm a bare number on its own: free-form prose can
+    coincidentally (or adversarially) cite an unrelated PR that happens to share
+    the same bare number as the one in the title -- that is exactly the
+    misattribution round-2 finding F1 caught (``_resolve_card_pr_keys(None, None,
+    "Review PR #329", "See unrelated other-repo PR #329 for context.")`` used to
+    resolve to ``{'other-repo#329'}`` non-ambiguously). When the card names no
+    bare number at all, a single repo-qualified body mention (URL or textual) is
+    safe because nothing else on the card could disagree with it.
+
+    ``ambiguous`` is True when nothing resolves to exactly one PR but the card still
+    names a PR number -- the review cost gate blocks such a card instead of letting it
+    run uncapped (2026-10-18 owner rule: a specifier rewrite to "Review PR #329" with
+    no repo had silently dropped the per-PR round cap)."""
+    t = _kb._lossy_text(title) or ""
+    title_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    title_keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if title_keys:
+        return title_keys, False
+    b = _kb._lossy_text(body) or ""
+    nums = set(_BARE_PR_REF_RE.findall(_unconsumed_text(t)))
+    nums |= set(_BARE_PR_REF_RE.findall(_unconsumed_text(b)))
+    url_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    textual_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    body_keys = url_keys | textual_keys
+    parent_keys: set[str] = set()
+    if conn is not None and task_id:
+        try:
+            for p in conn.execute(
+                "SELECT t.title, t.body FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                "WHERE l.child_id = ?", (task_id,),
+            ).fetchall():
+                parent_keys |= _card_pr_keys(p[0], p[1]) or _body_repo_pr_keys(p[1])
+        except sqlite3.Error:
+            parent_keys = set()
+    if not nums:
+        # No PR number on the card itself: parents only say what the card came FROM
+        # (e.g. a review of a NEW redo PR whose parent names the old PR), so they never
+        # pin a PR here. A lone repo-qualified body mention still does.
+        return (body_keys, False) if len(body_keys) == 1 else (set(), bool(body_keys))
+    strong = {k for k in (url_keys | parent_keys) if k.rsplit("#", 1)[1] in nums}
+    if len(strong) == 1:
+        return strong, False
+    return set(), True
+
+
+def _match_card_pr_keys(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                         title: Optional[str], body: Optional[str]) -> set[str]:
+    """Best-effort PR keys for MATCHING a card against an already-known PR --
+    used only for historical round-counting (``_review_verdict_runs``) and
+    duplicate-review detection, NEVER for admitting a new card.
+
+    Round-3 finding F4 (MAJOR): round-2's F1 tightening correctly makes
+    ``_resolve_card_pr_keys`` refuse to ADMIT a bare-title/textual-body card
+    on the strength of a textual body mention alone, but using that same
+    strict result to match HISTORY silently dropped a legacy card's prior
+    verdict run out of the round-cap and duplicate-review accounting the
+    moment a later, repo-qualified card named the same PR (measured: 91 live
+    cards flipped resolved -> ambiguous, 5 PR/profile round counts crossed
+    their cap boundary). A textual-only body mention counts here even though
+    it never confirms a bare number for admission.
+
+    Round-4 finding F5 (MAJOR): the nums-present branch below used to return
+    the FULL union of URL/textual/parent candidates for a confirmed number
+    with no check that they agree on one repo, unlike ``_resolve_card_pr_keys``
+    (which goes ambiguous on >1 distinct candidate). A card body with two
+    DISAGREEING repo-qualified mentions of the same bare number -- e.g. a
+    follow-up card naming its own PR plus an unrelated "see also" link that
+    happens to share the number -- returned BOTH keys, letting one historical
+    run double-count toward two different PRs' round caps or falsely trip
+    ``duplicate_review_running`` for either. Now rejects (returns ``set()``)
+    whenever the confirmed candidates disagree, same as the admission resolver."""
+    t = _kb._lossy_text(title) or ""
+    title_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    title_keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if title_keys:
+        return title_keys
+    b = _kb._lossy_text(body) or ""
+    nums = set(_BARE_PR_REF_RE.findall(_unconsumed_text(t)))
+    nums |= set(_BARE_PR_REF_RE.findall(_unconsumed_text(b)))
+    url_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    textual_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    body_keys = url_keys | textual_keys
+    parent_keys: set[str] = set()
+    if conn is not None and task_id:
+        try:
+            for p in conn.execute(
+                "SELECT t.title, t.body FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                "WHERE l.child_id = ?", (task_id,),
+            ).fetchall():
+                parent_keys |= _card_pr_keys(p[0], p[1])
+        except sqlite3.Error:
+            parent_keys = set()
+    if not nums:
+        return body_keys if len(body_keys) == 1 else set()
+    url_keys_f = {k for k in url_keys if k.rsplit("#", 1)[1] in nums}
+    textual_keys_f = {k for k in textual_keys if k.rsplit("#", 1)[1] in nums}
+    parent_keys_f = {k for k in parent_keys if k.rsplit("#", 1)[1] in nums}
+    candidates = url_keys_f | textual_keys_f | parent_keys_f
+    return candidates if len(candidates) == 1 else set()
+
+
+def _card_matches_pr(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                     title: Optional[str], body: Optional[str], keys: set[str]) -> bool:
+    """Whether a card is about one of ``keys`` -- for HISTORY matching only (round
+    counting, duplicate detection), never for admitting a card.
+
+    Counting must be inclusive: an under-count silently lets a capital PR exceed the
+    owner's round cap, an over-count only hands the decision to the owner early.
+    Beyond ``_match_card_pr_keys`` (repo-qualified title, or a bare number confirmed
+    by a URL / parent / textual ``repo PR #n``), a card also matches ``repo#n`` when
+    its TITLE names ``PR #n`` and either the title names the repo or the body has
+    that exact ``repo PR #n`` / URL, e.g. legacy
+    titles like "Review PR #94 for external-data-service ..." or
+    "Review PR #47: candle-api ...", which name the repo AFTER the number."""
+    if _match_card_pr_keys(conn, task_id, title, body) & keys:
+        return True
+    t = _kb._lossy_text(title) or ""
+    b = _kb._lossy_text(body) or ""
+    # The PR number must be in the TITLE (bodies cite other PRs in passing). Raw
+    # scan, not ``_unconsumed_text``: a pseudo-repo like "Re-review PR #304" is
+    # consumed by the title regex as ``re-review#304`` and must not hide the 304.
+    title_nums = set(_BARE_PR_REF_RE.findall(t)) | {n for _r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if not title_nums:
+        return False
+    body_keys = _body_repo_pr_keys(b)
+    tl = t.lower()
+    for k in keys:
+        repo, n = k.rsplit("#", 1)
+        if n not in title_nums or not repo:
+            continue
+        # Round-4 F5 (MAJOR, same class as ``_match_card_pr_keys``): body_keys is an
+        # unconditional union over the whole body, so two DISAGREEING repo-qualified
+        # mentions of the same number (this PR plus an unrelated "see also" link
+        # sharing the number) must not let EITHER side match -- only trust the body
+        # when it names exactly one repo for this number.
+        same_num = {bk for bk in body_keys if bk.rsplit("#", 1)[1] == n}
+        if same_num == {k}:
+            return True
+        if re.search(rf"(?<![\w.-])(?:etoro-)?{re.escape(repo)}(?![\w-])", tl):
+            return True  # repo named in the title, e.g. after the number
+    return False
+
+
+def _is_capital_review(task) -> bool:
+    title = _kb._lossy_text(getattr(task, "title", "")) or ""
+    body = (_kb._lossy_text(getattr(task, "body", "")) or "")[:4000]
+    if _CAPITAL_MARKER_RE.search(title) or _CAPITAL_MARKER_RE.search(body):
+        return True
+    repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
+    return any(r in _CAPITAL_REPOS for r in repos)
+
+
+def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
+    """Real verdict runs by ``profile`` on any card about the same PR, oldest first.
+
+    Returns full rows (including ``metadata``) so callers can read the structured
+    findings a prior round stored there (Rule 3 delta review)."""
+    nums = sorted({k.rsplit("#", 1)[1] for k in keys})
+    if not nums:
+        return []
+    # both patterns against title AND body: a full PR URL in the title used to be
+    # filtered out here (only the body was searched for "/pull/N").
+    like = " OR ".join(["t.title LIKE ? OR t.body LIKE ? OR t.title LIKE ? OR t.body LIKE ?"] * len(nums))
+    since = int(time.time()) - _REVIEW_LOOKBACK_SECONDS if _REVIEW_LOOKBACK_SECONDS else 0
+    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, since]
+    for n in nums:
+        params += [f"%#{n}%", f"%/pull/{n}%", f"%/pull/{n}%", f"%#{n}%"]
+    rows = conn.execute(
+        "SELECT r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
+        "AND r.outcome IN ('completed', 'changes_requested', 'blocked', 'review_requested') "
+        "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
+        f"AND ({like}) ORDER BY r.ended_at",
+        params,
+    ).fetchall()
+    return [r for r in rows if _card_matches_pr(conn, r["task_id"], r["title"], r["body"], keys)]
+
+
+def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) -> int:
+    """When the card last (re)entered a spawnable lane: a card that went back to
+    the dev and returned must not look older than the verdict that sent it back."""
+    row = conn.execute(
+        "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind IN "
+        "('created', 'review_requested', 'changes_requested', 'promoted', 'unblocked', "
+        "'status', 'assigned', 'review_reopened')",
+        (task_id,),
+    ).fetchone()
+    return max(int(created_at or 0), int((row["t"] if row else 0) or 0))
+
+
+def _block_review_for_owner(conn: sqlite3.Connection, task_id: str, status: str, reason: str) -> None:
+    # block_task only transitions running/ready; a review-lane card is parked
+    # in ready first so the owner's unblock returns it to a spawnable lane.
+    if status == "review":
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'review'", (task_id,))
+    _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+
+
+def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool) -> Optional[str]:
+    """Return a skip reason for a review-gate spawn that would waste a paid
+    review, else None. Fails open (None) on any error: this is a cost control,
+    not a safety check."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT title, body, created_at, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        keys, ambiguous = _resolve_card_pr_keys(conn, task_id, row["title"], row["body"])
+        if not keys:
+            if not ambiguous:
+                return None  # not about a PR at all (design note, audit, ...)
+            if not dry_run:
+                _block_review_for_owner(
+                    conn, task_id, row["status"],
+                    f"Review PR reference is ambiguous: {assignee} card names a PR number but no "
+                    "repo, PR URL or single-PR parent, so the per-PR review round cap cannot be "
+                    "applied. Put 'repo PR #N' or the github.com/.../pull/N URL in the title, "
+                    "then unblock.",
+                )
+            return "review_pr_ambiguous"
+        pr = sorted(keys)[0]
+        # 1. Another card for the same PR is being reviewed by this gate right now.
+        for other in conn.execute(
+            "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
+            (task_id, assignee),
+        ).fetchall():
+            if _card_matches_pr(conn, other["id"], other["title"], other["body"], keys):
+                return "duplicate_review_running"
+        runs = _review_verdict_runs(conn, assignee, keys)
+        # 2. This gate already gave a verdict on this PR after this card entered its lane.
+        entered = _lane_entry_time(conn, task_id, row["created_at"])
+        newer = [r for r in runs if r["task_id"] != task_id and int(r["ended_at"]) > entered]
+        if newer:
+            if not dry_run:
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    f"Duplicate review card: {assignee} already reviewed {pr} after this card was "
+                    f"queued (card {newer[-1]['task_id']}). Archived so the same round is not paid "
+                    "for twice. Unarchive it if it asks for something different.",
+                )
+                _kb.archive_task(conn, task_id)
+            return "duplicate_review_superseded"
+        # 3. Round cap: the owner decides whether a further round is worth it.
+        cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
+        if len(runs) < cap:
+            return None
+        unblocked = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (task_id,),
+        ).fetchone()
+        capped = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+            "AND payload LIKE ?",
+            (task_id, f"%{_REVIEW_CAP_MARKER}%"),
+        ).fetchone()
+        ok_at = int((unblocked["t"] if unblocked else 0) or 0)
+        cap_at = int((capped["t"] if capped else 0) or 0)
+        if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in runs):
+            return None  # owner unblocked after the cap: exactly one more round
+        if not dry_run:
+            _block_review_for_owner(
+                conn, task_id, row["status"],
+                f"Review round cap: {assignee} already gave {len(runs)} verdicts on {pr} "
+                f"(cap {cap}, owner directive: stop after {cap} rounds). Unblock this "
+                "card to allow ONE more round, or decide merge/close with the residual findings.",
+            )
+        return "review_round_cap"
+    except Exception as exc:  # pragma: no cover - cost gate must never stop the dispatcher
+        _kb._log.warning("review cost gate skipped for %s: %s", task_id, exc)
+        return None
+# --- end review cost gate -----------------------------------------------------
+
+
+# --- Rule 3: structured findings + delta-only review after round 1 ------------
+# (ADR "review-loop convergence", card t_f526b652). Findings are stored by the
+# reviewer/release-reviewer SOUL in each verdict run's ``task_runs.metadata`` as
+# ``{"findings": [{"id", "severity", "file", "line", "status"}, ...], "reviewed_sha": "..."}``.
+_BLOCKING_SEVERITIES = {"MAJOR", "CRITICAL", "BLOCKER"}
+
+
+def _findings_from_metadata(metadata: Optional[str]) -> list:
+    """Parse the ``findings`` list a verdict run stored in its ``metadata``.
+    Empty on any parse failure or absence -- advisory data, never load-bearing."""
+    meta = _kb._json_dict(metadata) if metadata else {}
+    findings = meta.get("findings")
+    return findings if isinstance(findings, list) else []
+
+
+def should_block_on_findings(findings: list) -> bool:
+    """Round >= 2 blocking rule: only a MAJOR-or-higher finding blocks approval.
+    MINOR/NIT are advisory, surfaced in the PR comment but never blocking."""
+    # decision 312: findings may be stored as plain strings ("MAJOR: file:line ..."); read the
+    # leading severity word from those instead of raising AttributeError.
+    def _sev(f) -> str:
+        if isinstance(f, dict):
+            return str(f.get("severity", "")).upper()
+        m = re.match(r"\s*\[?([A-Za-z]+)", str(f))
+        return m.group(1).upper() if m else ""
+    return any(_sev(f) in _BLOCKING_SEVERITIES for f in findings)
+
+
+def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Round >= 2 handoff text: the SHA the prior verdict reviewed plus the prior
+    findings' open/addressed status -- NEVER a "review it all again" instruction.
+    Returns None on round 1 (no prior verdict yet on this PR), so the caller falls
+    back to a normal full review."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    keys, _ambiguous = _resolve_card_pr_keys(conn, task_id, row["title"], row["body"])
+    if not keys:
+        return None
+    runs = _review_verdict_runs(conn, assignee, keys)
+    if not runs:
+        return None  # round 1: no prior verdict, do a normal full review
+    prior = runs[-1]
+    meta = _kb._json_dict(prior["metadata"]) if prior["metadata"] else {}
+    since_sha = meta.get("reviewed_sha")
+    findings = _findings_from_metadata(prior["metadata"])
+    lines = [
+        "Round >= 2 review: this gate already gave a verdict on this PR. Review ONLY the "
+        "diff since the prior verdict's reviewed SHA plus the prior findings below -- do "
+        "not re-review the whole PR from scratch.",
+    ]
+    if since_sha:
+        lines.append(f"Diff since reviewed SHA: {since_sha}")
+    if findings:
+        lines.append("Prior findings (mark each addressed/open in your verdict):")
+        for f in findings:
+            if not isinstance(f, dict):  # decision 312: plain-string finding = the finding's text
+                lines.append(f"- {str(f).strip()}")
+                continue
+            lines.append(
+                f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
+                f"{f.get('id', '')} -- {f.get('status', 'open')}"
+            )
+        lines.append(
+            "Only a MAJOR-or-higher finding may block approval; MINOR/NIT are advisory, "
+            "not blocking -- say so explicitly in the PR comment."
+        )
+    else:
+        lines.append("No prior findings were recorded.")
+    return "\n".join(lines)
+
+
+# --- Rule 5: fallback model for low-risk/text-only review PRs -----------------
+_LOW_RISK_PATH_RE = re.compile(
+    r"(^|/)(docs/|tests/)|\.md$|(^|/)\.github/workflows/|(^|/)\.github/[^/]*\.ya?ml$",
+    re.IGNORECASE,
+)
+_SMALL_PR_LINES = 30  # reuse release-reviewer SOUL.md's existing small_pr threshold
+
+
+def _is_low_risk_review(task, pr_meta: dict) -> bool:
+    """True only for a non-capital, docs/tests/CI-only, small PR -- the ONLY class
+    the dispatcher may ever substitute a fallback model for (Rule 5). Capital-sensitive
+    PRs never qualify, regardless of size or file list -- hard rule, unchanged."""
+    if _is_capital_review(task):
+        return False
+    files = pr_meta.get("files") or []
+    if not files:
+        return False  # unknown file list: fail closed, never low-risk
+    if not all(_LOW_RISK_PATH_RE.search(f) for f in files):
+        return False
+    if any(marker in f.lower() for f in files for marker in _CAPITAL_DENY_SUBSTRINGS):
+        return False
+    additions = int(pr_meta.get("additions") or 0)
+    deletions = int(pr_meta.get("deletions") or 0)
+    return (additions + deletions) <= _SMALL_PR_LINES
+
+
+def _required_gate_unavailable(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
+    """The exact error text when the latest run against this task's REQUIRED gate
+    model is CONFIRMED unavailable (quota/429, auth revoked, infra refusal) -- never
+    merely slow (OWNER-RULES #3). None when the gate looks reachable."""
+    row = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["outcome"] not in ("spawn_failed", "rate_limited"):
+        return None
+    if row["outcome"] == "spawn_failed" and not _kb._json_dict(row["metadata"]).get("infrastructure"):
+        return None
+    return _kb._lossy_text(row["error"]) or row["outcome"]
+
+
+def _review_fallback_model() -> Optional[tuple]:
+    """``auxiliary.review_fallback`` (model, provider), or None when unset."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        cfg = (load_user_config_effective(fail_closed=True) or {}).get("auxiliary", {})
+        fallback = cfg.get("review_fallback") or {}
+    except Exception:
+        return None
+    model = (fallback.get("model") or "").strip()
+    if not model:
+        return None
+    provider = (fallback.get("provider") or "").strip()
+    if not provider or provider == "auto":
+        provider = "anthropic"
+    return (model, provider)
+
+
+def _maybe_review_fallback_model(conn: sqlite3.Connection, task, assignee: str,
+                                  pr_meta: Optional[dict] = None) -> Optional[tuple]:
+    """Rule 5: only for a low-risk review PR, only when the REQUIRED gate model is
+    confirmed unavailable, substitute ``auxiliary.review_fallback`` and disclose it
+    on the card. Capital-sensitive PRs never fall back -- enforced by
+    ``_is_low_risk_review`` itself, not re-checked here."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    if not _is_low_risk_review(task, pr_meta or {}):
+        return None
+    err = _required_gate_unavailable(conn, getattr(task, "id", None))
+    if err is None:
+        return None
+    fallback = _review_fallback_model()
+    if fallback is None:
+        return None
+    _kb.add_comment(
+        conn, task.id, "dispatcher",
+        f"Review gate model unavailable ({err}); this low-risk PR (docs/tests/CI-only, "
+        f"<= {_SMALL_PR_LINES} changed lines) ran on the configured fallback "
+        f"`{fallback[0]}` instead -- owner, please read the diff.",
+    )
+    return fallback
+# --- end Rules 3 & 5 -----------------------------------------------------------
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1576,7 +2128,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, title, body FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1644,9 +2196,25 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    # Only a PR the card does NOT already name counts as "a prior worker
+    # opened a PR". A review/fix card whose whole subject IS an existing PR
+    # re-posts that same link in discussion, and the 24h window re-armed on
+    # every such comment -- a livelock, not a wait (2026-09-16: ~3,700
+    # respawn_guarded events in 6h across 11 starved cards). A repo-qualified
+    # ref whose bare "#50" the card already names is the same PR: a title
+    # saying "review PR #50" cannot spell the repo out. (local patch, ported to v0.22.2)
+    known = _pr_refs(
+        f"{_kb._lossy_text(row['title']) or ''}\n{_kb._lossy_text(row['body']) or ''}"
+    )
+
+    def _names_new_pr(body: str) -> bool:
+        if not _RESPAWN_GUARD_PR_URL_RE.search(body):
+            return False
+        return any(f"#{r.rsplit('#', 1)[-1]}" not in known for r in _pr_url_refs(body) - known)
+
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                if _names_new_pr(_kb._lossy_text(c["body"]) or "")]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
@@ -1656,6 +2224,221 @@ def check_respawn_guard(
         return "active_pr"
 
     return None
+
+
+def review_dedupe_enabled() -> bool:
+    """Whether a review-column respawn first checks :func:`_review_head_unchanged`
+    and replays a prior verdict instead of re-running the model when the PR's
+    head SHA and findings are unchanged. Default true; disable for boards
+    where every review-lane spawn must re-run regardless (code-level default
+    only — not a live config.yaml write).
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool((load_config() or {}).get("kanban", {}).get("review_dedupe", True))
+    except Exception:
+        return True
+
+
+_REVIEW_DEDUPE_PR_URL_RE = _RESPAWN_GUARD_PR_URL_RE
+
+
+def _task_pr_contract(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Most recent GitHub PR URL mentioned in any comment on ``task_id``, or
+    ``None``. Same signal :func:`check_respawn_guard`'s ``active_pr`` branch
+    uses to recognize "a PR already exists for this card" — reused here to
+    find WHICH PR a reviewer verdict is about. There is no dedicated
+    ``_card_pr_keys`` helper in this codebase; comments are the durable place
+    a worker records the PR it opened.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        match = _REVIEW_DEDUPE_PR_URL_RE.search(_kb._lossy_text(row["body"]) or "")
+        if match:
+            return match.group(0)
+    return None
+
+
+def _review_head_unchanged(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+) -> tuple[bool, Optional[dict]]:
+    """``(True, prior_verdict)`` when ``reviewer_profile``'s prior verdict on
+    this task is still current for the PR's LIVE head SHA — the caller should
+    replay it instead of spawning a fresh reviewer. Otherwise ``(False,
+    None)``: spawn for real.
+
+    Calls :func:`hermes_cli.kanban_pr_acceptance.fetch_pr_head_sha` AT MOST
+    ONCE (one live GraphQL round trip per spawn attempt). Fails open — returns
+    ``(False, None)`` — whenever anything is ambiguous: ``review_dedupe``
+    disabled, no prior verdict (first review always runs), that verdict's
+    metadata has no ``head_sha`` (old data model), no PR reference found on
+    the task, the live head SHA cannot be resolved (network/auth/private
+    repo/closed PR), the live head SHA differs from the verdict's, or a new
+    task comment landed after the verdict closed.
+
+    "No new findings" has no structured findings schema in this codebase
+    yet, so it is judged via comments, not every task event: the normal
+    re-review cycle (implementer does more work at the SAME head and calls
+    ``kanban_request_review`` again — exactly the case this guard exists
+    for) itself produces a ``review_requested`` event, a ``claimed`` event,
+    and an ``assigned`` event strictly after the prior verdict's
+    ``ended_at`` — counting those as "new activity" would make the guard
+    never fire. A durable task comment (the channel ``sdlc-review``'s own
+    procedure uses for reviewer findings and the one a human would use to
+    raise something new) is the signal actually worth failing open on.
+    False positives here (wrongly skipping a real review) are far more
+    expensive than false negatives (an extra, harmless re-review), so every
+    ambiguous branch still spawns for real.
+    """
+    if not review_dedupe_enabled():
+        return False, None
+
+    prior = conn.execute(
+        "SELECT outcome, summary, metadata, ended_at FROM task_runs "
+        "WHERE task_id = ? AND profile = ? AND outcome IN ('completed', 'changes_requested') "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id, reviewer_profile),
+    ).fetchone()
+    if prior is None:
+        return False, None  # first review always runs
+
+    prior_metadata = _kb._json_dict(prior["metadata"])
+    prior_head_sha = prior_metadata.get("head_sha")
+    if not isinstance(prior_head_sha, str) or not prior_head_sha.strip():
+        return False, None  # no declared head_sha (old data model) -- spawn for real
+
+    contract = _task_pr_contract(conn, task_id)
+    if not contract:
+        return False, None  # no PR reference found -- spawn for real
+
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    live_sha = fetch_pr_head_sha(contract, assignee=reviewer_profile)
+    if not live_sha or live_sha != prior_head_sha:
+        # Unresolvable (fail CLOSED) or the head moved -- spawn for real either way.
+        return False, None
+
+    ended_at = _kb._to_epoch(prior["ended_at"])
+    if ended_at is None:
+        return False, None
+    now = int(time.time())
+    # A comment strictly after the verdict closed is treated as a possible new
+    # finding (a human, or the reviewer's own procedure, surfaces findings via
+    # comments). An unreadable timestamp counts as "newer" -- fail closed,
+    # never silently lift the dedupe.
+    if any(_rows_since(conn, "task_comments", task_id, ended_at, strict=True, unreadable=now)):
+        return False, None
+
+    return True, {
+        "summary": prior["summary"],
+        "outcome": prior["outcome"],
+        "metadata": prior_metadata,
+    }
+
+
+def _replay_review_dedupe_verdict(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+    prior_verdict: dict, head_sha: Optional[str],
+) -> bool:
+    """Resolve a review-column task WITHOUT spawning a new reviewer run: the
+    PR's head SHA and findings are unchanged since ``reviewer_profile``'s
+    prior verdict (:func:`_review_head_unchanged`), so this replays that
+    verdict's outcome by hand instead of re-running the model.
+
+    - ``completed`` replays via :func:`hermes_cli.kanban_db.complete_task` —
+      the exact same ``review -> done`` path a human review approval takes
+      (``kanban_db.py`` ~2660; it already accepts ``review`` with no active
+      claim and synthesizes the closing run itself).
+    - ``changes_requested`` has no reusable top-level function: the real
+      :func:`hermes_cli.kanban_db.request_changes` (``kanban_db.py`` ~3432)
+      requires an ACTIVE run claimed from ``review`` — there is none here,
+      since no worker ran this tick. Its ``review -> implementer`` state
+      transition is reproduced by hand below: same target status
+      (``_landing_status_after_parents``), same implementer lookup (latest
+      ``review_requested`` event), same claim-clearing columns, closed with
+      a synthesized run (:func:`hermes_cli.kanban_db._synthesize_ended_run`)
+      instead of ``_end_run`` because there is no active run to end.
+
+    Either branch appends a ``review_dedupe_replayed`` event so the board
+    shows why no new worker spawned. Returns ``True`` on a successful
+    replay; ``False`` if the task changed out from under us (caller should
+    treat this tick as a no-op — it will be retried fresh next tick).
+    """
+    summary = f"[replayed, head unchanged] {prior_verdict.get('summary') or ''}".strip()
+    metadata = prior_verdict.get("metadata") or {}
+    outcome = prior_verdict.get("outcome")
+
+    if outcome == "completed":
+        ok = _kb.complete_task(conn, task_id, summary=summary, metadata=metadata)
+        if not ok:
+            return False
+        with _kb.write_txn(conn):
+            run_row = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=int(run_row["id"]) if run_row else None,
+            )
+        return True
+
+    if outcome == "changes_requested":
+        with _kb.write_txn(conn):
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if task_row is None or task_row["status"] != "review":
+                return False
+            requested_event = _kb._latest_event(conn, task_id, "review_requested")
+            implementer = None
+            if requested_event is not None:
+                implementer = _kb._nonblank_str(
+                    _kb._json_dict(_kb._row_get(requested_event, "payload")).get("implementer"),
+                )
+            if implementer is None:
+                return False
+            new_status = _kb._landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       assignee = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL, worker_started_at = NULL
+                 WHERE id = ? AND status = 'review'
+                """,
+                (new_status, implementer, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _kb._synthesize_ended_run(
+                conn, task_id, outcome="changes_requested", summary=summary, metadata=metadata,
+                profile=reviewer_profile,
+            )
+            _kb._append_event(
+                conn, task_id, "changes_requested",
+                {
+                    "reason": summary,
+                    "implementer": implementer,
+                    "reviewer": reviewer_profile,
+                    "status": new_status,
+                    "replayed": True,
+                },
+                run_id=run_id,
+            )
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=run_id,
+            )
+        return True
+
+    return False
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
@@ -2098,6 +2881,10 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    cost_reason = _review_cost_gate(conn, task_id, assignee, dry_run=dry_run)
+    if cost_reason is not None:
+        result.respawn_guarded.append((task_id, cost_reason))
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2112,6 +2899,23 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Review-lane dedupe: check_respawn_guard never guards the review lane (it is
+    # the handoff's INPUT, not a duplicate-work signal — see its docstring), so this
+    # is the dedicated check for "nothing has changed since the last reviewer
+    # verdict" (#review_dedupe). Only a real check — no DB write — so dry_run can
+    # safely skip the spawn attribution below without the replay side effects.
+    if lane == "review" and not dry_run:
+        unchanged, prior_verdict = _review_head_unchanged(conn, task_id, assignee)
+        if unchanged and prior_verdict is not None:
+            head_sha = (prior_verdict.get("metadata") or {}).get("head_sha")
+            if _replay_review_dedupe_verdict(conn, task_id, assignee, prior_verdict, head_sha):
+                # Resolved without spawning a worker -- the task left ``review``
+                # (approved -> done, or changes_requested -> back to the implementer),
+                # so it is never stuck waiting for a tick that will never come.
+                return False
+            # State changed out from under us (e.g. raced with a real claim) --
+            # fall through and let the normal claim/spawn path below handle it.
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -2148,10 +2952,22 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        # Rule 3: round >= 2 gets a delta-only handoff (diff since the prior
+        # verdict's SHA + prior findings open/addressed), never a full re-review.
+        delta_context = build_round_delta_context(conn, claimed.id, assignee)
+        if delta_context is not None:
+            _kb.add_comment(conn, claimed.id, "dispatcher", delta_context)
+        # Rule 5: only a low-risk (docs/tests/CI-only, small) PR, and only when the
+        # required gate model is confirmed unavailable, may run on a fallback model.
+        # Capital-sensitive PRs never fall back (_is_low_risk_review enforces it).
+        if not claimed.model_override:
+            fallback = _maybe_review_fallback_model(conn, claimed, assignee)
+            if fallback is not None:
+                claimed.model_override, claimed.provider_override = fallback
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+            _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2230,6 +3046,10 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    # Quota/429 backoff timer sweep — runs BEFORE recompute_ready /
+    # ready_rows so a card whose resume_at just came due is spawnable in
+    # this same tick, not one tick later.
+    result.scheduled_promoted = _kb.recompute_scheduled(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2317,6 +3137,18 @@ def _any_spawnable_review(
     assignee already at the per-profile cap, or respawn-guarded — cannot
     consume the reservation, so it must not withhold capacity from an
     otherwise ready task (one such row would pin ``ready_budget`` to 0).
+
+    A row that :func:`_dispatch_lane_task` would instead DEDUPE (replay a
+    prior verdict — see :func:`_review_head_unchanged`) is treated as
+    spawnable here, not skipped: ``_dispatch_lane_task`` resolves it in the
+    SAME tick it is reached (no claim/worker involved), so reserving its
+    slot costs at most one wasted ready-lane slot for one tick, while NOT
+    reserving it risks the opposite — a sustained ready backlog consuming
+    the full ``spawn_budget`` before the review loop runs, so the dedupe row
+    never reaches ``_dispatch_lane_task`` this tick (the loop breaks on
+    ``spawned >= spawn_budget`` BEFORE calling it) and the already-decided
+    verdict sits unreplayed for another tick. Treating it as spawnable keeps
+    the review lane always making progress, which is the safer default.
     """
     if not review_rows:
         return False
@@ -2465,10 +3297,82 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     return parsed if parsed >= minimum else default
 
 
+def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
+    """Return ``(rotate_bytes, backup_count)`` for worker log rotation.
+    Defaults: rotate at 2 MiB, keep one backup (``.log.1``); both overridable
+    from ``config.yaml``.
+    """
+    if kanban_cfg is None:
+        try:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config().get("kanban") or {})
+        except Exception:
+            kanban_cfg = {}
+    kanban_cfg = kanban_cfg or {}
+    max_bytes = _positive_int(kanban_cfg.get("worker_log_rotate_bytes"), DEFAULT_LOG_ROTATE_BYTES, minimum=1)
+    backup_count = _positive_int(kanban_cfg.get("worker_log_backup_count"), DEFAULT_LOG_BACKUP_COUNT, minimum=0)
+    return max_bytes, backup_count
+
+
+def _rotated_log_path(log_path: Path, generation: int) -> Path:
+    return log_path.with_suffix(log_path.suffix + f".{generation}")
+
+
+def _rotate_worker_log(
+    log_path: Path,
+    max_bytes: int,
+    backup_count: int = DEFAULT_LOG_BACKUP_COUNT,
+) -> None:
+    """Rotate ``<log>`` when it exceeds ``max_bytes``: ``<log>`` → ``<log>.1``,
+    older generations shift up to ``backup_count``.
+    """
+    try:
+        if not log_path.exists() or log_path.stat().st_size <= max_bytes:
+            return
+        backup_count = _positive_int(backup_count, DEFAULT_LOG_BACKUP_COUNT, minimum=0)
+        if backup_count == 0:
+            log_path.unlink()
+            return
+        oldest = _rotated_log_path(log_path, backup_count)
+        with contextlib.suppress(OSError):
+            if oldest.exists():
+                oldest.unlink()
+        for generation in range(backup_count - 1, 0, -1):
+            src = _rotated_log_path(log_path, generation)
+            if not src.exists():
+                continue
+            with contextlib.suppress(OSError):
+                src.rename(_rotated_log_path(log_path, generation + 1))
+        log_path.rename(_rotated_log_path(log_path, 1))
+    except OSError:
+        pass
+
+
 def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
     console-script target — there is no top-level ``hermes`` package)."""
     return [sys.executable, "-m", "hermes_cli.main"]
+
+
+def _propagate_module_import_root(cmd: list[str], env: dict[str, str]) -> None:
+    """Put the running install's package root on a module-form worker's path.
+
+    ``_resolve_hermes_argv`` proves ``hermes_cli`` importable in THIS process,
+    where a store-python shim has the repo root on ``sys.path`` in-process;
+    the spawned child runs the bare ``sys.executable`` from the task workspace
+    with a scrubbed ``PYTHONPATH`` and cannot import the package the parent
+    just proved importable — it dies before any work and the board
+    auto-blocks (#122299, #122487, #122500). Same-interpreter child, so the
+    root is version-safe to propagate; ``hermes_cli.main``'s own bootstrap
+    then owns dependency activation as usual. A resolved shim path owns its
+    imports and is left alone. Same pin cron's external worker uses (#112729).
+    """
+    if cmd[1:3] != ["-m", "hermes_cli.main"]:
+        return
+    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+
+    pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parents[1])
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2670,6 +3574,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
 
 _retagged_workspace_roots: set[str] = set()
 
+
 def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
     """Reclaim pre-tag worker rows in state.db so they leave the session lists.
 
@@ -2696,9 +3601,44 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """The profile owner executes; this subprocess only waits for its receipt."""
-    import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+    cmd = [
+        *_resolve_hermes_argv(),
+        "-p", profile_arg,
+        # A worker must NEVER boot the interactive TUI: its no-TTY bail-out
+        # exits 0 without doing the task → "protocol violation" every attempt.
+        "--cli",
+        # Workers run under a profile-scoped HERMES_HOME and so see that
+        # profile's shell-hook allowlist; pass --accept-hooks explicitly so
+        # configured hooks still register.
+        "--accept-hooks",
+    ]
+    # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
+    # ambiguity if a skill name contains unusual chars.
+    for sk in task.skills or ():
+        if sk:
+            cmd.extend(["--skills", sk])
+    if (not task.model_override and profile_arg == "release-reviewer"
+            and _is_capital_review(task)):
+        # Cost gate D: release-reviewer runs Sonnet; capital PRs get Opus.
+        cmd.extend(["-m", _CAPITAL_REVIEW_MODEL[0], "--provider", _CAPITAL_REVIEW_MODEL[1]])
+    if task.model_override:
+        cmd.extend(["-m", task.model_override])
+        # Pin the provider too so the worker resolves the model against the
+        # intended backend (model X with provider Y is the classic board-stall).
+        if task.provider_override:
+            cmd.extend(["--provider", task.provider_override])
+    # Independent of the model override — a task can run the profile's own
+    # model at a different depth.
+    if task.reasoning_effort:
+        cmd.extend(["--reasoning", task.reasoning_effort])
+    worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    if worker_toolsets:
+        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
+    # worker log keeps its live tool feed (forcing -Q blanked it).
+    return cmd
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
@@ -2709,8 +3649,8 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_dir = _kb.worker_logs_dir(board=board)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
-    from hermes_cli.kanban_worker_log import rotate_worker_log, worker_log_rotation_config
-    rotate_worker_log(log_path, *worker_log_rotation_config())
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
     return open(log_path, "ab")
 
 
@@ -2847,6 +3787,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(_kb.workspaces_root(board=board))
+    _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — defense-in-depth pin if a path is resolved without the
     # DB / workspaces env vars.
     env["HERMES_KANBAN_BOARD"] = _kb._normalize_board_slug(board) or _kb.get_current_board()
@@ -2861,13 +3802,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The worker is `-m hermes_cli.kanban_worker_client`: Hermes itself, with no console-script
-    # bootstrap. The routed-profile scrub above strips Hermes-owned PYTHONPATH entries (user
-    # children must not see our tree), so a PYTHONPATH-launched dispatcher spawned a child that
-    # died on `No module named 'hermes_cli'` before it ever reached the owner. Same pin as cron's
-    # external worker (#112729): applied to the sanitized env, after every other decision stands.
-    from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
-    env = pin_hermes_tree_on_pythonpath(env, Path(__file__).resolve().parent.parent)
+    # The module argv must carry the import context that made it resolvable:
+    # the shim's in-process path injection is invisible to the bare child.
+    _propagate_module_import_root(cmd, env)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
