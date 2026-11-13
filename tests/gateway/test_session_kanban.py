@@ -78,6 +78,81 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     print(json.dumps(receipt))
 
 
+def test_review_lane_forces_sdlc_review_tracked_separately(tmp_path, monkeypatch):
+    """The review lane adds ``sdlc-review`` to the preload list (unchanged behaviour) but also
+    records it as ``forced_review_skill`` so ``_run_task_turns`` can treat it as soft (#t_3d8b302d:
+    a reviewer worker whose copy of the skill could not resolve exited 1 before any turn ran)."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from gateway.session_contract import Principal
+    from contextlib import closing
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HOME', str(tmp_path / 'home'))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path) if name == 'default' else str(tmp_path / name))
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    kb.create_board('owned')
+    with closing(connect(board='owned')) as conn:
+        task_id = kb.create_task(conn, title='Reviewed deliverable', assignee='default',
+            workspace_kind='dir', workspace_path=str(workspace), skills=['own-skill'])
+        kb.recompute_ready(conn)
+        implementer_run = kb.claim_task(conn, task_id)
+        kb.request_review(conn, task_id, summary='done', expected_run_id=implementer_run.current_run_id)
+        task = kb.claim_review_task(conn, task_id)
+        assert task is not None
+    actor = Principal('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
+    params = dict(board='owned', task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
+    from gateway.session_kanban import build_kanban_policy, REVIEW_FORCED_SKILL
+    config = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal', 'file']}}
+    policy, _secrets = build_kanban_policy(connection, params, config)
+    context = json.loads(policy.kanban_json)
+    assert context['skills'] == ['own-skill', REVIEW_FORCED_SKILL]
+    assert context['forced_review_skill'] == REVIEW_FORCED_SKILL
+
+
+def test_forced_review_skill_failure_is_fail_open_but_own_skill_failure_still_raises(monkeypatch):
+    """A reviewer whose task carries no skills of its own never hard-fails on a missing
+    ``sdlc-review`` (fail-open); a task with its OWN unresolvable skill still raises so a genuinely
+    broken preload is not silently swallowed."""
+    import agent.skill_commands as sc
+    from gateway import session_kanban
+
+    class _Agent:
+        session_id = 'sess-1'
+
+        def run_conversation(self, prompt, conversation_history=None):
+            return {'completed': True, 'final_response': prompt}
+
+    monkeypatch.setattr('agent.kanban_turn_recovery.recover_failed_kanban_turns', lambda *a, **kw: None)
+    frame = {'text': 'work kanban task t1'}
+
+    # Case 1: only the force-loaded review skill is missing -> no raise, turn still runs.
+    def fake_build_only_forced_missing(identifiers, task_id=None, excluded_loaded_names=None):
+        if identifiers == ['sdlc-review']:
+            return '', [], ['sdlc-review']
+        return '', [], []
+    monkeypatch.setattr(sc, 'build_preloaded_skills_prompt', fake_build_only_forced_missing)
+    context = {'skills': ['sdlc-review'], 'forced_review_skill': 'sdlc-review', 'context': '',
+               'task_id': 't1', 'goal_mode': False}
+    result = session_kanban._run_task_turns(_Agent(), frame, [], context)
+    assert result['completed'] is True
+
+    # Case 2: the task's OWN requested skill is unresolvable -> still a hard failure.
+    def fake_build_own_missing(identifiers, task_id=None, excluded_loaded_names=None):
+        if identifiers == ['own-skill']:
+            return '', [], ['own-skill']
+        return '', [], []
+    monkeypatch.setattr(sc, 'build_preloaded_skills_prompt', fake_build_own_missing)
+    context2 = {'skills': ['own-skill'], 'forced_review_skill': None, 'context': '',
+                'task_id': 't1', 'goal_mode': False}
+    with pytest.raises(ValueError, match='kanban_skills_unavailable'):
+        session_kanban._run_task_turns(_Agent(), frame, [], context2)
+
+
 def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
     from contextlib import closing
     from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
