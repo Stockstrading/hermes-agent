@@ -40,6 +40,7 @@ from hermes_cli.kanban_db_dispatch_review_contract import (
     _is_docs_only_review,
     _review_round_cap_for,
     filter_blocking_findings,
+    pr_meta_for_review_cap,
 )
 
 if TYPE_CHECKING:
@@ -1942,7 +1943,7 @@ def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str])
         "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
         f"AND r.outcome IN ({outcomes}) "
         "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
-        f"AND ({like}) ORDER BY r.ended_at",
+        f"AND ({like}) ORDER BY r.ended_at, r.id",
         params,
     ).fetchall()
     return [r for r in rows if _card_matches_pr(conn, r["task_id"], r["title"], r["body"], keys)]
@@ -1973,7 +1974,7 @@ def _review_quota_stalls(conn: sqlite3.Connection, profile: str, keys: set[str])
         "AND (r.outcome = 'scheduled' "
         "     OR (r.outcome IN ('rate_limited', 'blocked') AND t.block_kind = 'needs_input')) "
         "AND (r.ended_at - r.started_at) < ? AND r.started_at >= ? "
-        f"AND ({like}) ORDER BY r.ended_at",
+        f"AND ({like}) ORDER BY r.ended_at, r.id",
         params,
     ).fetchall()
     return [r for r in rows if _card_matches_pr(conn, r["task_id"], r["title"], r["body"], keys)]
@@ -2190,11 +2191,15 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
         # owner-tunable per PR via _REVIEW_ROUND_CAP_BY_PR, unchanged) or a QUOTA STALL
         # (a spawn that 429'd/was scheduled before producing a verdict -- fixed cap, no
         # owner overrides yet since nothing has needed one). The real-round base cap is
-        # per PR class (Rule 7, _review_round_cap_for); _REVIEW_ROUND_CAP_BY_PR overrides it.
+        # per PR class (Rule 7, _review_round_cap_for); _REVIEW_ROUND_CAP_BY_PR overrides it,
+        # and an overridden PR never pays for the pr_meta lookup.
         quota_runs = _review_quota_stalls(conn, assignee, keys)
-        cap = _REVIEW_ROUND_CAP_BY_PR.get(
-            str(pr).lower(), _review_round_cap_for(_TaskLike(id=task_id, title=row["title"], body=row["body"])),
-        )
+        cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower())
+        if cap is None:
+            cap = _review_round_cap_for(
+                _TaskLike(id=task_id, title=row["title"], body=row["body"]),
+                pr_meta_for_review_cap(conn, pr, assignee),
+            )
         if len(runs) >= cap:
             cap_kind, marker, count, relevant_runs = "real_rounds", _REVIEW_CAP_MARKER, len(runs), runs
         elif len(quota_runs) >= _QUOTA_STALL_CAP:

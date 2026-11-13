@@ -9,6 +9,7 @@ same convention the facade itself uses for ``kanban_db``.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -69,6 +70,31 @@ def _review_round_cap_for(task, pr_meta: Optional[dict] = None) -> int:
     if _is_capital_review(task):
         return REVIEW_ROUND_CAP_CAPITAL
     return REVIEW_ROUND_CAP_DEFAULT
+
+
+def pr_meta_for_review_cap(conn: sqlite3.Connection, pr: str, assignee: str) -> dict:
+    """Real ``{"files", "additions", "deletions"}`` for Rule 6's
+    ``_is_docs_only_review`` at the live ``_review_cost_gate`` call site (F2,
+    hermes-agent PR #5 gate-2): before this, no ``pr_meta`` was ever fetched
+    there, so ``_is_docs_only_review`` always saw ``files=[]`` and the
+    docs-only cap was unreachable in production. Resolves the published PR
+    URL the same way :func:`hermes_cli.kanban_db_dispatch._owner_escalation_summary`
+    already does, then one GraphQL round trip via ``kanban_pr_acceptance``.
+    Fails closed to ``{}`` (identical behaviour to before this was wired in)
+    whenever no PR has been published yet or the lookup fails for any
+    reason -- both classifiers already treat an empty file list as "never
+    docs-only/low-risk"."""
+    from hermes_cli import kanban_db_dispatch as _kbd
+    from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
+
+    pr_url = _kbd._pr_url_for_key(conn, pr)
+    if not pr_url:
+        return {}
+    try:
+        return _kb_pr_acceptance.fetch_pr_files(pr_url, pr_url, assignee=assignee) or {}
+    except Exception as exc:  # health: allow BLE001 -- classifier input must never stop the dispatcher
+        _kb._log.warning("pr file-list lookup skipped for %s: %s", pr, exc)
+        return {}
 
 
 _EVIDENCE_SCOPE_RE = re.compile(r"(?im)^\s*scope\s*:")
@@ -156,32 +182,50 @@ def _finding_is_addressed(finding: dict) -> bool:
     return bool(str(finding.get("test_ref") or "").strip())
 
 
+def _finding_key(finding: dict) -> str:
+    """Stable identity for a finding across review rounds: its explicit
+    ``id`` when the reviewer set one, else a deterministic fallback hash of
+    ``(file, line, severity, text)`` (F3, hermes-agent PR #5 gate-2) -- without
+    this, a round-2 finding with no ``id`` silently lost its frozen/blocking
+    status by round 3, because nothing requires a reviewer to set one."""
+    fid = str(finding.get("id") or "").strip()
+    if fid:
+        return fid
+    basis = "|".join(str(finding.get(k) or "") for k in ("file", "line", "severity", "text"))
+    return "fallback:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()
+
+
 def _frozen_finding_ids(verdict_runs: list) -> set[str]:
-    """IDs reported in round 1 and round 2 (the first two verdict runs) -- the
-    frozen list Rule 4 locks in after round 2."""
+    """Keys (see :func:`_finding_key`) reported in round 1 and round 2 (the
+    first two verdict runs) -- the frozen list Rule 4 locks in after round 2."""
     from hermes_cli.kanban_db_dispatch import _findings_from_metadata
 
     ids: set[str] = set()
     for run in verdict_runs[:_FREEZE_ROUND_CUTOFF]:
         for f in _findings_from_metadata(run["metadata"]):
-            fid = f.get("id")
-            if fid:
-                ids.add(str(fid))
+            ids.add(_finding_key(f))
     return ids
 
 
 def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[str]) -> bool:
     """Rule 4: for ``round_no`` > 2, a finding not already present in the
-    round-1/round-2 frozen list only counts (stays eligible to block THIS PR)
-    if its ``category`` is capital-safety, data-loss, or security. A
-    frozen-list finding (matched by id) is always eligible -- Rule 4 gates NEW
-    findings only. Missing/unknown category on a new finding fails closed
-    (never exempt)."""
+    round-1/round-2 frozen list (matched by :func:`_finding_key`, so a
+    finding missing an explicit ``id`` still freezes/unfreezes consistently
+    instead of silently losing its status -- F3) only counts (stays eligible
+    to block THIS PR) if its ``category`` is capital-safety, data-loss, or
+    security. A frozen-list finding is always eligible -- Rule 4 gates NEW
+    findings only. A ``category`` that is missing/blank fails closed (treated
+    as blocking, same convention as ``_is_docs_only_review``/
+    ``_is_low_risk_review``'s "unknown data is never safe") until a reviewer
+    explicitly classifies it as something else (F4)."""
     if round_no <= _FREEZE_ROUND_CUTOFF:
         return True
-    if str(finding.get("id") or "") in frozen_ids:
+    if _finding_key(finding) in frozen_ids:
         return True
-    category = str(finding.get("category") or "").strip().lower()
+    raw_category = finding.get("category")
+    if raw_category is None or not str(raw_category).strip():
+        return True  # unclassified: fail closed, stays blocking
+    category = str(raw_category).strip().lower()
     return category in _FREEZE_ALLOWED_CATEGORIES
 
 
