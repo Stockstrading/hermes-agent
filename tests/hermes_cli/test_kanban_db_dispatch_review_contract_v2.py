@@ -497,10 +497,10 @@ def test_finding_with_no_id_still_freezes_by_fallback_hash():
 
 
 def test_finding_identity_survives_line_drift_via_note_not_line():
-    """F3: the fallback hash basis is (file, severity, note) -- a legitimate
-    upstream edit that shifts the finding's line number must not change its
-    identity (unlike the old (file, line, severity, text) basis, which lost
-    the finding's frozen status whenever line drifted)."""
+    """F3: a legitimate upstream edit that shifts the finding's line number
+    must not change its identity (unlike the old (file, line, severity,
+    text) basis, which lost the finding's frozen status whenever line
+    drifted)."""
     verdict_runs = [
         {"metadata": kb._json_or_null({"findings": [
             {"file": "a.py", "line": 10, "severity": "MAJOR", "note": "sql injection"},
@@ -518,6 +518,30 @@ def test_finding_identity_survives_line_drift_via_note_not_line():
     ) is True
 
 
+def test_finding_identity_survives_note_rephrasing():
+    """F-identity (gate-2 round 5, same failure class as F3 but on ``note``
+    instead of ``line``): the fallback basis is ``(file, severity)`` only --
+    a reviewer rephrasing the same finding's free-text note across rounds
+    must not change its identity and silently drop its frozen/blocking
+    status, exactly like a line-number drift must not."""
+    verdict_runs = [
+        {"metadata": kb._json_or_null({"findings": [
+            {"file": "a.py", "line": 10, "severity": "MAJOR", "note": "SQL injection via raw string interpolation"},
+        ]})},
+        {"metadata": kb._json_or_null({"findings": []})},
+    ]
+    frozen = kbd_review_contract._frozen_finding_ids(verdict_runs)
+    assert len(frozen) == 1
+    reworded_round3 = {
+        "file": "a.py", "line": 10, "severity": "MAJOR",
+        "note": "user input reaches the query unsanitised -- classic injection",
+        "category": "style",
+    }
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        reworded_round3, round_no=3, frozen_ids=frozen,
+    ) is True
+
+
 def test_malformed_non_string_category_fails_closed():
     """F4: a malformed category (list/dict from an upstream schema slip) must
     fail closed exactly like a missing/blank category -- not silently fall
@@ -529,6 +553,30 @@ def test_malformed_non_string_category_fails_closed():
     finding_dict_category = {"id": "F8", "severity": "MAJOR", "category": {"name": "style"}}
     assert kbd_review_contract._finding_allowed_after_freeze(
         finding_dict_category, round_no=3, frozen_ids=set(),
+    ) is True
+
+
+def test_unrecognised_category_string_fails_closed():
+    """Category MAJOR (gate-2 round 5): a well-formed string that is neither
+    an exact critical category nor a known safe one -- typo, synonym, or
+    extra word -- must fail closed (stay blocking), never silently exempt
+    itself just because it does not exactly equal one of the three critical
+    names."""
+    typo = {"id": "F10", "severity": "MAJOR", "category": "capital-saftey"}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        typo, round_no=3, frozen_ids=set(),
+    ) is True
+    synonym = {"id": "F11", "severity": "MAJOR", "category": "capital safety"}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        synonym, round_no=3, frozen_ids=set(),
+    ) is True
+    extra_word = {"id": "F12", "severity": "MAJOR", "category": "security-related"}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        extra_word, round_no=3, frozen_ids=set(),
+    ) is True
+    unknown_but_well_formed = {"id": "F13", "severity": "MAJOR", "category": "performance"}
+    assert kbd_review_contract._finding_allowed_after_freeze(
+        unknown_but_well_formed, round_no=3, frozen_ids=set(),
     ) is True
 
 
@@ -577,6 +625,65 @@ def test_pr_url_for_key_never_trusts_contract_bound_to_a_different_pr(conn):
     resolved = kbd._pr_url_for_key(conn, pr_key)
 
     assert resolved is None
+
+
+def test_pr_url_for_key_never_trusts_a_different_owner_same_short_name_repo(conn):
+    """Owner MAJOR (gate-2 round 5): a contract that encodes the right
+    ``repo#n`` but under a DIFFERENT GitHub owner than the review card's own
+    body must never be trusted -- same short repo name across two orgs is
+    not the same PR. The card's own trustworthy anchor URL is used instead
+    (never degrades to None when the anchor itself names the right owner)."""
+    pr_key = "bff-api#9341"
+    other_task_id = kb.create_task(conn, title=f"dev work for {pr_key}", assignee="backend-dev")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/some-other-org/bff-api/pull/9341", other_task_id),
+    )
+    conn.commit()
+    card_text = "PR: https://github.com/Stockstrading/bff-api/pull/9341"
+
+    resolved = kbd._pr_url_for_key(conn, pr_key, fallback_text=card_text)
+
+    # the mismatched-owner contract is rejected; the card's own anchor URL wins instead
+    assert resolved == "https://github.com/Stockstrading/bff-api/pull/9341"
+
+
+def test_pr_url_for_key_without_anchor_has_no_owner_signal_to_check(conn):
+    """Same owner-mismatch setup, but with no review-card anchor text at all:
+    there is no owner signal to check against, so the pre-existing (no
+    owner-mismatch regression) behaviour holds -- the repo#n-matching
+    contract still resolves. Both production call sites always pass the
+    review card's own title+body as the anchor, so this path is a
+    documented edge case, not the exploit the owner check targets."""
+    pr_key = "bff-api#9341"
+    other_task_id = kb.create_task(conn, title=f"dev work for {pr_key}", assignee="backend-dev")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/some-other-org/bff-api/pull/9341", other_task_id),
+    )
+    conn.commit()
+
+    resolved = kbd._pr_url_for_key(conn, pr_key)
+
+    assert resolved == "https://github.com/some-other-org/bff-api/pull/9341"
+
+
+def test_pr_url_for_key_accepts_matching_owner_contract(conn):
+    """Sanity check: a contract whose owner matches the review card's own
+    anchor still resolves normally -- the owner check is not a blanket
+    rejection, only a mismatch is rejected."""
+    pr_key = "bff-api#9341"
+    other_task_id = kb.create_task(conn, title=f"dev work for {pr_key}", assignee="backend-dev")
+    conn.execute(
+        "UPDATE tasks SET completion_contract = ? WHERE id = ?",
+        ("https://github.com/Stockstrading/bff-api/pull/9341", other_task_id),
+    )
+    conn.commit()
+    card_text = "PR: https://github.com/Stockstrading/bff-api/pull/9341"
+
+    resolved = kbd._pr_url_for_key(conn, pr_key, fallback_text=card_text)
+
+    assert resolved == "https://github.com/Stockstrading/bff-api/pull/9341"
 
 
 def test_live_review_cost_gate_reaches_docs_only_cap_via_card_body_pr_url(conn, monkeypatch):

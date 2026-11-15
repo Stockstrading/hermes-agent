@@ -37,6 +37,7 @@ from hermes_cli.kanban_db_dispatch_review_contract import (
     _frozen_finding_ids,
     _handoff_has_evidence,
     _is_docs_only_review,
+    _owner_for_pr_key,
     _review_round_cap_for,
     filter_blocking_findings,
     pr_meta_for_review_cap,
@@ -1596,7 +1597,7 @@ _REVIEW_CAP_MARKER = "review round cap"
 # grace periods never bleed into each other.
 _QUOTA_STALL_CAP = 3
 _QUOTA_STALL_CAP_MARKER = "quota stall cap"
-_REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_REVIEW_PR_URL_RE = re.compile(r"github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
 _REVIEW_PR_TITLE_RE = re.compile(
     r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
 _CAPITAL_DENY_SUBSTRINGS = (
@@ -1619,11 +1620,11 @@ def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
     only counts via full PR URLs when the title names none (a body often cites
     other PRs in passing, which must not merge two PRs' round counts)."""
     t = _kb._lossy_text(title) or ""
-    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    keys = {f"{_norm_repo(r)}#{n}" for _o, r, n in _REVIEW_PR_URL_RE.findall(t)}
     keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
     if not keys:
         b = _kb._lossy_text(body) or ""
-        keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+        keys = {f"{_norm_repo(r)}#{n}" for _o, r, n in _REVIEW_PR_URL_RE.findall(b)}
     return keys
 
 
@@ -1708,8 +1709,16 @@ def _pr_url_for_key(
     never trusted (fail closed, same as no contract found) -- it would otherwise
     feed one PR's file list into another PR's docs-only/low-risk classification.
     None when nothing resolves -- CI status degrades to 'unknown' in the
-    escalation summary rather than blocking on it."""
+    escalation summary rather than blocking on it. ``fallback_text`` doubles as
+    the owner anchor (owner MAJOR, gate-2 round 5): a contract/body URL that
+    matches this ``repo#n`` but names a DIFFERENT GitHub owner than the one
+    ``fallback_text`` itself uses for this exact ``repo#n`` is never trusted
+    either -- a same-short-name repo under another owner must not pass as the
+    same PR. No anchor (fallback_text carries no URL for this ``repo#n``)
+    means no owner check is possible, same as before this fix."""
     num = pr_key.rsplit("#", 1)[1]
+    anchor_text = _kb._lossy_text(fallback_text) or "" if fallback_text else ""
+    expected_owner = _owner_for_pr_key(anchor_text, pr_key) if anchor_text else None
     rows = conn.execute(
         "SELECT title, body, completion_contract FROM tasks "
         "WHERE title LIKE ? OR body LIKE ? OR title LIKE ? OR body LIKE ?",
@@ -1722,13 +1731,14 @@ def _pr_url_for_key(
         if not contract or not _PR_URL_FULL_RE.fullmatch(str(contract)):
             continue
         m = _REVIEW_PR_URL_RE.search(str(contract))
-        if not m or f"{_norm_repo(m.group(1))}#{m.group(2)}" != pr_key:
+        if not m or f"{_norm_repo(m.group(2))}#{m.group(3)}" != pr_key:
             continue  # contract encodes a different PR -- fail closed, keep looking
+        if expected_owner is not None and m.group(1).strip().lower() != expected_owner:
+            continue  # same repo#n, different GitHub owner -- fail closed, keep looking
         return contract
-    if fallback_text:
-        text = _kb._lossy_text(fallback_text) or ""
-        for m in _REVIEW_PR_URL_RE.finditer(text):
-            if f"{_norm_repo(m.group(1))}#{m.group(2)}" == pr_key:
+    if anchor_text:
+        for m in _REVIEW_PR_URL_RE.finditer(anchor_text):
+            if f"{_norm_repo(m.group(2))}#{m.group(3)}" == pr_key:
                 return "https://" + m.group(0)
     return None
 
@@ -1761,11 +1771,16 @@ def _open_findings_from_runs(verdict_runs: list) -> list:
 def _owner_escalation_summary(
     conn: sqlite3.Connection, assignee: str, pr: str,
     cap_kind: str, cap: int, count: int, verdict_runs: list,
+    card_text: Optional[str] = None,
 ) -> str:
     """Rule 5: exactly 3 lines for the owner -- (1) open findings after the
     Rule 4 freeze, (2) head SHA + CI status (best-effort), (3) the three named
     options (merge / waive gate / close). Never raises -- a PR/CI lookup
-    failure degrades fields to 'unknown', it never blocks the escalation."""
+    failure degrades fields to 'unknown', it never blocks the escalation.
+    ``card_text`` (this review card's own title+body) is the owner anchor
+    passed through to :func:`_pr_url_for_key` so a same-short-name,
+    different-owner repo can't resolve a head SHA/CI status for the wrong
+    PR."""
     findings = _open_findings_from_runs(verdict_runs)
     findings_txt = (
         "; ".join(f"[{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')}" for f in findings)
@@ -1773,7 +1788,7 @@ def _owner_escalation_summary(
     )
     head_sha = "unknown"
     ci_txt = "unknown"
-    pr_url = _pr_url_for_key(conn, pr)
+    pr_url = _pr_url_for_key(conn, pr, fallback_text=card_text)
     if pr_url:
         try:
             from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
@@ -1905,7 +1920,10 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
         if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in relevant_runs):
             return None  # owner unblocked after this cap: exactly one more round
         if not dry_run:
-            summary = _owner_escalation_summary(conn, assignee, pr, cap_kind, cap, count, runs)
+            summary = _owner_escalation_summary(
+                conn, assignee, pr, cap_kind, cap, count, runs,
+                card_text=f"{row['title'] or ''}\n{row['body'] or ''}",
+            )
             _block_review_for_owner(conn, task_id, row["status"], summary)
         return "review_round_cap"
     except Exception as exc:  # pragma: no cover - cost gate must never stop the dispatcher
