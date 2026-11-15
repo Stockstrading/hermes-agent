@@ -665,6 +665,98 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_schedule_task_sets_resume_at(kanban_home):
+    """``schedule_task``'s ``resume_at`` kwarg (the quota/429 backoff path)
+    is persisted on the row; omitting it keeps the legacy NULL/park-forever
+    behaviour."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="quota wait", assignee="a")
+        wake = int(time.time()) + 900
+        assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=later", resume_at=wake)
+        task = kb.get_task(conn, tid)
+        assert task.status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (tid,),
+        ).fetchone()[0] == wake
+
+        tid2 = kb.create_task(conn, title="human park", assignee="a")
+        assert kb.schedule_task(conn, tid2, reason="waiting on a human")
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (tid2,),
+        ).fetchone()[0] is None
+
+
+def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home):
+    """A ``resume_at`` in the past is promoted to ``ready`` (and cleared);
+    one still in the future is left ``scheduled``, untouched."""
+    now = int(time.time())
+    with kbc.connect() as conn:
+        due = kb.create_task(conn, title="due", assignee="a")
+        assert kb.schedule_task(conn, due, resume_at=now - 10)
+        not_due = kb.create_task(conn, title="not due", assignee="a")
+        assert kb.schedule_task(conn, not_due, resume_at=now + 3600)
+        parked = kb.create_task(conn, title="parked forever", assignee="a")
+        assert kb.schedule_task(conn, parked, reason="human will unblock")
+
+        promoted = kb.recompute_scheduled(conn)
+        assert promoted == 1
+
+        due_task = kb.get_task(conn, due)
+        assert due_task.status == "ready"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (due,),
+        ).fetchone()[0] is None
+
+        assert kb.get_task(conn, not_due).status == "scheduled"
+        assert kb.get_task(conn, parked).status == "scheduled"
+
+        # Idempotent: nothing left to promote on a second sweep.
+        assert kb.recompute_scheduled(conn) == 0
+
+
+def test_recompute_scheduled_restores_review_for_reviewer_quota_park(kanban_home):
+    """CRITICAL regression: a reviewer run scheduled mid-review (quota/429
+    wait-until timer) must resume to ``review``, not ``ready`` — else
+    ``request_changes`` rejects the resumed run with 'active run was not
+    claimed from review' and the review can never return to the
+    implementer through the normal protocol."""
+    now = int(time.time())
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reviewed", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="done", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        review_run = kb.claim_review_task(conn, tid)
+        assert review_run is not None
+        assert kb.get_task(conn, tid).status == "running"
+
+        # Reviewer hits a model quota wall mid-review and is parked with a
+        # timer instead of being blocked.
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=now - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+        # Timer fires: must land back on 'review', not 'ready'.
+        assert kb.recompute_scheduled(conn) == 1
+        resumed = kb.get_task(conn, tid)
+        assert resumed.status == "review"
+
+        # Re-claim exactly as a reviewer worker would, then verify the
+        # protocol lets the verdict flow back to the implementer.
+        reclaimed = kb.claim_review_task(conn, tid)
+        assert reclaimed is not None
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="found issues",
+            expected_run_id=reclaimed.current_run_id,
+        )
+        assert ok is True
+        assert implementer == "builder"
+
 
 
 # ---------------------------------------------------------------------------

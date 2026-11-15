@@ -256,3 +256,182 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+# ---------------------------------------------------------------------------
+# list_triage_ids must not resurrect block_loop_detected escalations
+# ---------------------------------------------------------------------------
+
+
+def _running_task(conn, title="t"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    return tid
+
+
+def test_list_triage_ids_excludes_block_loop_detected(kanban_home):
+    """A triage card whose latest event is block_loop_detected is a human-gated
+    escalation; the auto-decompose sweep must not pick it back up (that is
+    exactly the storm this fix stops)."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid not in decomp.list_triage_ids()
+
+
+def test_list_triage_ids_includes_fresh_triage_card(kanban_home):
+    """A plain one-liner idea card in triage (no block_loop_detected event at
+    all) must still be picked up — only the escalation kind is excluded."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="idea", triage=True)
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid in decomp.list_triage_ids()
+
+
+def test_list_triage_ids_includes_card_re_escalated_for_unrelated_reason(kanban_home):
+    """The exclusion is on the MOST RECENT event only. A card that hit
+    block_loop_detected and later gets a fresh, unrelated, newer event while
+    still in triage must be included again -- this is not a blanket
+    NOT EXISTS over all history."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert tid not in decomp.list_triage_ids()
+
+        # A newer, unrelated event lands on the still-triage card (e.g. a
+        # human comment/reopen) -- the latest event is no longer
+        # block_loop_detected, so the sweep must see it again.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "reopened_for_fresh_idea", {"reason": "unrelated"})
+
+    assert tid in decomp.list_triage_ids()
+# Rule 6 routing guard (ADR t_f526b652): log-only, assignee is NOT rewritten
+# in this phase.
+# ---------------------------------------------------------------------------
+
+def test_implement_card_routed_to_release_reviewer_gets_log_only_audit_comment(kanban_home):
+    """An 'implement feature X' card the LLM routes to release-reviewer gets a
+    log-only audit comment; the assignee is left exactly as the LLM picked it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="implement feature X", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Implement feature X end to end",
+        "body": "Add the new endpoint and wire it up.",
+        "assignee": "release-reviewer",
+    })
+
+    patches = _patch_list_profiles(["backend-dev", "release-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {"default_assignee": "backend-dev"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task is not None
+    # Assignee is untouched in this phase — it was empty, the LLM's pick is honoured as-is.
+    assert task.assignee == "release-reviewer"
+    bodies = [c.body for c in comments]
+    assert any("routing-guard mismatch" in b and "release-reviewer" in b for b in bodies)
+
+
+def test_review_pr_card_routed_to_backend_dev_gets_symmetric_audit_comment(kanban_home):
+    """A 'Review PR #50' card the LLM routes to backend-dev gets the symmetric
+    audit comment (review request landed on a dev profile)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Review PR #50", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Review PR #50",
+        "body": "Review https://github.com/org/repo/pull/50 for correctness.",
+        "assignee": "backend-dev",
+    })
+
+    patches = _patch_list_profiles(["backend-dev", "release-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {"default_assignee": "backend-dev"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task is not None
+    assert task.assignee == "backend-dev"
+    bodies = [c.body for c in comments]
+    assert any("routing-guard mismatch" in b and "backend-dev" in b for b in bodies)
+
+
+def test_design_note_card_for_platform_architect_untouched_no_comment(kanban_home):
+    """A genuine 'Design note:' card routed to platform-architect (neither a dev
+    nor a review-only profile) is untouched — no guard comment."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="Design note: routing guard", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Design note: routing guard",
+        "body": "Write the ADR for the routing guard.",
+        "assignee": "platform-architect",
+    })
+
+    patches = _patch_list_profiles(["platform-architect", "backend-dev", "release-reviewer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {"default_assignee": "backend-dev"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        comments = kb.list_comments(conn, tid)
+    assert task is not None
+    assert task.assignee == "platform-architect"
+    bodies = [c.body for c in comments]
+    assert not any("routing-guard mismatch" in b for b in bodies)
+
+

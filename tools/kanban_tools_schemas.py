@@ -118,7 +118,11 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Free-form dict of structured facts about this "
                 "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
+                "workers alongside ``summary``. A reviewer approving a PR "
+                "out of the review column should include a "
+                "``head_sha`` key (the 40-char PR head commit SHA) here — "
+                "the dispatcher uses it to skip a redundant re-review when "
+                "a later tick sees the same head SHA and no new findings."
         )),
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "
@@ -290,6 +294,17 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Optional structured facts about this verdict. Include a "
+                "``head_sha`` key (the 40-char PR head commit SHA you "
+                "reviewed) so the dispatcher can skip a redundant "
+                "re-review on a later tick when the head SHA hasn't moved "
+                "and no new findings exist."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )
