@@ -455,6 +455,25 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
             event.kind == "scheduled" and event.payload == {"reason": reason}
             for event in kb.list_events(conn, worker_env)
         )
+        # The marker is a real wake-up timer, not just a human-readable note.
+        import calendar
+        expected_epoch = calendar.timegm((2026, 9, 13, 0, 0, 0))
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] == expected_epoch
+
+
+def test_schedule_without_scheduled_until_marker_leaves_resume_at_null(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    json.loads(entry.handler({"reason": "waiting on a human to unblock"}))
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
