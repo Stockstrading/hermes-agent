@@ -27,6 +27,26 @@ REVIEW_ROUND_CAP_CAPITAL = 2    # _CAPITAL_REPOS / [CAPITAL] marker: round 2 una
 REVIEW_ROUND_CAP_DOCS_ONLY = 1  # Rule 6 (_is_docs_only_review): one gate, one round
 
 
+def _norm_owner(name: str) -> str:
+    return (name or "").strip().lower()
+
+
+def _owner_for_pr_key(text: str, pr_key: str) -> Optional[str]:
+    """First GitHub owner in free ``text`` whose ``owner/repo/pull/n`` matches
+    ``pr_key`` (``repo#n``) exactly -- the local anchor used by
+    :func:`hermes_cli.kanban_db_dispatch._pr_url_for_key` to catch a
+    same-short-name, different-owner repo that would otherwise still satisfy
+    the bare ``repo#n`` comparison (owner MAJOR, hermes-agent PR #5 gate-2
+    round 5). Returns None when no URL in ``text`` names this exact
+    ``repo#n`` -- there is nothing to anchor on, not a confirmed match."""
+    from hermes_cli.kanban_db_dispatch import _norm_repo, _REVIEW_PR_OWNER_URL_RE
+
+    for m in _REVIEW_PR_OWNER_URL_RE.finditer(text or ""):
+        if f"{_norm_repo(m.group(2))}#{m.group(3)}" == pr_key:
+            return _norm_owner(m.group(1))
+    return None
+
+
 @dataclass
 class _TaskLike:
     """Minimal (id, title, body) shim so dispatch-time code holding only a raw
@@ -175,6 +195,20 @@ def _handoff_has_evidence(conn: sqlite3.Connection, task_id: str) -> tuple[bool,
 # safety-critical -- everything else is a follow-up.
 _FREEZE_ROUND_CUTOFF = 2
 _FREEZE_ALLOWED_CATEGORIES = {"capital-safety", "data-loss", "security"}
+# Rule 4's own category vocabulary: the ONLY non-critical category this gate
+# has ever seen a reviewer actually emit (every test fixture + real verdict
+# payload to date uses "style" for a non-safety finding). This is
+# deliberately a closed allowlist, not an open "everything else is safe"
+# default (F-category MAJOR, gate-2 round 5): a well-formed string that is
+# neither an exact critical category nor a recognised safe one -- a typo
+# ("capital-saftey"), a synonym ("capital safety"), or an extra word
+# ("security-related") -- must fail closed (stay blocking) exactly like a
+# missing/malformed category, never silently exempt itself by falling
+# through the "not in _FREEZE_ALLOWED_CATEGORIES" branch. Extending this set
+# is an owner-reviewed change, not something a reviewer's free-text field
+# should be able to do by accident.
+_FREEZE_KNOWN_SAFE_CATEGORIES = {"style"}
+_FREEZE_KNOWN_CATEGORIES = _FREEZE_ALLOWED_CATEGORIES | _FREEZE_KNOWN_SAFE_CATEGORIES
 
 
 def _finding_is_addressed(finding: dict) -> bool:
@@ -190,17 +224,25 @@ def _finding_is_addressed(finding: dict) -> bool:
 def _finding_key(finding: dict) -> str:
     """Stable identity for a finding across review rounds: its explicit
     ``id`` when the reviewer set one, else a deterministic fallback hash of
-    ``(file, severity, note)`` (F3, hermes-agent PR #5 gate-2 round 2). The
-    findings schema actually used throughout this pipeline is ``id, severity,
-    file, line, status, category, found_by, note`` -- there is no ``text``
-    field, so hashing it always contributed an empty string. ``line`` is
-    deliberately excluded from the basis too: a legitimate upstream edit that
-    shifts a line number must not change an id-less finding's identity and
-    silently drop its frozen/blocking status by round 3."""
+    ``(file, severity)`` (F-identity, hermes-agent PR #5 gate-2 round 5,
+    continuing F3). The findings schema actually used throughout this
+    pipeline is ``id, severity, file, line, status, category, found_by,
+    note`` -- every field besides ``file``/``severity`` is excluded from the
+    fallback basis on purpose: ``line`` legitimately shifts on an upstream
+    edit (F3), ``status``/``category`` legitimately change as a finding is
+    triaged or addressed, ``found_by`` can differ between reviewer tools on
+    the same finding, and free-text ``note``/``text`` is never stable across
+    rounds -- a reviewer rephrasing the same finding, or two distinct
+    findings sharing a generic note, must not change or collide its identity
+    (the same failure class F3 fixed for ``line``, now closed for every
+    other unstable/free-text field too). An id-less finding's identity is
+    therefore coarser (same file + severity collide) -- reviewers that need
+    to distinguish two no-id findings in one file at the same severity must
+    set an explicit ``id``."""
     fid = str(finding.get("id") or "").strip()
     if fid:
         return fid
-    basis = "|".join(str(finding.get(k) or "") for k in ("file", "severity", "note"))
+    basis = "|".join(str(finding.get(k) or "") for k in ("file", "severity"))
     return "fallback:" + hashlib.sha1(basis.encode("utf-8")).hexdigest()
 
 
@@ -223,11 +265,14 @@ def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[
     instead of silently losing its status -- F3) only counts (stays eligible
     to block THIS PR) if its ``category`` is capital-safety, data-loss, or
     security. A frozen-list finding is always eligible -- Rule 4 gates NEW
-    findings only. A ``category`` that is missing/blank, OR not a string at
-    all (e.g. a list/dict from an upstream schema slip), fails closed (treated
-    as blocking, same convention as ``_is_docs_only_review``/
-    ``_is_low_risk_review``'s "unknown data is never safe") until a reviewer
-    explicitly classifies it as a recognised string category (F4)."""
+    findings only. A ``category`` that is missing/blank, not a string at all
+    (e.g. a list/dict from an upstream schema slip), OR a well-formed string
+    that is not one of ``_FREEZE_KNOWN_CATEGORIES`` (a typo, synonym, or
+    extra word never exactly matches but must not silently exempt the
+    finding either) fails closed (treated as blocking, same convention as
+    ``_is_docs_only_review``/``_is_low_risk_review``'s "unknown data is never
+    safe") until a reviewer explicitly classifies it as a recognised string
+    category (F4/F-category)."""
     if round_no <= _FREEZE_ROUND_CUTOFF:
         return True
     if _finding_key(finding) in frozen_ids:
@@ -236,6 +281,8 @@ def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[
     if raw_category is None or not isinstance(raw_category, str) or not raw_category.strip():
         return True  # unclassified or malformed (non-string): fail closed, stays blocking
     category = raw_category.strip().lower()
+    if category not in _FREEZE_KNOWN_CATEGORIES:
+        return True  # unrecognised string (typo/synonym/extra word): fail closed, stays blocking
     return category in _FREEZE_ALLOWED_CATEGORIES
 
 
