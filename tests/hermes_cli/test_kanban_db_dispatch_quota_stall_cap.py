@@ -48,11 +48,16 @@ def _insert_run(conn, task_id, profile, *, outcome, started_at=None, ended_at=No
     else:
         started_at = now - 600 if started_at is None else started_at
         ended_at = now - 400 if ended_at is None else ended_at  # >= _REVIEW_MIN_RUN_SECONDS
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome) "
         "VALUES (?, ?, 'done', ?, ?, ?)",
         (task_id, profile, started_at, ended_at, outcome),
     )
+    if outcome == "completed":
+        # MAJOR #4: _review_verdict_runs only counts a run claimed via
+        # claim_review_task (source_status=review on 'claimed') -- mirror
+        # that here so a "real round" stays realistic.
+        kb._append_event(conn, task_id, "claimed", {"source_status": "review"}, run_id=cur.lastrowid)
     conn.commit()
 
 

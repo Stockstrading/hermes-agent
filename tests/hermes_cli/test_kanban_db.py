@@ -714,6 +714,49 @@ def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home
         assert kb.recompute_scheduled(conn) == 0
 
 
+def test_recompute_scheduled_restores_review_for_reviewer_quota_park(kanban_home):
+    """CRITICAL regression: a reviewer run scheduled mid-review (quota/429
+    wait-until timer) must resume to ``review``, not ``ready`` — else
+    ``request_changes`` rejects the resumed run with 'active run was not
+    claimed from review' and the review can never return to the
+    implementer through the normal protocol."""
+    now = int(time.time())
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reviewed", assignee="builder")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn, tid, summary="done", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        review_run = kb.claim_review_task(conn, tid)
+        assert review_run is not None
+        assert kb.get_task(conn, tid).status == "running"
+
+        # Reviewer hits a model quota wall mid-review and is parked with a
+        # timer instead of being blocked.
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=now - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+        # Timer fires: must land back on 'review', not 'ready'.
+        assert kb.recompute_scheduled(conn) == 1
+        resumed = kb.get_task(conn, tid)
+        assert resumed.status == "review"
+
+        # Re-claim exactly as a reviewer worker would, then verify the
+        # protocol lets the verdict flow back to the implementer.
+        reclaimed = kb.claim_review_task(conn, tid)
+        assert reclaimed is not None
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="found issues",
+            expected_run_id=reclaimed.current_run_id,
+        )
+        assert ok is True
+        assert implementer == "builder"
+
 
 
 # ---------------------------------------------------------------------------

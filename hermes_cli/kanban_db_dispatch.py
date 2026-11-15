@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -1611,15 +1612,45 @@ def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
 
 def _is_capital_review(task) -> bool:
     title = _kb._lossy_text(getattr(task, "title", "")) or ""
-    body = (_kb._lossy_text(getattr(task, "body", "")) or "")[:4000]
-    if _CAPITAL_MARKER_RE.search(title) or _CAPITAL_MARKER_RE.search(body):
+    body = _kb._lossy_text(getattr(task, "body", "")) or ""
+    text = f"{title}\n{body}"
+    if _CAPITAL_MARKER_RE.search(text):
         return True
     repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
-    return any(r in _CAPITAL_REPOS for r in repos)
+    if any(r in _CAPITAL_REPOS for r in repos):
+        return True
+    # Independent ground-truth fallback (MAJOR #2): ``_card_pr_keys``' regex
+    # only finds a repo token sitting immediately before "#N"/"PR #N", so a
+    # card phrasing the repo AFTER the PR number (or past the old 4000-char
+    # scan window) made the primary extractor return no keys and this
+    # function silently say "not capital". Scan the FULL text (no
+    # truncation) for a bare capital-repo token anywhere -- a capital repo
+    # name appearing at all is enough to fail closed, independent of where
+    # it sits relative to the PR number.
+    lowered = text.lower()
+    return any(
+        re.search(rf"\b{re.escape(repo)}\b", lowered) for repo in _CAPITAL_REPOS
+    )
+
+
+def _run_claimed_from_review(conn: sqlite3.Connection, task_id: str, run_id: int) -> bool:
+    """True when ``run_id`` was claimed via :func:`_kb.claim_review_task`
+    (its ``claimed`` event carries ``source_status: review``). Used to keep
+    verdict accounting to runs that actually went through the review lane
+    (MAJOR #4)."""
+    event = _kb._latest_event(conn, task_id, "claimed", run_id)
+    payload = _kb._json_dict(_kb._row_get(event, "payload"))
+    return payload.get("source_status") == "review"
 
 
 def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
     """Real verdict runs by ``profile`` on any card about the same PR, oldest first.
+
+    Only ``completed``/``changes_requested`` outcomes from a run actually
+    claimed via ``claim_review_task`` count as a "real round" against
+    ``_REVIEW_ROUND_CAP`` (MAJOR #4): ``review_requested`` is a handoff, not
+    a verdict, and ``blocked`` can be an unrelated operational block --
+    either previously consumed a capped slot before an actual review ran.
 
     Returns full rows (including ``metadata``) so callers can read the structured
     findings a prior round stored there (Rule 3 delta review)."""
@@ -1631,15 +1662,16 @@ def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str])
     for n in nums:
         params += [f"%#{n}%", f"%/pull/{n}%"]
     rows = conn.execute(
-        "SELECT r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
+        "SELECT r.id, r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
-        "AND r.outcome IN ('completed', 'changes_requested', 'blocked', 'review_requested') "
+        "AND r.outcome IN ('completed', 'changes_requested') "
         "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
         f"AND ({like}) ORDER BY r.ended_at",
         params,
     ).fetchall()
-    return [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
+    matched = [r for r in rows if _card_pr_keys(r["title"], r["body"]) & keys]
+    return [r for r in matched if _run_claimed_from_review(conn, r["task_id"], r["id"])]
 
 
 def _review_quota_stalls(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
@@ -1916,6 +1948,48 @@ _LOW_RISK_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 _SMALL_PR_LINES = 30  # reuse release-reviewer SOUL.md's existing small_pr threshold
+
+
+def _fetch_pr_files_meta(pr_url: str, timeout: int = 20) -> Optional[dict]:
+    """``gh pr view <url> --json files,additions,deletions`` ->
+    ``{"files": [...], "additions": N, "deletions": N}``, or None on any
+    failure (unreachable gh, network, bad URL) -- fail closed, the caller
+    treats None exactly like an unknown file list."""
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "files,additions,deletions"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        data = json.loads(result.stdout or "{}")
+        files = [f.get("path") for f in (data.get("files") or []) if f.get("path")]
+        return {
+            "files": files,
+            "additions": int(data.get("additions") or 0),
+            "deletions": int(data.get("deletions") or 0),
+        }
+    except Exception:
+        return None
+
+
+def _resolve_pr_meta_for_task(conn: sqlite3.Connection, task) -> dict:
+    """Real PR file/addition/deletion metadata for a review card's PR
+    (MAJOR #3): resolves the PR's own published URL via
+    :func:`_pr_url_for_key` -- ground truth from the PR's own identity, not
+    the card text -- then fetches its live diff shape. Empty dict (never
+    None) on any failure; ``_is_low_risk_review`` already fails closed on
+    an empty file list, so Rule 5 never fires without real metadata."""
+    keys = _card_pr_keys(getattr(task, "title", ""), getattr(task, "body", ""))
+    for key in keys:
+        url = _pr_url_for_key(conn, key)
+        if not url:
+            continue
+        meta = _fetch_pr_files_meta(url)
+        if meta is not None:
+            return meta
+    return {}
 
 
 def _is_low_risk_review(task, pr_meta: dict) -> bool:
@@ -2834,7 +2908,14 @@ def _dispatch_lane_task(
         # required gate model is confirmed unavailable, may run on a fallback model.
         # Capital-sensitive PRs never fall back (_is_low_risk_review enforces it).
         if not claimed.model_override:
-            fallback = _maybe_review_fallback_model(conn, claimed, assignee)
+            # Only worth the gh round-trip for the profiles Rule 5 can ever
+            # apply to -- _maybe_review_fallback_model would reject any
+            # other assignee on this same check anyway.
+            pr_meta = (
+                _resolve_pr_meta_for_task(conn, claimed)
+                if assignee in _REVIEW_GATE_PROFILES else {}
+            )
+            fallback = _maybe_review_fallback_model(conn, claimed, assignee, pr_meta)
             if fallback is not None:
                 claimed.model_override, claimed.provider_override = fallback
     try:

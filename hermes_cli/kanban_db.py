@@ -2042,7 +2042,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -3607,11 +3607,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
+        # ``_resume_status_from_events`` now scans 'scheduled' events too (a
+        # reviewer parked mid-review carries ``source_status: review`` on its
+        # scheduled event), so the same lookup covers both source statuses.
+        resume_status = _resume_status_from_events(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
@@ -3934,19 +3933,29 @@ def schedule_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params.append(int(expected_run_id))
+        # Capture which lane this run was claimed from BEFORE ending it, so a
+        # reviewer scheduled mid-review (quota wall) resumes to 'review', not
+        # 'ready' — mirrors _resume_status_from_events's use by unblock_task.
+        source_status = _retry_status_for_run(conn, task_id)
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        event_payload: dict[str, Any] = {"reason": reason}
+        if source_status == "review":
+            event_payload["source_status"] = "review"
+        _append_event(conn, task_id, "scheduled", event_payload, run_id=run_id)
         return True
 
 
 def recompute_scheduled(conn: sqlite3.Connection) -> int:
     """Promote ``scheduled`` tasks whose ``resume_at`` timer has arrived back
-    to ``ready``; returns the count. Sibling of :func:`recompute_ready`,
-    opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+    to their resumable phase (``review`` when that is where it left off,
+    else ``ready`` — mirrors ``unblock_task``'s use of
+    :func:`_resume_status_from_events`); returns the count. Sibling of
+    :func:`recompute_ready`, opens its own IMMEDIATE txn — call OUTSIDE any
+    write txn.
 
     A ``scheduled`` row with no ``resume_at`` (the legacy / human-driven
     path) is left alone forever, exactly as before this timer existed —
@@ -3961,12 +3970,22 @@ def recompute_scheduled(conn: sqlite3.Connection) -> int:
         ).fetchall()
         for row in rows:
             task_id = row["id"]
+            resume_status = _resume_status_from_events(conn, task_id)
+            landing_status = _landing_status_after_parents(conn, task_id)
+            new_status = (
+                "review"
+                if landing_status == "ready" and resume_status == "review"
+                else landing_status
+            )
             if conn.execute(
-                "UPDATE tasks SET status = 'ready', resume_at = NULL "
-                "WHERE id = ? AND status = 'scheduled'", (task_id,),
+                "UPDATE tasks SET status = ?, resume_at = NULL "
+                "WHERE id = ? AND status = 'scheduled'", (new_status, task_id),
             ).rowcount != 1:
                 continue
-            _append_event(conn, task_id, "promoted", {"status": "ready", "reason": "resume_at_due"})
+            _append_event(
+                conn, task_id, "promoted",
+                {"status": new_status, "reason": "resume_at_due"},
+            )
             promoted += 1
     return promoted
 

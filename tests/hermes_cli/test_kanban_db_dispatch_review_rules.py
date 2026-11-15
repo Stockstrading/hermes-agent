@@ -46,11 +46,15 @@ def _insert_verdict_run(conn, task_id, profile, *, outcome="completed",
     now = int(time.time())
     started_at = now - 600 if started_at is None else started_at
     ended_at = now - 400 if ended_at is None else ended_at
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, metadata) "
         "VALUES (?, ?, 'done', ?, ?, ?, ?)",
         (task_id, profile, started_at, ended_at, outcome, kb._json_or_null(metadata) if metadata else None),
     )
+    # MAJOR #4 regression guard: _review_verdict_runs now only counts a run
+    # claimed via claim_review_task (source_status=review on its 'claimed'
+    # event) -- mirror that here so these synthetic rows stay realistic.
+    kb._append_event(conn, task_id, "claimed", {"source_status": "review"}, run_id=cur.lastrowid)
     conn.commit()
 
 
@@ -228,6 +232,117 @@ def test_gate_only_slow_not_confirmed_unavailable_never_falls_back(conn, monkeyp
         pr_meta={"files": ["docs/readme.md"], "additions": 1, "deletions": 1},
     )
     assert fallback is None
+
+
+# --- MAJOR #2: capital detection must not depend on repo-before-#N phrasing ---
+
+def test_capital_repo_named_after_pr_number_is_still_capital():
+    """A card phrasing the repo AFTER the PR number (so ``_card_pr_keys``'
+    repo-before-#N regex extracts nothing) must still be detected as
+    capital -- the independent full-text scan is the ground-truth
+    fallback (MAJOR #2)."""
+    task = _docs_task(title="Fix release-gate findings on PR #276 (strategy-api)")
+    assert kbd._is_capital_review(task) is True
+
+
+def test_capital_marker_past_old_4000_char_truncation_window_is_still_capital():
+    """The old body scan truncated to 4000 chars before looking for a
+    capital marker/repo; a marker placed after that window must still be
+    caught (MAJOR #2)."""
+    task = _docs_task(title="review bff-api#141")
+    task.body = ("padding " * 1000) + "touches strategy-api order sizing"
+    assert kbd._is_capital_review(task) is True
+
+
+def test_non_capital_text_stays_non_capital():
+    task = _docs_task(title="review bff-api#141")
+    task.body = "docs-only readme update, no behaviour change"
+    assert kbd._is_capital_review(task) is False
+
+
+# --- MAJOR #3: real PR metadata must reach _is_low_risk_review in production --
+
+def test_dispatch_lane_task_wires_real_pr_meta_into_fallback_classification(conn, monkeypatch, all_assignees_spawnable):
+    """End-to-end through ``dispatch_once``: the dispatcher must resolve the
+    PR's own file/addition/deletion metadata (never an empty/implicit
+    ``pr_meta={}``) and let a genuinely low-risk PR's fallback model reach
+    ``spawn_fn`` when the required gate is confirmed unavailable."""
+    task_id = kb.create_task(
+        conn, title="review bff-api#141", assignee="builder",
+        completion_contract="https://github.com/Stockstrading/bff-api/pull/141",
+    )
+    claimed = kb.claim_task(conn, task_id)
+    assert kb.request_review(
+        conn, task_id, summary="done", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    # Cooldown=0 ("next tick, for tests"): the SAME rate_limited run both
+    # confirms the required gate is unavailable (_required_gate_unavailable,
+    # which keys off the task's MOST-RECENTLY-ENDED run) AND would otherwise
+    # trip check_respawn_guard's rate_limit_cooldown. ended_at must be
+    # strictly after request_review()'s own auto-closed 'review_requested'
+    # run (ended a moment earlier, same test) or that run -- not this one --
+    # would be "latest" and the gate would look available.
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) "
+        "VALUES (?, 'reviewer', 'done', ?, ?, 'rate_limited', '429 quota exceeded')",
+        (task_id, int(time.time()) - 60, int(time.time()) + 1),
+    )
+    conn.commit()
+    monkeypatch.setattr(kbd, "_review_fallback_model", lambda: ("claude-haiku-5", "anthropic"))
+    monkeypatch.setattr(kbd, "_pr_url_for_key", lambda c, pr: "https://github.com/Stockstrading/bff-api/pull/141")
+    monkeypatch.setattr(
+        kbd, "_fetch_pr_files_meta",
+        lambda url, timeout=20: {"files": ["docs/readme.md"], "additions": 4, "deletions": 6},
+    )
+
+    spawned = []
+
+    def _fake_spawn(claimed, workspace, board):
+        spawned.append((claimed.model_override, claimed.provider_override))
+        return 12345
+
+    kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert spawned == [("claude-haiku-5", "anthropic")]
+
+
+def test_dispatch_lane_task_never_falls_back_without_real_file_metadata(conn, monkeypatch, all_assignees_spawnable):
+    """When the PR's real metadata cannot be resolved, ``pr_meta`` stays
+    empty and Rule 5 fails closed -- never silently \"low risk\" (MAJOR #3)."""
+    task_id = kb.create_task(
+        conn, title="review bff-api#142", assignee="builder",
+        completion_contract="https://github.com/Stockstrading/bff-api/pull/142",
+    )
+    claimed = kb.claim_task(conn, task_id)
+    assert kb.request_review(
+        conn, task_id, summary="done", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    # Cooldown=0 ("next tick, for tests") -- see the sibling fallback test
+    # above for why the cooldown must be disabled for this run to reach
+    # dispatch at all.
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    conn.execute(
+        "INSERT INTO task_runs (task_id, profile, status, started_at, ended_at, outcome, error) "
+        "VALUES (?, 'reviewer', 'done', ?, ?, 'rate_limited', '429 quota exceeded')",
+        (task_id, int(time.time()) - 60, int(time.time()) - 30),
+    )
+    conn.commit()
+    monkeypatch.setattr(kbd, "_review_fallback_model", lambda: ("claude-haiku-5", "anthropic"))
+    monkeypatch.setattr(kbd, "_pr_url_for_key", lambda c, pr: "https://github.com/Stockstrading/bff-api/pull/142")
+    monkeypatch.setattr(kbd, "_fetch_pr_files_meta", lambda url, timeout=20: None)
+
+    spawned = []
+
+    def _fake_spawn(claimed, workspace, board):
+        spawned.append((claimed.model_override, claimed.provider_override))
+        return 12345
+
+    kbd.dispatch_once(conn, spawn_fn=_fake_spawn)
+
+    assert spawned == [(None, None)]
 
 
 def test_no_fallback_configured_returns_none(conn, monkeypatch):
