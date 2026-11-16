@@ -1,7 +1,7 @@
 ---
 name: sdlc-review
 description: Review Kanban handoffs and route verified outcomes.
-version: 1.1.0
+version: 1.2.0
 author: Jakub Wolniewicz (@frizikk) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -53,6 +53,27 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 | Escalate | A human decision or external prerequisite is required | `kanban_block` |
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
+
+## Verdict Metadata Shape (findings + head SHA)
+
+Every verdict (`kanban_complete` approval or `kanban_request_changes`) on a PR review card must set structured `metadata`. The dispatcher's review-cost gate and review-dedupe logic read these keys back on later ticks, so an omitted or malformed key disables that round's cost savings rather than causing a wrong verdict — they fail open and simply re-spawn a full review.
+
+```text
+metadata={
+    "head_sha": "<40-char PR head commit SHA you reviewed>",
+    "reviewed_sha": "<same 40-char SHA, repeated>",
+    "findings": [
+        {"id": "F1", "severity": "MAJOR", "file": "path/to/file.py", "line": 42, "status": "open"},
+        ...
+    ],
+}
+```
+
+- **`head_sha`** — the exact PR head commit SHA you reviewed (`gh pr view <n> --json headRefOid`, or the SHA you diffed against). The review-dedupe check (`_review_head_unchanged`) compares this against the PR's LIVE head SHA on the next tick: if they still match and no new task comment landed, the dispatcher replays this verdict instead of spawning a fresh reviewer. Without this key, dedupe never engages for this task's history and a later tick always re-reviews.
+- **`reviewed_sha`** — the same commit SHA as `head_sha`, under the key the round ≥ 2 delta-review context builder (`build_round_delta_context`) reads. Set both keys to the identical value on every verdict; they are read by two different consumers for the same fact and neither substitutes for the other.
+- **`findings`** — the list of issues found this round, oldest-first, each either a dict `{"id", "severity", "file", "line", "status"}` or a plain string beginning with the severity (`"MAJOR: file.py:10 missing null check"`). `severity` is one of `NIT`, `MINOR`, `MAJOR`, `CRITICAL`, `BLOCKER`. On round ≥ 2, only a `MAJOR`-or-higher finding blocks approval (`should_block_on_findings`) — `MINOR`/`NIT` are advisory and must be said so explicitly in the verdict comment, never used to request changes. Mark each finding carried over from a prior round `"status": "addressed"` or `"status": "open"` instead of dropping it, so the delta-review handoff on the next round can tell what is still outstanding. An approval with zero open findings still sets `"findings": []` (not an omitted key) so later ticks can tell "no findings" apart from "findings never recorded."
+
+Round ≥ 2 reviewers receive a dispatcher comment built from the PRIOR round's `reviewed_sha` and `findings` (the delta-review handoff) — review only the diff since that SHA plus the carried-over findings, not the whole PR again. Carry the same `head_sha`/`reviewed_sha` convention forward on your own verdict so the round after yours gets the same benefit.
 
 ## Review Lenses
 
@@ -113,7 +134,13 @@ Approve only when the acceptance criteria are satisfied and the evidence is suff
 ```text
 kanban_complete(
     summary="Reviewed and approved. <what was verified>",
-    metadata={"review_outcome": "approved", "reviewer_checks": [...]}
+    metadata={
+        "review_outcome": "approved",
+        "reviewer_checks": [...],
+        "head_sha": "<40-char PR head commit SHA you reviewed>",
+        "reviewed_sha": "<same SHA>",
+        "findings": [],
+    }
 )
 ```
 
@@ -130,11 +157,16 @@ kanban_comment(
 )
 ```
 
-Then return the same task to its implementer:
+Then return the same task to its implementer with the same metadata shape (`head_sha`, `reviewed_sha`, and the `findings` list including every open and newly-addressed item):
 
 ```text
 kanban_request_changes(
-    reason="<concise summary of the required corrections>"
+    reason="<concise summary of the required corrections>",
+    metadata={
+        "head_sha": "<40-char PR head commit SHA you reviewed>",
+        "reviewed_sha": "<same SHA>",
+        "findings": [{"id": "F1", "severity": "MAJOR", "file": "...", "line": 1, "status": "open"}],
+    }
 )
 ```
 
@@ -179,3 +211,4 @@ Before submitting the verdict, confirm:
 - [ ] The verdict uses exactly one terminal action.
 - [ ] The summary contains concrete, non-secret evidence.
 - [ ] No implementation files were edited by the reviewer.
+- [ ] The verdict's `metadata` sets `head_sha` and `reviewed_sha` to the identical reviewed commit SHA, and `findings` (possibly `[]`) with each carried-over finding marked `addressed` or `open`.
