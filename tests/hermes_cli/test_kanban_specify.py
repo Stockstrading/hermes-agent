@@ -139,3 +139,90 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+# ---------------------------------------------------------------------------
+# _preserve_pr_refs: an auto-specify rewrite must not drop the repo+PR key
+# or capital-safety tags.
+# ---------------------------------------------------------------------------
+
+
+def test_preserve_pr_refs_keeps_dropped_title_pr_key():
+    """An LLM rewrite that drops the repo+PR reference gets it re-prefixed."""
+    old_title = "strategy-api PR #329: fix zero-bid loop"
+    new_title, new_body = spec._preserve_pr_refs(
+        old_title, "body", "Fix the zero-bid collect loop", None,
+    )
+    assert new_title is not None
+    assert "strategy-api" in new_title and "329" in new_title
+    assert new_body is None
+
+
+def test_preserve_pr_refs_keeps_capital_tags_in_title():
+    old_title = "[CAPITAL][needs-human-ok] strategy-api PR #392: fix gate"
+    new_title, _ = spec._preserve_pr_refs(old_title, "body", "Fix the release gate", None)
+    assert new_title is not None
+    assert "[CAPITAL]" in new_title
+    assert "[needs-human-ok]" in new_title
+
+
+def test_preserve_pr_refs_keeps_pr_url_in_rewritten_body():
+    old_body = "See https://github.com/Stockstrading/strategy-api/pull/329 for context."
+    _, new_body = spec._preserve_pr_refs("t", old_body, None, "A totally rewritten body.")
+    assert new_body is not None
+    assert "pull/329" in new_body
+
+
+def test_preserve_pr_refs_untouched_fields_pass_through_as_none():
+    """When the specifier didn't rewrite a field (None), the function must not
+    invent a value for it — the caller's "don't touch" contract at the DB
+    write site depends on this."""
+    new_title, new_body = spec._preserve_pr_refs("old t", "old b", None, None)
+    assert new_title is None
+    assert new_body is None
+
+
+def test_preserve_pr_refs_no_op_when_old_card_names_no_pr():
+    new_title, new_body = spec._preserve_pr_refs("plain idea", "body", "Tightened idea", "New body")
+    assert new_title == "Tightened idea"
+    assert new_body == "New body"
+
+
+# ---------------------------------------------------------------------------
+# list_triage_ids must not resurrect block_loop_detected escalations
+# ---------------------------------------------------------------------------
+
+
+def _running_task(conn, title="t"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    return tid
+
+
+def test_list_triage_ids_excludes_block_loop_detected(kanban_home):
+    """A triage card whose latest event is block_loop_detected is a human-gated
+    escalation; auto-specify must not re-specify it back to todo (that is
+    exactly the storm this fix stops)."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid not in spec.list_triage_ids()
+
+
+def test_list_triage_ids_includes_fresh_triage_card(kanban_home):
+    """A plain one-liner idea card in triage (no block_loop_detected event at
+    all) must still be picked up — only the escalation kind is excluded."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="idea", triage=True)
+        assert kb.get_task(conn, tid).status == "triage"
+
+    assert tid in spec.list_triage_ids()
+
+
