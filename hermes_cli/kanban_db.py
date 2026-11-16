@@ -3462,6 +3462,7 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+    metadata = redact_review_value(metadata)
 
     with write_txn(conn):
         task_row = conn.execute(

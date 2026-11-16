@@ -496,6 +496,46 @@ def test_schedule_unparsable_scheduled_until_marker_leaves_resume_at_null(worker
         ).fetchone()[0] is None
 
 
+def test_schedule_marker_requires_left_word_boundary(worker_env):
+    """``UNSCHEDULED_UNTIL=...`` must not substring-match the marker — only
+    the exact ``SCHEDULED_UNTIL=`` token (preceded by a non-word char or
+    string start) is honoured."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({
+        "reason": "UNSCHEDULED_UNTIL=2026-09-13T00:00:00Z, not a real marker",
+    }))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
+    """A timestamp immediately followed by sentence punctuation (no space)
+    must still parse — the capture group stops at the ISO8601 value, not at
+    the next whitespace."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+    import calendar
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({
+        "reason": "waiting for quota reset, SCHEDULED_UNTIL=2026-09-13T00:00:00Z.",
+    }))
+    assert out["ok"] is True
+    expected_epoch = calendar.timegm((2026, 9, 13, 0, 0, 0))
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] == expected_epoch
+
+
 def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
     """``kanban_request_changes`` stores an optional ``metadata`` dict (e.g.
     ``head_sha``/``findings``) on the closed run, exactly like ``kanban_complete``;

@@ -851,7 +851,10 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
-_SCHEDULED_UNTIL_RE = re.compile(r"SCHEDULED_UNTIL=(\S+)")
+_SCHEDULED_UNTIL_RE = re.compile(
+    r"\bSCHEDULED_UNTIL=(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?)"
+)
 
 
 def _parse_scheduled_until(reason: Optional[str]) -> Optional[int]:

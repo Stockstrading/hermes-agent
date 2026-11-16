@@ -102,6 +102,10 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    scheduled_promoted: int = 0
+    """``scheduled`` cards whose ``resume_at`` wake timer had arrived, promoted
+    back to ``ready`` this tick by :func:`hermes_cli.kanban_db.recompute_scheduled`
+    — the sibling of ``promoted`` for the ``kanban_schedule`` timer path."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -1554,6 +1558,45 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _review_respawn_is_redundant(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``True`` when the handoff that put ``task_id`` into the review lane
+    names the exact ``head_sha`` the last ``changes_requested`` verdict
+    already reviewed, with no ``findings`` reported on the fresh handoff.
+
+    ``head_sha``/``findings`` are caller-supplied ``metadata`` keys (see
+    ``kanban_request_review``/``kanban_request_changes`` schemas); absent on
+    either side, this is conservatively ``False`` (never dedup a handoff we
+    cannot positively identify as a repeat).
+    """
+    requested = conn.execute(
+        "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    run_id = _kb._row_get(requested, "run_id")
+    if run_id is None:
+        return False
+    current_run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (int(run_id),),
+    ).fetchone()
+    current_meta = _kb._json_dict(_kb._row_get(current_run, "metadata"))
+    current_sha = current_meta.get("head_sha")
+    if not isinstance(current_sha, str) or not current_sha.strip():
+        return False
+
+    prior_run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    prior_meta = _kb._json_dict(_kb._row_get(prior_run, "metadata"))
+    prior_sha = prior_meta.get("head_sha")
+    if not isinstance(prior_sha, str) or prior_sha.strip() != current_sha.strip():
+        return False
+
+    return not current_meta.get("findings")
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1625,7 +1668,14 @@ def check_respawn_guard(
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+    # Exception: ``head_sha`` dedup (kanban_request_changes schema) — the
+    # implementer re-requested review naming the EXACT head SHA the last
+    # ``changes_requested`` verdict already reviewed, with no new findings on
+    # the fresh handoff. Nothing changed since that verdict; spawning another
+    # reviewer would just repeat it.
     if lane == "review":
+        if _review_respawn_is_redundant(conn, task_id):
+            return "head_sha_unchanged"
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
@@ -2231,6 +2281,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.scheduled_promoted = _kb.recompute_scheduled(conn)
 
 
 def _tick_spawn_budget(
