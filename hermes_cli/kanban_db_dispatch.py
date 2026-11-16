@@ -84,6 +84,52 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_RESPAWN_GUARD_PR_URL_PARTS_RE = re.compile(
+    r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_RESPAWN_GUARD_PR_SHORTHAND_RE = re.compile(r"\bPR\s*#?\s*(\d+)", re.IGNORECASE)
+
+
+def _pr_refs(text: Optional[str]) -> set[str]:
+    """Return the PR references in ``text`` as a comparable set.
+
+    A full URL yields BOTH ``owner/repo#n`` (lowercased) and the bare ``#n``; a
+    shorthand ``PR #n`` / ``PR n`` / ``PR#n`` yields ``#n``. Empty/None text
+    yields an empty set.
+
+    Bare numbers are compared too on purpose: a card titled "review PR #50" and
+    a worker comment linking ``.../pull/50`` are the SAME PR, and treating them
+    as two different PRs makes the respawn guard starve the card forever (see
+    step 4 of :func:`check_respawn_guard`). The repo-qualified form is kept as
+    well so two different repos' ``#50`` can still be told apart when both
+    sides spell the URL out.
+    """
+    if not text:
+        return set()
+    refs: set[str] = set()
+    for repo, num in _RESPAWN_GUARD_PR_URL_PARTS_RE.findall(text):
+        refs.add(f"{repo.lower()}#{num}")
+        refs.add(f"#{num}")
+    for num in _RESPAWN_GUARD_PR_SHORTHAND_RE.findall(text):
+        refs.add(f"#{num}")
+    return refs
+
+
+def _pr_url_refs(text: Optional[str]) -> set[str]:
+    """``_pr_refs`` restricted to refs spelled as a full PR URL.
+
+    Used on the COMMENT side of the respawn guard: the bare ``PR #n`` shorthand
+    that ``_pr_refs`` accepts is right for reading what a card is about, but on
+    a comment it makes any passing mention of another PR ("same bug as PR #107")
+    look like a brand-new PR and re-arm the 24h window.
+    """
+    if not text:
+        return set()
+    refs: set[str] = set()
+    for repo, num in _RESPAWN_GUARD_PR_URL_PARTS_RE.findall(text):
+        refs.add(f"{repo.lower()}#{num}")
+        refs.add(f"#{num}")
+    return refs
+
 
 @dataclass
 class DispatchResult:
@@ -1576,7 +1622,7 @@ def check_respawn_guard(
     passes own those.
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, title, body FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -1644,9 +1690,25 @@ def check_respawn_guard(
     #    now work on THAT PR — a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    # Only a PR the card does NOT already name counts as "a prior worker
+    # opened a PR". A review/fix card whose whole subject IS an existing PR
+    # re-posts that same link in discussion, and the 24h window re-armed on
+    # every such comment -- a livelock, not a wait (2026-09-16: ~3,700
+    # respawn_guarded events in 6h across 11 starved cards). A repo-qualified
+    # ref whose bare "#50" the card already names is the same PR: a title
+    # saying "review PR #50" cannot spell the repo out. (local patch, ported to v0.22.2)
+    known = _pr_refs(
+        f"{_kb._lossy_text(row['title']) or ''}\n{_kb._lossy_text(row['body']) or ''}"
+    )
+
+    def _names_new_pr(body: str) -> bool:
+        if not _RESPAWN_GUARD_PR_URL_RE.search(body):
+            return False
+        return any(f"#{r.rsplit('#', 1)[-1]}" not in known for r in _pr_url_refs(body) - known)
+
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                if _names_new_pr(_kb._lossy_text(c["body"]) or "")]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
