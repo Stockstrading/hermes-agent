@@ -362,6 +362,130 @@ def test_branch_rules_404_fallback_with_no_checks_at_all_stays_missing(github_no
     assert "local-only" in receipt["detail"]
 
 
+# --- branch-rules denial must never launder a check GraphQL did not already know about ---
+
+@pytest.fixture
+def github_required_rules_denied(tmp_path, monkeypatch):
+    """GraphQL branch protection already declares >=1 required check (``required``,
+    success), AND a second real check (``other-ci``) ran on the head and failed, AND the
+    rules/branches REST endpoint is denied. The denial must never make ``other-ci``
+    disappear: a repo with real CI governance cannot have a failing check silently
+    laundered just because the rulesets endpoint is inaccessible."""
+    state = {"conclusion": "failure", "head": "a" * 40, "status_code": 403, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+            elif "/rules/branches/" in self.path:
+                self.send_error(state["status_code"])
+                return
+            elif "/check-runs" in self.path:
+                runs = [
+                    {"id": 1, "name": "required", "head_sha": sha, "app": {"id": 1},
+                     "status": "completed", "conclusion": "success",
+                     "html_url": "https://github.com/acme/repo/actions/runs/1"},
+                    {"id": 2, "name": "other-ci", "head_sha": sha, "app": {"id": 2},
+                     "status": "completed", "conclusion": state["conclusion"],
+                     "html_url": "https://github.com/acme/repo/actions/runs/2"},
+                ]
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_denied_rules_never_launders_a_failed_check(github_required_rules_denied):
+    """Finding 1 (#9 release-gate reject): GraphQL already declares 'required' required and
+    passing; rules/branches is denied (403); 'other-ci' also ran on the same head and failed.
+    Pre-fix this returned ok=True (the denial silently dropped whatever rules/branches would
+    have required, and 'fallback' never engaged because the merged required set was non-empty).
+    The fix must catch 'other-ci' by merging the fallback ran-checks set additively."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-real-failure", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "failure"
+    assert {"required", "other-ci"} <= {c["context"] for c in receipt["required"]}
+    failed = next(c for c in receipt["checks"] if c["name"] == "other-ci")
+    assert failed["classification"] == "failure"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_denied_rules_still_succeeds_when_everything_passed(github_required_rules_denied):
+    """Same denial shape, but both checks that ran actually passed: completion must still
+    succeed -- the fix must not turn every rules/branches denial into a false failure."""
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-all-pass", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_rules_401_fails_closed_not_laundered(github_required_rules_denied):
+    """Finding 2/4: a 401 (or rate-limited 403) on rules/branches is an identity/infra problem
+    on the SAME login that just read the PR fine -- it must fail closed (classification
+    'auth'), never be treated as 'this plan has no rulesets configured'."""
+    github_required_rules_denied["status_code"] = 401
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-401", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+
+
 # --- fetch_pr_head_sha: fail-closed on every ambiguous case ---
 
 def test_fetch_pr_head_sha_returns_live_head_on_success(github):
@@ -408,4 +532,3 @@ def test_fetch_pr_head_sha_fails_closed_on_gh_error(tmp_path, monkeypatch):
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None
-

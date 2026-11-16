@@ -65,6 +65,22 @@ class _GateAuthError(RuntimeError):
     an infrastructure blip to retry."""
 
 
+def _resolve_contract_pr(contract: str, published_pr: str | None) -> tuple[re.Match[str], str | None] | None:
+    """The PR ``match`` and resolved ``url`` for ``(contract, published_pr)``, or ``None``.
+
+    Shared by :func:`fetch_pr_head_sha` and :func:`collect_acceptance`: a ``contract`` that is
+    itself a declared PR URL must agree with a non-empty ``published_pr``; otherwise the task's
+    own declared contract decides the URL and ``published_pr`` is informational only.
+    """
+    declared = _PR.fullmatch(contract)
+    url = contract if declared else published_pr
+    match = _PR.fullmatch(url or "")
+    if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        return None
+    return match, url
+
+
+
 def _gh_env(profile_home: str | None) -> dict[str, str] | None:
     """Child env for ``gh``: the card's profile identity when one is resolvable.
 
@@ -121,11 +137,10 @@ def fetch_pr_head_sha(contract: str, published_pr: str | None = None,
     """
     try:
         profile_home = _assignee_profile_home(assignee)
-        declared = _PR.fullmatch(contract)
-        url = contract if declared else published_pr
-        match = _PR.fullmatch(url or "")
-        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        resolved = _resolve_contract_pr(contract, published_pr)
+        if resolved is None:
             return None
+        match, _url = resolved
         repo, number = match[1], int(match[2])
         owner, name = repo.split("/")
         query = (
@@ -144,10 +159,41 @@ def fetch_pr_head_sha(contract: str, published_pr: str | None = None,
         if pr.get("state") not in {"OPEN", "MERGED"}:
             return None
         return sha
-    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
+            IndexError, AttributeError):
         # Never raise into a dispatcher tick: any resolution failure here must fail
-        # closed into "spawn for real", never into a silent skip.
+        # closed into "spawn for real", never into a silent skip. AttributeError covers a
+        # malformed GraphQL shape (e.g. {"data": {"repository": []}}) where .get()/dict
+        # access on a non-dict value would otherwise escape -- the docstring promises this
+        # never raises.
         return None
+
+
+def _resolve_required_checks(required: set[tuple[str, int | None]], graphql_required: bool,
+                             rules_denied_exc: Exception | None,
+                             ran_checks: set[tuple[str, None]]) -> tuple[set, str | None]:
+    """The final required-checks set and its ``required_source`` label (``None`` when the
+    set is exactly what GraphQL + the rulesets REST call declared, with nothing to disclose).
+
+    Raises ``rules_denied_exc`` unchanged when the rules/branches denial was not the
+    GitHub-Free-plan 403/404 shape: a 401 or a rate-limited 403 on the SAME login that just
+    read the PR fine is an identity/infra problem, never "no governance configured", and
+    must fail closed rather than be read as a plan limitation.
+    """
+    if rules_denied_exc is not None:
+        if not re.search(r"HTTP 40[34]", str(rules_denied_exc)):
+            raise rules_denied_exc
+        if graphql_required:
+            # GraphQL already declared >=1 required check: the denied rulesets call may have
+            # required more. Never drop that possibility silently -- merge every check that
+            # actually ran on the head in ADDITIVELY on top of the known GraphQL set, so a
+            # real failure on an unlisted check is still caught.
+            return required | ran_checks, ("graphql-required checks + fallback: all checks that ran on "
+                                           "the head (rules/branches denied on this plan)")
+        return set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)"
+    if not required:
+        return set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)"
+    return required, None
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
@@ -158,12 +204,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
         profile_home = _assignee_profile_home(assignee)
-        declared = _PR.fullmatch(contract)
-        url = contract if declared else published_pr
-        match = _PR.fullmatch(url or "")
-        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+        resolved = _resolve_contract_pr(contract, published_pr)
+        if resolved is None:
             receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
             return receipt
+        match, url = resolved
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
         owner, name = repo.split("/")
@@ -179,14 +224,17 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
+        graphql_required = bool(required)
+        rules_denied_exc: _GateAuthError | None = None
         try:
             rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
                          paginate=True, profile_home=profile_home)
-        except _GateAuthError:
-            # The PR itself was just read with this login, so a 403/404 on the branch-rules
-            # endpoint specifically is the plan (GitHub Free private repos expose no rules),
-            # not an identity failure -- fall back to treating every check that ran on the
-            # head as required (recorded below via required_source).
+        except _GateAuthError as exc:
+            # Record the denial instead of silently discarding it: whether it is safe to
+            # treat as "this plan has no rulesets" (vs. an identity failure to fail closed
+            # on) is decided below, once we know the HTTP status and what GraphQL already
+            # declared required.
+            rules_denied_exc = exc
             rules = []
         for page in rules:
             for rule in page:
@@ -200,10 +248,10 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
-        fallback = not required
-        if fallback:
-            required = {(r["name"], None) for r in runs} | {(s["context"], None) for s in statuses}
-            receipt["required_source"] = "fallback: all checks that ran on the head (no branch rules available on this plan)"
+        ran_checks = {(r["name"], None) for r in runs} | {(s["context"], None) for s in statuses}
+        required, required_source = _resolve_required_checks(required, graphql_required, rules_denied_exc, ran_checks)
+        if required_source:
+            receipt["required_source"] = required_source
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
             receipt["detail"] = ("No repository-required checks are configured and no checks ran on the head; "
@@ -223,11 +271,12 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
-                if fallback and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
-                    # A fallback-required check has no app pin to compare against, so
-                    # _classify's conservative default (infra) for an unrecognised-but-
-                    # non-failing outcome ("neutral"/"skipped") would block every fallback
-                    # repo on its own non-blocking checks; treat those as passing.
+                if app_id is None and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
+                    # A required context with no app pin to compare against has nothing for
+                    # _classify's conservative default (infra on an unrecognised-but-non-failing
+                    # outcome -- "neutral"/"skipped") to check, so it would block every
+                    # branch-rules-denied or no-rules repo on its own non-blocking checks;
+                    # treat those as passing. A pinned required check never takes this path.
                     classification = "success"
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
