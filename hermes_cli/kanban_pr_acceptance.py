@@ -191,8 +191,11 @@ def _resolve_required_checks(required: set[tuple[str, int | None]], graphql_requ
             return required | ran_checks, ("graphql-required checks + fallback: all checks that ran on "
                                            "the head (rules/branches denied on this plan)")
         return set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)"
-    if not required:
-        return set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)"
+    # No GraphQL branch protection AND an ordinary (non-denied) empty rules/branches response:
+    # genuinely no CI governance is declared for this branch. Never promote "whatever happened
+    # to run" into "required" here -- that silently accepts any check outcome for a repo with
+    # zero configured governance. Return the (empty) required set unchanged; the caller's
+    # `if not required` path reports ok=False with local-only-contract guidance.
     return required, None
 
 

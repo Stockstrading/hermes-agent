@@ -362,6 +362,86 @@ def test_branch_rules_404_fallback_with_no_checks_at_all_stays_missing(github_no
     assert "local-only" in receipt["detail"]
 
 
+# --- ordinary 200 + no rules + no GraphQL protection: genuinely no CI governance declared ---
+
+@pytest.fixture
+def github_empty_rules_no_denial(tmp_path, monkeypatch):
+    """Finding 2 (#9 release-gate reject): rules/branches answers an ordinary 200 with no
+    rules configured (``[[]]``, not an exception) AND GraphQL declares no branch protection.
+    This is genuinely "no CI governance declared", not a GitHub-Free-plan denial -- it must
+    stay the pre-PR ``ok: false`` / local-only-contract outcome even though a check ran."""
+    state = {"conclusion": "success", "head": "a" * 40, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": None}}}}}
+            elif "/rules/branches/" in self.path:
+                value = [[]]  # ordinary 200, no exception -- not the Free-plan 403/404 shape
+            elif "/check-runs" in self.path:
+                runs = [{"id": 42, "name": "ci", "head_sha": sha, "app": {"id": 1},
+                         "status": "completed", "conclusion": state["conclusion"],
+                         "html_url": "https://github.com/acme/repo/actions/runs/42"}]
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_empty_rules_no_denial_stays_ok_false_even_though_a_check_ran(github_empty_rules_no_denial):
+    """Finding 2 (#9 release-gate reject): an ordinary 200 from rules/branches with no rules
+    configured, and no GraphQL branch protection, must never promote 'whatever ran' into
+    'required'. Pre-fix this returned ok=True off a repo with zero declared CI governance --
+    the exact regression the release gate flagged against the 403/404-only carve-out."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no-governance", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["required"] == []
+    assert "required_source" not in receipt
+    assert "local-only" in receipt["detail"]
+
+
 # --- branch-rules denial must never launder a check GraphQL did not already know about ---
 
 @pytest.fixture
