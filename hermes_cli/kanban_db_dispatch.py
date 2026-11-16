@@ -1600,6 +1600,539 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+
+# --- Review cost gate (local patch 2026-09-29, owner-approved) ---------------
+# Reviews used ~76% of all Claude tokens (1,384 review runs on 133 PRs in 10
+# days, up to 16 gate-1 rounds on one PR, two review cards per round). The
+# round cap in the SOULs was only checked by the model AFTER a full paid review,
+# so it is enforced here, at spawn time, before any model call.
+_REVIEW_GATE_PROFILES = ("reviewer", "release-reviewer")
+_REVIEW_ROUND_CAP = 4  # verdict runs per gate per PR; the next one needs the owner (raised 2 -> 4 by the owner 2026-10-08)
+# Owner-granted extra rounds for specific PRs (2026-10-08: 3 more rounds each, then report readiness).
+# 2026-10-27 11:58 IDT owner decision 259: review cap 8 for ADR-037 sub-second perf PRs (marketdata/candle/indicator + gitops#397)
+# 2026-10-27 owner: ai-stocktrading#589 review cap 12 (more than 10 rounds, make it ready to merge)
+_REVIEW_ROUND_CAP_BY_PR = {'strategy-api#431': 6, 'instruments-api#101': 9, 'oke-platform-gitops#267': 9, 'indicator-api#133': 8, 'risk-api#56': 6, 'execution-service#337': 7, 'strategy-api#356': 6, 'strategy-api#355': 6, 'backtest-api#47': 8, 'credentials-service#25': 7, 'trading-config-api#32': 5, 'strategy-api#346': 7, 'strategy-api#340': 7, 'strategy-api#334': 7, 'account-pod-provisioner#12': 7, 'strategy-lab#27': 8, 'strategy-lab#28': 7, 'bff-api#141': 11, 'ai-stocktrading#560': 7, 'execution-service#308': 7, 'ai-stocktrading#531': 10, 'strategy-api#276': 9, 'account-pod-provisioner#7': 7, 'ai-stocktrading#535': 9, 'execution-service#326': 9, 'oke-platform-gitops#241': 12, 'ai-stocktrading#546': 6, 'ai-stocktrading#533': 3, 'strategy-lab#33': 10, 'ai-stocktrading#532': 8, 'bff-api#144': 7, 'bff-api#150': 7, 'oke-platform-gitops#228': 18, 'oke-platform-gitops#333': 7, 'oke-platform-gitops#336': 28, 'ai-stocktrading#538': 7, 'ai-stocktrading#551': 8, 'ai-stocktrading#552': 7, 'risk-api#51': 7, 'strategy-api#335': 7, 'strategy-api#298': 8, 'strategy-api#245': 11, 'strategy-api#304': 9, 'account-pod-provisioner#11': 7, 'strategy-api#319': 9, 'strategy-api#243': 16, 'indicator-api#96': 15, 'strategy-api#237': 16, 'strategy-api#339': 6, 'strategy-api#313': 7, 'strategy-api#352': 5, 'execution-service#329': 9, 'strategy-lab#37': 7, 'indicator-api#118': 10, 'ai-stocktrading#558': 5, 'bff-api#157': 10, 'strategy-api#342': 7, 'execution-service#332': 6, 'trading-router#18': 10, 'bff-api#156': 6, 'bff-api#162': 6, 'candle-api#63': 7, 'oke-platform-gitops#343': 5, 'strategy-api#381': 9, 'strategy-api#382': 9, 'strategy-api#383': 9, 'strategy-api#414': 8, 'strategy-lab#46': 8, 'candle-api#68': 9, 'strategy-api#360': 9, 'oke-platform-gitops#373': 7, 'oke-platform-gitops#376': 7, 'external-data-service#144': 7, 'bff-api#170': 7, 'ai-stocktrading#570': 8, 'bff-api#164': 10, 'bff-api#165': 8, 'bff-api#166': 8, 'strategy-api#387': 8, 'strategy-api#391': 8, 'strategy-api#397': 8, 'oke-platform-gitops#383': 6, 'strategy-api#440': 12, 'bff-api#178': 6, 'trading-config-api#39': 6, 'marketdata-api#126': 8, 'marketdata-api#130': 8, 'candle-api#74': 8, 'candle-api#76': 8, 'candle-api#77': 9, 'candle-api#78': 9, 'indicator-api#142': 8, 'indicator-api#143': 11, 'oke-platform-gitops#397': 10, 'ai-stocktrading#589': 12, 'oke-platform-gitops#393': 9, 'oke-platform-gitops#400': 8, 'candle-api#86': 7, 'indicator-api#156': 7, 'marketdata-api#131': 9, 'oke-platform-gitops#404': 8, 'oke-platform-gitops#398': 5, 'indicator-api#152': 7, 'indicator-api#149': 6, 'indicator-api#153': 7, 'candle-api#80': 5, 'candle-api#89': 6, 'candle-api#85': 6, 'candle-api#83': 6, 'indicator-api#151': 6, 'oke-platform-gitops#391': 6, 'oke-platform-gitops#396': 6, 'oke-platform-gitops#384': 6, 'oke-platform-gitops#349': 6, 'oke-platform-gitops#316': 6, 'oke-platform-gitops#310': 6, 'oke-platform-gitops#299': 6, 'ai-stocktrading#591': 6, 'oke-platform-gitops#424': 9, 'oke-platform-gitops#425': 9, 'oke-platform-gitops#418': 10, 'oke-platform-gitops#419': 11, 'candle-api#106': 10, 'candle-api#107': 9, 'indicator-api#163': 9, 'indicator-api#181': 9, 'strategy-api#469': 9, 'strategy-api#462': 9, 'strategy-api#463': 9, 'strategy-api#464': 9, 'candle-api#109': 10, 'candle-api#110': 9, 'candle-api#111': 9, 'candle-api#112': 9, 'candle-api#113': 9, 'candle-api#114': 9, 'indicator-api#189': 10, 'indicator-api#190': 9, 'strategy-api#470': 10, 'strategy-api#472': 9, 'strategy-api#473': 9, 'oke-platform-gitops#430': 9, 'oke-platform-gitops#433': 9}  # 2026-10-28 owner decisions 307 (#149 5->6), 308 (#153 4->5), 309 (#131 6->7), 310 (#80 4->5); 2026-10-24 owner: two additional review rounds for every still-open PR currently blocked by the round cap
+  # 2026-10-30 owner: +5 review rounds for the open latency-plan PRs (candle-api#109 4->10, candle-api#110 4->9, candle-api#111 4->9, candle-api#112 4->9, candle-api#113 4->9, candle-api#114 4->9, indicator-api#189 4->10, indicator-api#190 4->9, strategy-api#470 4->10, strategy-api#472 4->9, strategy-api#473 4->9, oke-platform-gitops#430 4->9, oke-platform-gitops#433 4->9)
+  # 2026-10-30 owner: +5 review rounds for the open latency-plan PRs (oke-platform-gitops#424 4->9, oke-platform-gitops#425 4->9, oke-platform-gitops#418 4->10, oke-platform-gitops#419 4->11, candle-api#106 4->10, candle-api#107 4->9, indicator-api#163 4->9, indicator-api#181 4->9, strategy-api#469 4->9, strategy-api#440 6->12, strategy-api#462 4->9, strategy-api#463 4->9, strategy-api#464 4->9)
+  # 2026-10-12 owner: +3 for #141/#560/#533, +2 for #308/#531/#546; 2026-10-12 owner (2nd batch): +3 rounds for strategy-api#276, account-pod-provisioner#7, ai-stocktrading#531/#535, execution-service#326, oke-platform-gitops#241; 2026-10-18 13:06 owner: +1 #245/#237/#304/#339/#313/#352/#346/#276, exec #337/#329, backtest #47, lab #33/#37, indicator #118, AI #558, bff #157; +2 strategy #342, exec #332, router #18, bff #156/#162 (cap = rounds used + N); 2026-10-18 14:13 owner: +1 indicator-api#118 and execution-service#329 (post-fix reviews); 2026-10-19 owner: candle-api#63 -> 7, credentials-service#25 -> 7, oke-platform-gitops#343 -> 5; 2026-10-19 owner (2nd): strategy-api#381/#382/#383 -> 6; 2026-10-21 owner (Option A): +3 rounds on today's active PRs; 2026-10-28 owner decisions 273-278: gitops#400 -> 5, candle#78 -> 9, candle#77 -> 9, indicator#143 -> 9, gitops#393 -> 9
+  # 2026-10-28 21:59 IDT owner request d372 (push indicator/candle/gitops/AI PRs to review, more rounds): +2 for PRs at or near cap: candle-api#89 4->6, candle-api#85 4->6, candle-api#83 4->6, indicator-api#143 9->11, indicator-api#156 5->7, indicator-api#153 5->7, indicator-api#152 5->7, indicator-api#151 4->6, marketdata-api#131 7->9, oke-platform-gitops#404 6->8, oke-platform-gitops#400 6->8, oke-platform-gitops#397 8->10, oke-platform-gitops#391 4->6, oke-platform-gitops#396 4->6, oke-platform-gitops#384 4->6, oke-platform-gitops#349 4->6, oke-platform-gitops#316 4->6, oke-platform-gitops#310 4->6, oke-platform-gitops#299 4->6, ai-stocktrading#591 4->6
+_REVIEW_MIN_RUN_SECONDS = 120  # shorter runs are crashes / synthesized block runs
+_REVIEW_LOOKBACK_SECONDS = 0  # 0 = no window: owner caps are absolute ("rounds used + N"); a 30-day window let #237's 14 rounds expire (2026-10-19 owner fix)
+_REVIEW_CAP_MARKER = "review round cap"
+_REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
+_REVIEW_PR_TITLE_RE = re.compile(
+    r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
+_CAPITAL_DENY_SUBSTRINGS = (
+    "strategy", "execution", "risk", "signal", "exit", "entry", "stop-loss",
+    "sizing", "kelly", "profit", "pnl", "orders", "trade",
+)
+_CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
+                  "position-service", "risk-api", "credentials-service")
+_CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
+_CAPITAL_REVIEW_MODEL = ("claude-opus-5", "anthropic")
+
+
+def _norm_repo(name: str) -> str:
+    n = (name or "").lower().removesuffix(".git")
+    return n.removeprefix("etoro-")
+
+
+def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
+    """``repo#n`` keys for the PR a card is ABOUT. The title decides; the body
+    only counts via a repo-qualified reference (full PR URL or textual
+    ``repo PR #n``) when the title names none (a body often cites other PRs
+    in passing, which must not merge two PRs' round counts).
+
+    Both qualified forms are checked in the body fallback (not just the URL
+    form) so this stays in lockstep with ``_resolve_card_pr_keys`` -- a
+    diverging, URL-only body fallback here let a capital-affecting card with
+    a bare ``PR #n`` title and a textual (non-URL) repo mention in the body
+    silently miss the capital-model gate (round-2 finding F3)."""
+    t = _kb._lossy_text(title) or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if not keys:
+        b = _kb._lossy_text(body) or ""
+        keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+        keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    return keys
+
+
+_BARE_PR_REF_RE = re.compile(
+    r"(?:\bPR\s*#|pull\s*request\s*#?|/pull/)(\d+)", re.IGNORECASE)
+
+
+def _body_repo_pr_keys(body: Optional[str]) -> set[str]:
+    """Repo-qualified PR mentions anywhere in a body (full URLs and ``repo PR #n``)."""
+    b = _kb._lossy_text(body) or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    return keys
+
+
+def _unconsumed_text(text: str) -> str:
+    """``text`` with spans already matched by the repo-qualified PR regexes
+    (full URL, textual ``repo PR #n``) blanked out, so a bare-number scan
+    never re-derives a number from inside a qualified mention it has already
+    been credited for (and never treats a relative ``/pull/N`` inside a full
+    ``github.com/.../pull/N`` URL as a second, separate bare reference)."""
+    spans = [m.span() for m in _REVIEW_PR_URL_RE.finditer(text)]
+    spans += [m.span() for m in _REVIEW_PR_TITLE_RE.finditer(text)]
+    if not spans:
+        return text
+    chars = list(text)
+    for start, end in spans:
+        for i in range(start, end):
+            chars[i] = " "
+    return "".join(chars)
+
+
+def _resolve_card_pr_keys(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                          title: Optional[str], body: Optional[str]) -> tuple[set[str], bool]:
+    """``(keys, ambiguous)`` for the PR a card is about.
+
+    Resolution order: a repo-qualified PR reference in the TITLE always decides,
+    full stop. Only when the title names none do we fall back to a bare ``PR #n``
+    on the card (title or body), confirmed ONLY by a STRUCTURAL source: a full PR
+    URL (someone pasted the actual link) or a parent card's own resolved PR key
+    (system-maintained linkage). A purely textual ``repo PR #n`` body mention is
+    never enough to confirm a bare number on its own: free-form prose can
+    coincidentally (or adversarially) cite an unrelated PR that happens to share
+    the same bare number as the one in the title -- that is exactly the
+    misattribution round-2 finding F1 caught (``_resolve_card_pr_keys(None, None,
+    "Review PR #329", "See unrelated other-repo PR #329 for context.")`` used to
+    resolve to ``{'other-repo#329'}`` non-ambiguously). When the card names no
+    bare number at all, a single repo-qualified body mention (URL or textual) is
+    safe because nothing else on the card could disagree with it.
+
+    ``ambiguous`` is True when nothing resolves to exactly one PR but the card still
+    names a PR number -- the review cost gate blocks such a card instead of letting it
+    run uncapped (2026-10-18 owner rule: a specifier rewrite to "Review PR #329" with
+    no repo had silently dropped the per-PR round cap)."""
+    t = _kb._lossy_text(title) or ""
+    title_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    title_keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if title_keys:
+        return title_keys, False
+    b = _kb._lossy_text(body) or ""
+    nums = set(_BARE_PR_REF_RE.findall(_unconsumed_text(t)))
+    nums |= set(_BARE_PR_REF_RE.findall(_unconsumed_text(b)))
+    url_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    textual_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    body_keys = url_keys | textual_keys
+    parent_keys: set[str] = set()
+    if conn is not None and task_id:
+        try:
+            for p in conn.execute(
+                "SELECT t.title, t.body FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                "WHERE l.child_id = ?", (task_id,),
+            ).fetchall():
+                parent_keys |= _card_pr_keys(p[0], p[1]) or _body_repo_pr_keys(p[1])
+        except sqlite3.Error:
+            parent_keys = set()
+    if not nums:
+        # No PR number on the card itself: parents only say what the card came FROM
+        # (e.g. a review of a NEW redo PR whose parent names the old PR), so they never
+        # pin a PR here. A lone repo-qualified body mention still does.
+        return (body_keys, False) if len(body_keys) == 1 else (set(), bool(body_keys))
+    strong = {k for k in (url_keys | parent_keys) if k.rsplit("#", 1)[1] in nums}
+    if len(strong) == 1:
+        return strong, False
+    return set(), True
+
+
+def _match_card_pr_keys(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                         title: Optional[str], body: Optional[str]) -> set[str]:
+    """Best-effort PR keys for MATCHING a card against an already-known PR --
+    used only for historical round-counting (``_review_verdict_runs``) and
+    duplicate-review detection, NEVER for admitting a new card.
+
+    Round-3 finding F4 (MAJOR): round-2's F1 tightening correctly makes
+    ``_resolve_card_pr_keys`` refuse to ADMIT a bare-title/textual-body card
+    on the strength of a textual body mention alone, but using that same
+    strict result to match HISTORY silently dropped a legacy card's prior
+    verdict run out of the round-cap and duplicate-review accounting the
+    moment a later, repo-qualified card named the same PR (measured: 91 live
+    cards flipped resolved -> ambiguous, 5 PR/profile round counts crossed
+    their cap boundary). A textual-only body mention counts here even though
+    it never confirms a bare number for admission.
+
+    Round-4 finding F5 (MAJOR): the nums-present branch below used to return
+    the FULL union of URL/textual/parent candidates for a confirmed number
+    with no check that they agree on one repo, unlike ``_resolve_card_pr_keys``
+    (which goes ambiguous on >1 distinct candidate). A card body with two
+    DISAGREEING repo-qualified mentions of the same bare number -- e.g. a
+    follow-up card naming its own PR plus an unrelated "see also" link that
+    happens to share the number -- returned BOTH keys, letting one historical
+    run double-count toward two different PRs' round caps or falsely trip
+    ``duplicate_review_running`` for either. Now rejects (returns ``set()``)
+    whenever the confirmed candidates disagree, same as the admission resolver."""
+    t = _kb._lossy_text(title) or ""
+    title_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
+    title_keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if title_keys:
+        return title_keys
+    b = _kb._lossy_text(body) or ""
+    nums = set(_BARE_PR_REF_RE.findall(_unconsumed_text(t)))
+    nums |= set(_BARE_PR_REF_RE.findall(_unconsumed_text(b)))
+    url_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(b)}
+    textual_keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(b)}
+    body_keys = url_keys | textual_keys
+    parent_keys: set[str] = set()
+    if conn is not None and task_id:
+        try:
+            for p in conn.execute(
+                "SELECT t.title, t.body FROM task_links l JOIN tasks t ON t.id = l.parent_id "
+                "WHERE l.child_id = ?", (task_id,),
+            ).fetchall():
+                parent_keys |= _card_pr_keys(p[0], p[1])
+        except sqlite3.Error:
+            parent_keys = set()
+    if not nums:
+        return body_keys if len(body_keys) == 1 else set()
+    url_keys_f = {k for k in url_keys if k.rsplit("#", 1)[1] in nums}
+    textual_keys_f = {k for k in textual_keys if k.rsplit("#", 1)[1] in nums}
+    parent_keys_f = {k for k in parent_keys if k.rsplit("#", 1)[1] in nums}
+    candidates = url_keys_f | textual_keys_f | parent_keys_f
+    return candidates if len(candidates) == 1 else set()
+
+
+def _card_matches_pr(conn: Optional[sqlite3.Connection], task_id: Optional[str],
+                     title: Optional[str], body: Optional[str], keys: set[str]) -> bool:
+    """Whether a card is about one of ``keys`` -- for HISTORY matching only (round
+    counting, duplicate detection), never for admitting a card.
+
+    Counting must be inclusive: an under-count silently lets a capital PR exceed the
+    owner's round cap, an over-count only hands the decision to the owner early.
+    Beyond ``_match_card_pr_keys`` (repo-qualified title, or a bare number confirmed
+    by a URL / parent / textual ``repo PR #n``), a card also matches ``repo#n`` when
+    its TITLE names ``PR #n`` and either the title names the repo or the body has
+    that exact ``repo PR #n`` / URL, e.g. legacy
+    titles like "Review PR #94 for external-data-service ..." or
+    "Review PR #47: candle-api ...", which name the repo AFTER the number."""
+    if _match_card_pr_keys(conn, task_id, title, body) & keys:
+        return True
+    t = _kb._lossy_text(title) or ""
+    b = _kb._lossy_text(body) or ""
+    # The PR number must be in the TITLE (bodies cite other PRs in passing). Raw
+    # scan, not ``_unconsumed_text``: a pseudo-repo like "Re-review PR #304" is
+    # consumed by the title regex as ``re-review#304`` and must not hide the 304.
+    title_nums = set(_BARE_PR_REF_RE.findall(t)) | {n for _r, n in _REVIEW_PR_TITLE_RE.findall(t)}
+    if not title_nums:
+        return False
+    body_keys = _body_repo_pr_keys(b)
+    tl = t.lower()
+    for k in keys:
+        repo, n = k.rsplit("#", 1)
+        if n not in title_nums or not repo:
+            continue
+        # Round-4 F5 (MAJOR, same class as ``_match_card_pr_keys``): body_keys is an
+        # unconditional union over the whole body, so two DISAGREEING repo-qualified
+        # mentions of the same number (this PR plus an unrelated "see also" link
+        # sharing the number) must not let EITHER side match -- only trust the body
+        # when it names exactly one repo for this number.
+        same_num = {bk for bk in body_keys if bk.rsplit("#", 1)[1] == n}
+        if same_num == {k}:
+            return True
+        if re.search(rf"(?<![\w.-])(?:etoro-)?{re.escape(repo)}(?![\w-])", tl):
+            return True  # repo named in the title, e.g. after the number
+    return False
+
+
+def _is_capital_review(task) -> bool:
+    title = _kb._lossy_text(getattr(task, "title", "")) or ""
+    body = (_kb._lossy_text(getattr(task, "body", "")) or "")[:4000]
+    if _CAPITAL_MARKER_RE.search(title) or _CAPITAL_MARKER_RE.search(body):
+        return True
+    repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
+    return any(r in _CAPITAL_REPOS for r in repos)
+
+
+def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
+    """Real verdict runs by ``profile`` on any card about the same PR, oldest first.
+
+    Returns full rows (including ``metadata``) so callers can read the structured
+    findings a prior round stored there (Rule 3 delta review)."""
+    nums = sorted({k.rsplit("#", 1)[1] for k in keys})
+    if not nums:
+        return []
+    # both patterns against title AND body: a full PR URL in the title used to be
+    # filtered out here (only the body was searched for "/pull/N").
+    like = " OR ".join(["t.title LIKE ? OR t.body LIKE ? OR t.title LIKE ? OR t.body LIKE ?"] * len(nums))
+    since = int(time.time()) - _REVIEW_LOOKBACK_SECONDS if _REVIEW_LOOKBACK_SECONDS else 0
+    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, since]
+    for n in nums:
+        params += [f"%#{n}%", f"%/pull/{n}%", f"%/pull/{n}%", f"%#{n}%"]
+    rows = conn.execute(
+        "SELECT r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
+        "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
+        "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
+        "AND r.outcome IN ('completed', 'changes_requested', 'blocked', 'review_requested') "
+        "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
+        f"AND ({like}) ORDER BY r.ended_at",
+        params,
+    ).fetchall()
+    return [r for r in rows if _card_matches_pr(conn, r["task_id"], r["title"], r["body"], keys)]
+
+
+def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) -> int:
+    """When the card last (re)entered a spawnable lane: a card that went back to
+    the dev and returned must not look older than the verdict that sent it back."""
+    row = conn.execute(
+        "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind IN "
+        "('created', 'review_requested', 'changes_requested', 'promoted', 'unblocked', "
+        "'status', 'assigned', 'review_reopened')",
+        (task_id,),
+    ).fetchone()
+    return max(int(created_at or 0), int((row["t"] if row else 0) or 0))
+
+
+def _block_review_for_owner(conn: sqlite3.Connection, task_id: str, status: str, reason: str) -> None:
+    # block_task only transitions running/ready; a review-lane card is parked
+    # in ready first so the owner's unblock returns it to a spawnable lane.
+    if status == "review":
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'review'", (task_id,))
+    _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+
+
+def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool) -> Optional[str]:
+    """Return a skip reason for a review-gate spawn that would waste a paid
+    review, else None. Fails open (None) on any error: this is a cost control,
+    not a safety check."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT title, body, created_at, status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        keys, ambiguous = _resolve_card_pr_keys(conn, task_id, row["title"], row["body"])
+        if not keys:
+            if not ambiguous:
+                return None  # not about a PR at all (design note, audit, ...)
+            if not dry_run:
+                _block_review_for_owner(
+                    conn, task_id, row["status"],
+                    f"Review PR reference is ambiguous: {assignee} card names a PR number but no "
+                    "repo, PR URL or single-PR parent, so the per-PR review round cap cannot be "
+                    "applied. Put 'repo PR #N' or the github.com/.../pull/N URL in the title, "
+                    "then unblock.",
+                )
+            return "review_pr_ambiguous"
+        pr = sorted(keys)[0]
+        # 1. Another card for the same PR is being reviewed by this gate right now.
+        for other in conn.execute(
+            "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
+            (task_id, assignee),
+        ).fetchall():
+            if _card_matches_pr(conn, other["id"], other["title"], other["body"], keys):
+                return "duplicate_review_running"
+        runs = _review_verdict_runs(conn, assignee, keys)
+        # 2. This gate already gave a verdict on this PR after this card entered its lane.
+        entered = _lane_entry_time(conn, task_id, row["created_at"])
+        newer = [r for r in runs if r["task_id"] != task_id and int(r["ended_at"]) > entered]
+        if newer:
+            if not dry_run:
+                _kb.add_comment(
+                    conn, task_id, "dispatcher",
+                    f"Duplicate review card: {assignee} already reviewed {pr} after this card was "
+                    f"queued (card {newer[-1]['task_id']}). Archived so the same round is not paid "
+                    "for twice. Unarchive it if it asks for something different.",
+                )
+                _kb.archive_task(conn, task_id)
+            return "duplicate_review_superseded"
+        # 3. Round cap: the owner decides whether a further round is worth it.
+        cap = _REVIEW_ROUND_CAP_BY_PR.get(str(pr).lower(), _REVIEW_ROUND_CAP)
+        if len(runs) < cap:
+            return None
+        unblocked = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'unblocked'",
+            (task_id,),
+        ).fetchone()
+        capped = conn.execute(
+            "SELECT MAX(created_at) AS t FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+            "AND payload LIKE ?",
+            (task_id, f"%{_REVIEW_CAP_MARKER}%"),
+        ).fetchone()
+        ok_at = int((unblocked["t"] if unblocked else 0) or 0)
+        cap_at = int((capped["t"] if capped else 0) or 0)
+        if cap_at and ok_at >= cap_at and not any(int(r["started_at"]) >= ok_at for r in runs):
+            return None  # owner unblocked after the cap: exactly one more round
+        if not dry_run:
+            _block_review_for_owner(
+                conn, task_id, row["status"],
+                f"Review round cap: {assignee} already gave {len(runs)} verdicts on {pr} "
+                f"(cap {cap}, owner directive: stop after {cap} rounds). Unblock this "
+                "card to allow ONE more round, or decide merge/close with the residual findings.",
+            )
+        return "review_round_cap"
+    except Exception as exc:  # pragma: no cover - cost gate must never stop the dispatcher
+        _kb._log.warning("review cost gate skipped for %s: %s", task_id, exc)
+        return None
+# --- end review cost gate -----------------------------------------------------
+
+
+# --- Rule 3: structured findings + delta-only review after round 1 ------------
+# (ADR "review-loop convergence", card t_f526b652). Findings are stored by the
+# reviewer/release-reviewer SOUL in each verdict run's ``task_runs.metadata`` as
+# ``{"findings": [{"id", "severity", "file", "line", "status"}, ...], "reviewed_sha": "..."}``.
+_BLOCKING_SEVERITIES = {"MAJOR", "CRITICAL", "BLOCKER"}
+
+
+def _findings_from_metadata(metadata: Optional[str]) -> list:
+    """Parse the ``findings`` list a verdict run stored in its ``metadata``.
+    Empty on any parse failure or absence -- advisory data, never load-bearing."""
+    meta = _kb._json_dict(metadata) if metadata else {}
+    findings = meta.get("findings")
+    return findings if isinstance(findings, list) else []
+
+
+def should_block_on_findings(findings: list) -> bool:
+    """Round >= 2 blocking rule: only a MAJOR-or-higher finding blocks approval.
+    MINOR/NIT are advisory, surfaced in the PR comment but never blocking."""
+    # decision 312: findings may be stored as plain strings ("MAJOR: file:line ..."); read the
+    # leading severity word from those instead of raising AttributeError.
+    def _sev(f) -> str:
+        if isinstance(f, dict):
+            return str(f.get("severity", "")).upper()
+        m = re.match(r"\s*\[?([A-Za-z]+)", str(f))
+        return m.group(1).upper() if m else ""
+    return any(_sev(f) in _BLOCKING_SEVERITIES for f in findings)
+
+
+def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Round >= 2 handoff text: the SHA the prior verdict reviewed plus the prior
+    findings' open/addressed status -- NEVER a "review it all again" instruction.
+    Returns None on round 1 (no prior verdict yet on this PR), so the caller falls
+    back to a normal full review."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    keys, _ambiguous = _resolve_card_pr_keys(conn, task_id, row["title"], row["body"])
+    if not keys:
+        return None
+    runs = _review_verdict_runs(conn, assignee, keys)
+    if not runs:
+        return None  # round 1: no prior verdict, do a normal full review
+    prior = runs[-1]
+    meta = _kb._json_dict(prior["metadata"]) if prior["metadata"] else {}
+    since_sha = meta.get("reviewed_sha")
+    findings = _findings_from_metadata(prior["metadata"])
+    lines = [
+        "Round >= 2 review: this gate already gave a verdict on this PR. Review ONLY the "
+        "diff since the prior verdict's reviewed SHA plus the prior findings below -- do "
+        "not re-review the whole PR from scratch.",
+    ]
+    if since_sha:
+        lines.append(f"Diff since reviewed SHA: {since_sha}")
+    if findings:
+        lines.append("Prior findings (mark each addressed/open in your verdict):")
+        for f in findings:
+            if not isinstance(f, dict):  # decision 312: plain-string finding = the finding's text
+                lines.append(f"- {str(f).strip()}")
+                continue
+            lines.append(
+                f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} "
+                f"{f.get('id', '')} -- {f.get('status', 'open')}"
+            )
+        lines.append(
+            "Only a MAJOR-or-higher finding may block approval; MINOR/NIT are advisory, "
+            "not blocking -- say so explicitly in the PR comment."
+        )
+    else:
+        lines.append("No prior findings were recorded.")
+    return "\n".join(lines)
+
+
+# --- Rule 5: fallback model for low-risk/text-only review PRs -----------------
+_LOW_RISK_PATH_RE = re.compile(
+    r"(^|/)(docs/|tests/)|\.md$|(^|/)\.github/workflows/|(^|/)\.github/[^/]*\.ya?ml$",
+    re.IGNORECASE,
+)
+_SMALL_PR_LINES = 30  # reuse release-reviewer SOUL.md's existing small_pr threshold
+
+
+def _is_low_risk_review(task, pr_meta: dict) -> bool:
+    """True only for a non-capital, docs/tests/CI-only, small PR -- the ONLY class
+    the dispatcher may ever substitute a fallback model for (Rule 5). Capital-sensitive
+    PRs never qualify, regardless of size or file list -- hard rule, unchanged."""
+    if _is_capital_review(task):
+        return False
+    files = pr_meta.get("files") or []
+    if not files:
+        return False  # unknown file list: fail closed, never low-risk
+    if not all(_LOW_RISK_PATH_RE.search(f) for f in files):
+        return False
+    if any(marker in f.lower() for f in files for marker in _CAPITAL_DENY_SUBSTRINGS):
+        return False
+    additions = int(pr_meta.get("additions") or 0)
+    deletions = int(pr_meta.get("deletions") or 0)
+    return (additions + deletions) <= _SMALL_PR_LINES
+
+
+def _required_gate_unavailable(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
+    """The exact error text when the latest run against this task's REQUIRED gate
+    model is CONFIRMED unavailable (quota/429, auth revoked, infra refusal) -- never
+    merely slow (OWNER-RULES #3). None when the gate looks reachable."""
+    row = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ? "
+        "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["outcome"] not in ("spawn_failed", "rate_limited"):
+        return None
+    if row["outcome"] == "spawn_failed" and not _kb._json_dict(row["metadata"]).get("infrastructure"):
+        return None
+    return _kb._lossy_text(row["error"]) or row["outcome"]
+
+
+def _review_fallback_model() -> Optional[tuple]:
+    """``auxiliary.review_fallback`` (model, provider), or None when unset."""
+    try:
+        from hermes_cli.config_effective import load_user_config_effective
+        cfg = (load_user_config_effective(fail_closed=True) or {}).get("auxiliary", {})
+        fallback = cfg.get("review_fallback") or {}
+    except Exception:
+        return None
+    model = (fallback.get("model") or "").strip()
+    if not model:
+        return None
+    provider = (fallback.get("provider") or "").strip()
+    if not provider or provider == "auto":
+        provider = "anthropic"
+    return (model, provider)
+
+
+def _maybe_review_fallback_model(conn: sqlite3.Connection, task, assignee: str,
+                                  pr_meta: Optional[dict] = None) -> Optional[tuple]:
+    """Rule 5: only for a low-risk review PR, only when the REQUIRED gate model is
+    confirmed unavailable, substitute ``auxiliary.review_fallback`` and disclose it
+    on the card. Capital-sensitive PRs never fall back -- enforced by
+    ``_is_low_risk_review`` itself, not re-checked here."""
+    if assignee not in _REVIEW_GATE_PROFILES:
+        return None
+    if not _is_low_risk_review(task, pr_meta or {}):
+        return None
+    err = _required_gate_unavailable(conn, getattr(task, "id", None))
+    if err is None:
+        return None
+    fallback = _review_fallback_model()
+    if fallback is None:
+        return None
+    _kb.add_comment(
+        conn, task.id, "dispatcher",
+        f"Review gate model unavailable ({err}); this low-risk PR (docs/tests/CI-only, "
+        f"<= {_SMALL_PR_LINES} changed lines) ran on the configured fallback "
+        f"`{fallback[0]}` instead -- owner, please read the diff.",
+    )
+    return fallback
+# --- end Rules 3 & 5 -----------------------------------------------------------
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
