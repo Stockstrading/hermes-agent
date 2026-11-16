@@ -1409,6 +1409,14 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+# Event kinds that count as a deliberate resolution of a ``block_loop_detected``
+# escalation for ``list_tasks(exclude_block_loop=True)``: the triage sweep actually
+# promoting the card (``specified``/``decomposed``), an explicit unblock, or a
+# manual/dispatcher status move. A bare ``commented`` row is NOT in this set on
+# purpose -- a human-gated escalation must stay hidden from auto-sweeps until it is
+# actually acted on, not merely until someone leaves a comment.
+_BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "status", "archived")
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -1431,11 +1439,15 @@ def list_tasks(
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
     exclude_block_loop: bool = False,
 ) -> list[Task]:
-    """``exclude_block_loop=True`` drops tasks whose MOST RECENT ``task_events``
-    row is ``block_loop_detected`` -- a human-gated escalation that a sweep
-    (auto-decompose, auto-specify) must never re-touch. Correlated on the
-    latest event only, so a card unblocked and later re-escalated for an
-    unrelated reason (a fresh, later event) is still returned."""
+    """``exclude_block_loop=True`` drops a task that has a ``block_loop_detected``
+    event with no *resolving* event after it -- a human-gated escalation that a
+    sweep (auto-decompose, auto-specify) must never re-touch. "Resolving" is an
+    explicit allowlist (``_BLOCK_LOOP_RESOLUTION_KINDS``: the triage sweep actually
+    promoting the card, a manual status move, or an explicit unblock) -- deliberately
+    NOT "whatever event happens to land next", so a plain ``commented`` row (e.g.
+    from ``add_comment``) can never silently clear a still-unresolved escalation.
+    A card unblocked and later re-escalated for an unrelated reason (a fresh
+    ``block_loop_detected`` with no resolving event after it) is still returned."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
@@ -1451,14 +1463,22 @@ def list_tasks(
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if exclude_block_loop:
+        resolution_placeholders = \
+            ", ".join("?" for _ in _BLOCK_LOOP_RESOLUTION_KINDS)
         query += (
             " AND NOT EXISTS ("
             "   SELECT 1 FROM task_events e"
             "   WHERE e.task_id = tasks.id"
-            "     AND e.id = (SELECT MAX(id) FROM task_events e2 WHERE e2.task_id = tasks.id)"
             "     AND e.kind = 'block_loop_detected'"
+            "     AND NOT EXISTS ("
+            "       SELECT 1 FROM task_events e2"
+            "       WHERE e2.task_id = tasks.id"
+            "         AND e2.id > e.id"
+            f"         AND e2.kind IN ({resolution_placeholders})"
+            "     )"
             " )"
         )
+        params.extend(_BLOCK_LOOP_RESOLUTION_KINDS)
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
