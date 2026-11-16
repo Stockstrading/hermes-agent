@@ -2253,6 +2253,221 @@ def check_respawn_guard(
     return None
 
 
+def review_dedupe_enabled() -> bool:
+    """Whether a review-column respawn first checks :func:`_review_head_unchanged`
+    and replays a prior verdict instead of re-running the model when the PR's
+    head SHA and findings are unchanged. Default true; disable for boards
+    where every review-lane spawn must re-run regardless (code-level default
+    only — not a live config.yaml write).
+    """
+    try:
+        from hermes_cli.config import load_config
+        return bool((load_config() or {}).get("kanban", {}).get("review_dedupe", True))
+    except Exception:
+        return True
+
+
+_REVIEW_DEDUPE_PR_URL_RE = _RESPAWN_GUARD_PR_URL_RE
+
+
+def _task_pr_contract(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Most recent GitHub PR URL mentioned in any comment on ``task_id``, or
+    ``None``. Same signal :func:`check_respawn_guard`'s ``active_pr`` branch
+    uses to recognize "a PR already exists for this card" — reused here to
+    find WHICH PR a reviewer verdict is about. There is no dedicated
+    ``_card_pr_keys`` helper in this codebase; comments are the durable place
+    a worker records the PR it opened.
+    """
+    rows = conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? ORDER BY created_at DESC, id DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        match = _REVIEW_DEDUPE_PR_URL_RE.search(_kb._lossy_text(row["body"]) or "")
+        if match:
+            return match.group(0)
+    return None
+
+
+def _review_head_unchanged(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+) -> tuple[bool, Optional[dict]]:
+    """``(True, prior_verdict)`` when ``reviewer_profile``'s prior verdict on
+    this task is still current for the PR's LIVE head SHA — the caller should
+    replay it instead of spawning a fresh reviewer. Otherwise ``(False,
+    None)``: spawn for real.
+
+    Calls :func:`hermes_cli.kanban_pr_acceptance.fetch_pr_head_sha` AT MOST
+    ONCE (one live GraphQL round trip per spawn attempt). Fails open — returns
+    ``(False, None)`` — whenever anything is ambiguous: ``review_dedupe``
+    disabled, no prior verdict (first review always runs), that verdict's
+    metadata has no ``head_sha`` (old data model), no PR reference found on
+    the task, the live head SHA cannot be resolved (network/auth/private
+    repo/closed PR), the live head SHA differs from the verdict's, or a new
+    task comment landed after the verdict closed.
+
+    "No new findings" has no structured findings schema in this codebase
+    yet, so it is judged via comments, not every task event: the normal
+    re-review cycle (implementer does more work at the SAME head and calls
+    ``kanban_request_review`` again — exactly the case this guard exists
+    for) itself produces a ``review_requested`` event, a ``claimed`` event,
+    and an ``assigned`` event strictly after the prior verdict's
+    ``ended_at`` — counting those as "new activity" would make the guard
+    never fire. A durable task comment (the channel ``sdlc-review``'s own
+    procedure uses for reviewer findings and the one a human would use to
+    raise something new) is the signal actually worth failing open on.
+    False positives here (wrongly skipping a real review) are far more
+    expensive than false negatives (an extra, harmless re-review), so every
+    ambiguous branch still spawns for real.
+    """
+    if not review_dedupe_enabled():
+        return False, None
+
+    prior = conn.execute(
+        "SELECT outcome, summary, metadata, ended_at FROM task_runs "
+        "WHERE task_id = ? AND profile = ? AND outcome IN ('completed', 'changes_requested') "
+        "ORDER BY ended_at DESC, id DESC LIMIT 1",
+        (task_id, reviewer_profile),
+    ).fetchone()
+    if prior is None:
+        return False, None  # first review always runs
+
+    prior_metadata = _kb._json_dict(prior["metadata"])
+    prior_head_sha = prior_metadata.get("head_sha")
+    if not isinstance(prior_head_sha, str) or not prior_head_sha.strip():
+        return False, None  # no declared head_sha (old data model) -- spawn for real
+
+    contract = _task_pr_contract(conn, task_id)
+    if not contract:
+        return False, None  # no PR reference found -- spawn for real
+
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    live_sha = fetch_pr_head_sha(contract, assignee=reviewer_profile)
+    if not live_sha or live_sha != prior_head_sha:
+        # Unresolvable (fail CLOSED) or the head moved -- spawn for real either way.
+        return False, None
+
+    ended_at = _kb._to_epoch(prior["ended_at"])
+    if ended_at is None:
+        return False, None
+    now = int(time.time())
+    # A comment strictly after the verdict closed is treated as a possible new
+    # finding (a human, or the reviewer's own procedure, surfaces findings via
+    # comments). An unreadable timestamp counts as "newer" -- fail closed,
+    # never silently lift the dedupe.
+    if any(_rows_since(conn, "task_comments", task_id, ended_at, strict=True, unreadable=now)):
+        return False, None
+
+    return True, {
+        "summary": prior["summary"],
+        "outcome": prior["outcome"],
+        "metadata": prior_metadata,
+    }
+
+
+def _replay_review_dedupe_verdict(
+    conn: sqlite3.Connection, task_id: str, reviewer_profile: str,
+    prior_verdict: dict, head_sha: Optional[str],
+) -> bool:
+    """Resolve a review-column task WITHOUT spawning a new reviewer run: the
+    PR's head SHA and findings are unchanged since ``reviewer_profile``'s
+    prior verdict (:func:`_review_head_unchanged`), so this replays that
+    verdict's outcome by hand instead of re-running the model.
+
+    - ``completed`` replays via :func:`hermes_cli.kanban_db.complete_task` —
+      the exact same ``review -> done`` path a human review approval takes
+      (``kanban_db.py`` ~2660; it already accepts ``review`` with no active
+      claim and synthesizes the closing run itself).
+    - ``changes_requested`` has no reusable top-level function: the real
+      :func:`hermes_cli.kanban_db.request_changes` (``kanban_db.py`` ~3432)
+      requires an ACTIVE run claimed from ``review`` — there is none here,
+      since no worker ran this tick. Its ``review -> implementer`` state
+      transition is reproduced by hand below: same target status
+      (``_landing_status_after_parents``), same implementer lookup (latest
+      ``review_requested`` event), same claim-clearing columns, closed with
+      a synthesized run (:func:`hermes_cli.kanban_db._synthesize_ended_run`)
+      instead of ``_end_run`` because there is no active run to end.
+
+    Either branch appends a ``review_dedupe_replayed`` event so the board
+    shows why no new worker spawned. Returns ``True`` on a successful
+    replay; ``False`` if the task changed out from under us (caller should
+    treat this tick as a no-op — it will be retried fresh next tick).
+    """
+    summary = f"[replayed, head unchanged] {prior_verdict.get('summary') or ''}".strip()
+    metadata = prior_verdict.get("metadata") or {}
+    outcome = prior_verdict.get("outcome")
+
+    if outcome == "completed":
+        ok = _kb.complete_task(conn, task_id, summary=summary, metadata=metadata)
+        if not ok:
+            return False
+        with _kb.write_txn(conn):
+            run_row = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=int(run_row["id"]) if run_row else None,
+            )
+        return True
+
+    if outcome == "changes_requested":
+        with _kb.write_txn(conn):
+            task_row = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if task_row is None or task_row["status"] != "review":
+                return False
+            requested_event = _kb._latest_event(conn, task_id, "review_requested")
+            implementer = None
+            if requested_event is not None:
+                implementer = _kb._nonblank_str(
+                    _kb._json_dict(_kb._row_get(requested_event, "payload")).get("implementer"),
+                )
+            if implementer is None:
+                return False
+            new_status = _kb._landing_status_after_parents(conn, task_id)
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = ?,
+                       assignee = ?,
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL, worker_started_at = NULL
+                 WHERE id = ? AND status = 'review'
+                """,
+                (new_status, implementer, task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _kb._synthesize_ended_run(
+                conn, task_id, outcome="changes_requested", summary=summary, metadata=metadata,
+                profile=reviewer_profile,
+            )
+            _kb._append_event(
+                conn, task_id, "changes_requested",
+                {
+                    "reason": summary,
+                    "implementer": implementer,
+                    "reviewer": reviewer_profile,
+                    "status": new_status,
+                    "replayed": True,
+                },
+                run_id=run_id,
+            )
+            _kb._append_event(
+                conn, task_id, "review_dedupe_replayed",
+                {"head_sha": head_sha, "prior_run_outcome": outcome},
+                run_id=run_id,
+            )
+        return True
+
+    return False
+
+
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
 
 
@@ -2693,6 +2908,10 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    cost_reason = _review_cost_gate(conn, task_id, assignee, dry_run=dry_run)
+    if cost_reason is not None:
+        result.respawn_guarded.append((task_id, cost_reason))
+        return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2707,6 +2926,23 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
+
+    # Review-lane dedupe: check_respawn_guard never guards the review lane (it is
+    # the handoff's INPUT, not a duplicate-work signal — see its docstring), so this
+    # is the dedicated check for "nothing has changed since the last reviewer
+    # verdict" (#review_dedupe). Only a real check — no DB write — so dry_run can
+    # safely skip the spawn attribution below without the replay side effects.
+    if lane == "review" and not dry_run:
+        unchanged, prior_verdict = _review_head_unchanged(conn, task_id, assignee)
+        if unchanged and prior_verdict is not None:
+            head_sha = (prior_verdict.get("metadata") or {}).get("head_sha")
+            if _replay_review_dedupe_verdict(conn, task_id, assignee, prior_verdict, head_sha):
+                # Resolved without spawning a worker -- the task left ``review``
+                # (approved -> done, or changes_requested -> back to the implementer),
+                # so it is never stuck waiting for a tick that will never come.
+                return False
+            # State changed out from under us (e.g. raced with a real claim) --
+            # fall through and let the normal claim/spawn path below handle it.
 
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
@@ -2743,6 +2979,18 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+        # Rule 3: round >= 2 gets a delta-only handoff (diff since the prior
+        # verdict's SHA + prior findings open/addressed), never a full re-review.
+        delta_context = build_round_delta_context(conn, claimed.id, assignee)
+        if delta_context is not None:
+            _kb.add_comment(conn, claimed.id, "dispatcher", delta_context)
+        # Rule 5: only a low-risk (docs/tests/CI-only, small) PR, and only when the
+        # required gate model is confirmed unavailable, may run on a fallback model.
+        # Capital-sensitive PRs never fall back (_is_low_risk_review enforces it).
+        if not claimed.model_override:
+            fallback = _maybe_review_fallback_model(conn, claimed, assignee)
+            if fallback is not None:
+                claimed.model_override, claimed.provider_override = fallback
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
