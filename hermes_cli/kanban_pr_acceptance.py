@@ -18,6 +18,10 @@ from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+# Outcomes that are not failures for a check with no app pin to compare against -- only
+# used in the branch-rules-fallback path (see collect_acceptance), never for a repo-declared
+# required check (those must still resolve to an actual "success").
+_PASSING_WHEN_UNPINNED = {"neutral", "skipped"}
 
 
 def validate_contract(value: str | None) -> str:
@@ -104,6 +108,48 @@ def _assignee_profile_home(assignee: str | None) -> str | None:
         raise _GateAuthError(f"assignee profile {assignee!r} cannot be resolved") from None
 
 
+def fetch_pr_head_sha(contract: str, published_pr: str | None = None,
+                      assignee: str | None = None) -> str | None:
+    """Live head SHA for the PR named by ``contract``/``published_pr``, or ``None``.
+
+    Minimal sibling of :func:`collect_acceptance`: a single GraphQL round trip for just
+    ``headRefOid``, skipping the required-checks machinery entirely. Used by the review-dedupe
+    guard (``kanban_db_dispatch``) to decide whether a prior reviewer verdict is still current
+    -- that guard must fail CLOSED (spawn a real reviewer) whenever this cannot prove the head
+    SHA, so every failure mode here (bad contract, private repo, closed PR, network/auth error)
+    returns ``None`` rather than raising.
+    """
+    try:
+        profile_home = _assignee_profile_home(assignee)
+        declared = _PR.fullmatch(contract)
+        url = contract if declared else published_pr
+        match = _PR.fullmatch(url or "")
+        if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
+            return None
+        repo, number = match[1], int(match[2])
+        owner, name = repo.split("/")
+        query = (
+            f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{'
+            f'pullRequest(number:{number:d}){{headRefOid state}}}}}}'
+        )
+        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+        if repository is None:
+            return None
+        pr = repository.get("pullRequest")
+        if pr is None:
+            return None
+        sha = pr.get("headRefOid")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            return None
+        if pr.get("state") not in {"OPEN", "MERGED"}:
+            return None
+        return sha
+    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        # Never raise into a dispatcher tick: any resolution failure here must fail
+        # closed into "spawn for real", never into a silent skip.
+        return None
+
+
 def collect_acceptance(contract: str, published_pr: str | None,
                        assignee: str | None = None) -> dict:
     receipt = {"ok": False, "classification": "missing", "head_sha": None,
@@ -133,17 +179,20 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError:
+            # The PR itself was just read with this login, so a 403/404 on the branch-rules
+            # endpoint specifically is the plan (GitHub Free private repos expose no rules),
+            # not an identity failure -- fall back to treating every check that ran on the
+            # head as required (recorded below via required_source).
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
                     required.update((r["context"], r.get("integration_id"))
                                     for r in rule["parameters"]["required_status_checks"])
-        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
-        if not required:
-            receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
-            return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
                      paginate=True, profile_home=profile_home)
         runs = [run for page in pages for run in page["check_runs"]]
@@ -151,6 +200,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("Incomplete check-run pagination")
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
+        fallback = not required
+        if fallback:
+            required = {(r["name"], None) for r in runs} | {(s["context"], None) for s in statuses}
+            receipt["required_source"] = "fallback: all checks that ran on the head (no branch rules available on this plan)"
+        receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
+        if not required:
+            receipt["detail"] = ("No repository-required checks are configured and no checks ran on the head; "
+                                 "explicitly use a local-only contract for non-CI tasks.")
+            return receipt
         outcomes = []
         for context, app_id in sorted(required, key=str):
             matching = [r for r in runs if r["name"] == context and
@@ -165,6 +223,12 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
+                if fallback and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
+                    # A fallback-required check has no app pin to compare against, so
+                    # _classify's conservative default (infra) for an unrecognised-but-
+                    # non-failing outcome ("neutral"/"skipped") would block every fallback
+                    # repo on its own non-blocking checks; treat those as passing.
+                    classification = "success"
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
                     "url": check.get("html_url") or check.get("target_url"),
