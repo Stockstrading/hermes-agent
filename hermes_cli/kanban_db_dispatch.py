@@ -1921,7 +1921,7 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
                     "then unblock.",
                 )
             return "review_pr_ambiguous"
-        pr = sorted(keys)[0]
+        pr = min(keys)
         # 1. Another card for the same PR is being reviewed by this gate right now.
         for other in conn.execute(
             "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
