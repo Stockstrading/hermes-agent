@@ -290,6 +290,17 @@ KANBAN_REQUEST_CHANGES_SCHEMA = _schema(
                 "Specific, actionable changes the implementer must make "
                 "before requesting another review."
         )),
+        "metadata": {
+            "type": "object",
+            "description": (
+                "Optional structured facts about this verdict. Include a "
+                "``head_sha`` key (the 40-char PR head commit SHA you "
+                "reviewed) so the dispatcher can skip a redundant "
+                "re-review on a later tick when the head SHA hasn't moved "
+                "and no new findings exist."
+            ),
+            "additionalProperties": True,
+        },
     },
     ["reason"],
 )

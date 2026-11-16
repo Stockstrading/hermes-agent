@@ -455,6 +455,99 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
             event.kind == "scheduled" and event.payload == {"reason": reason}
             for event in kb.list_events(conn, worker_env)
         )
+        # The marker is a real wake-up timer, not just a human-readable note.
+        import calendar
+        expected_epoch = calendar.timegm((2026, 9, 13, 0, 0, 0))
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] == expected_epoch
+
+
+def test_schedule_without_scheduled_until_marker_leaves_resume_at_null(worker_env):
+    """Missing/unparsable ``SCHEDULED_UNTIL`` keeps the legacy park-forever
+    behaviour (``resume_at`` stays NULL) rather than guessing a wake time."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    json.loads(entry.handler({"reason": "waiting on a human to unblock"}))
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_schedule_unparsable_scheduled_until_marker_leaves_resume_at_null(worker_env):
+    """A malformed marker must never silently drop the task back to ``ready``
+    immediately — it logs and falls back to the legacy park-forever path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({"reason": "SCHEDULED_UNTIL=not-a-timestamp"}))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
+    """``kanban_request_changes`` stores an optional ``metadata`` dict (e.g.
+    ``head_sha``/``findings``) on the closed run, exactly like ``kanban_complete``;
+    it is redacted the same way request_review's metadata is."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        run_id = rclaim.current_run_id
+
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    head_sha = "a" * 40
+    out = json.loads(kt._handle_request_changes({
+        "reason": "fix the failing test",
+        "metadata": {"head_sha": head_sha, "findings": ["missing boundary test"]},
+    }))
+    assert out["ok"] is True
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.assignee) == ("ready", "dev")
+        run = kb.latest_run(conn, tid)
+        assert run.metadata == {"head_sha": head_sha, "findings": ["missing boundary test"]}
+
+
+def test_request_changes_rejects_non_dict_metadata(worker_env):
+    """A non-object ``metadata`` is a tool_error, not a silent coercion."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_request_changes({
+        "reason": "fix it", "metadata": "not-a-dict",
+    }))
+    assert "metadata" in out.get("error", "")
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
