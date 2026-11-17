@@ -536,13 +536,20 @@ def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
         ).fetchone()[0] == expected_epoch
 
 
-
 @pytest.mark.parametrize("marker", [
     "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops",
     "SCHEDULED_UNTIL=2026-11-18T06:47:00+05",
     "SCHEDULED_UNTIL=2026-11-18T06:47:00+05 waiting",
     "SCHEDULED_UNTIL=2026-11-18T06:47:00-0",
     "SCHEDULED_UNTIL=2026-11-18T06:47+oops",
+    # Space-separated form: the time must never backtrack to a date-only match.
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00+oops",
+    "SCHEDULED_UNTIL=2026-11-18 06:47+05",
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00-0",
+    "SCHEDULED_UNTIL=2026-11-18 06",
+    # Whitespace before an offset must not silently drop the offset.
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00 +05:00",
+    "SCHEDULED_UNTIL=2026-11-18 06:47 -0230 later",
 ])
 def test_parse_scheduled_until_rejects_malformed_offset(marker):
     """A malformed or partial timezone suffix must reject the marker, never be
@@ -560,6 +567,9 @@ def test_parse_scheduled_until_rejects_malformed_offset(marker):
     ("SCHEDULED_UNTIL=2026-11-18T06:47:00", (2026, 11, 18, 6, 47, 0)),
     ("SCHEDULED_UNTIL=2026-11-18 06:47", (2026, 11, 18, 6, 47, 0)),
     ("SCHEDULED_UNTIL=2026-11-18", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 later", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18.", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 06:47:00-02:30 x", (2026, 11, 18, 9, 17, 0)),
     ("wait, SCHEDULED_UNTIL=2026-11-18T06:47:00Z.", (2026, 11, 18, 6, 47, 0)),
     ("wait (SCHEDULED_UNTIL=2026-11-18T06:47:00.5+05:00)", (2026, 11, 18, 1, 47, 0)),
 ])
@@ -568,6 +578,41 @@ def test_parse_scheduled_until_keeps_valid_forms(marker, expected):
     from tools.kanban_tools import _parse_scheduled_until
 
     assert _parse_scheduled_until(marker) == calendar.timegm(expected + (0, 0, 0))
+
+
+def test_parse_scheduled_until_logs_rejection_without_reason_text(caplog):
+    """A rejected marker is logged (so a parked-forever task is diagnosable), but the
+    free-form reason text never reaches the log."""
+    import logging
+    from tools.kanban_tools import _parse_scheduled_until
+
+    reason = "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops private-note-xyz"
+    with caplog.at_level(logging.WARNING, logger="tools.kanban_tools"):
+        assert _parse_scheduled_until(reason) is None
+    warnings = [r for r in caplog.records
+                if r.name == "tools.kanban_tools" and r.levelno == logging.WARNING]
+    assert warnings, "rejected SCHEDULED_UNTIL marker must log a warning"
+    for record in warnings:
+        assert "private-note-xyz" not in record.getMessage()
+        assert "+oops" not in record.getMessage()
+
+
+def test_schedule_malformed_offset_marker_leaves_resume_at_null(worker_env):
+    """Handler level: a marker with a malformed offset parks forever (resume_at NULL),
+    never a wake timer read as UTC."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({"reason": "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops"}))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
 
 def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
     """``kanban_request_changes`` stores an optional ``metadata`` dict (e.g.
