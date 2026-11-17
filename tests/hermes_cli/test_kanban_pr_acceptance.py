@@ -230,3 +230,548 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- branch-rules 403/404 fallback: GitHub Free private repos expose no branch rules ---
+
+@pytest.fixture
+def github_no_branch_rules(tmp_path, monkeypatch):
+    """Same shape as ``github`` but the rules/branches endpoint answers 404 (no branch
+    protection configured, the GitHub Free private-repo plan), forcing the fallback path."""
+    state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                # No branchProtectionRule at all -- the declared-required-checks path is empty,
+                # so collect_acceptance must fall through to the branch-rules endpoint below.
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": None}}}}}
+            elif "/rules/branches/" in self.path:
+                self.send_error(state.get("rules_status", 404), state.get("rules_reason"))
+                return
+            elif "/check-runs" in self.path:
+                runs = [] if state.get("missing") else [
+                    {"id": 42, "name": "ci", "head_sha": sha, "app": {"id": 1},
+                     "status": "completed", "conclusion": state["conclusion"],
+                     "html_url": "https://github.com/acme/repo/actions/runs/42"},
+                ]
+                if state.get("extra_optional"):
+                    runs.append({"id": 43, "name": "optional-advisory", "head_sha": sha,
+                                 "app": {"id": 2}, "status": "completed", "conclusion": "neutral"})
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'gh: {e.reason} (HTTP {e.code})\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_404_falls_back_to_every_check_on_head(github_no_branch_rules):
+    """A 404 on rules/branches is the GitHub Free private-repo plan, not an identity failure:
+    completion still succeeds off the checks that actually ran, with required_source recorded."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-ok", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "success"
+    assert receipt["ok"] is True
+    assert "fallback" in receipt["required_source"]
+    assert {"ci"} <= {c["context"] for c in receipt["required"]}
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_404_fallback_still_fails_on_a_real_failure(github_no_branch_rules):
+    """The fallback treats ran checks as required -- it does not launder a genuine failure."""
+    github_no_branch_rules["conclusion"] = "failure"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-fail", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_404_fallback_accepts_neutral_and_skipped_unpinned_checks(github_no_branch_rules):
+    """An extra check that ran on the head but concluded neutral/skipped (no app pin to
+    compare, so _classify's conservative default is `infra`) must not block a fallback repo
+    on its own non-blocking checks."""
+    github_no_branch_rules["extra_optional"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-neutral", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "success"
+    neutral_check = next(c for c in receipt["checks"] if c["name"] == "optional-advisory")
+    assert neutral_check["classification"] == "success"
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_404_fallback_with_no_checks_at_all_stays_missing(github_no_branch_rules):
+    """No branch rules AND no checks ran on the head: nothing to fall back to, so the
+    outcome is the pre-existing 'declare local-only explicitly' guidance, not a false success."""
+    github_no_branch_rules["missing"] = True
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-empty", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "missing"
+    assert receipt["required_source"] == "fallback: all checks that ran on the head (no branch rules available on this plan)"
+    assert "local-only" in receipt["detail"]
+
+
+# --- ordinary 200 + no rules + no GraphQL protection: genuinely no CI governance declared ---
+
+@pytest.fixture
+def github_empty_rules_no_denial(tmp_path, monkeypatch):
+    """Finding 2 (#9 release-gate reject): rules/branches answers an ordinary 200 with no
+    rules configured (``[[]]``, not an exception) AND GraphQL declares no branch protection.
+    This is genuinely "no CI governance declared", not a GitHub-Free-plan denial -- it must
+    stay the pre-PR ``ok: false`` / local-only-contract outcome even though a check ran."""
+    state = {"conclusion": "success", "head": "a" * 40, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": None}}}}}
+            elif "/rules/branches/" in self.path:
+                value = [[]]  # ordinary 200, no exception -- not the Free-plan 403/404 shape
+            elif "/check-runs" in self.path:
+                runs = [{"id": 42, "name": "ci", "head_sha": sha, "app": {"id": 1},
+                         "status": "completed", "conclusion": state["conclusion"],
+                         "html_url": "https://github.com/acme/repo/actions/runs/42"}]
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_empty_rules_no_denial_stays_ok_false_even_though_a_check_ran(github_empty_rules_no_denial):
+    """Finding 2 (#9 release-gate reject): an ordinary 200 from rules/branches with no rules
+    configured, and no GraphQL branch protection, must never promote 'whatever ran' into
+    'required'. Pre-fix this returned ok=True off a repo with zero declared CI governance --
+    the exact regression the release gate flagged against the 403/404-only carve-out."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="no-governance", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["required"] == []
+    assert "required_source" not in receipt
+    assert "local-only" in receipt["detail"]
+
+
+# --- an unpinned but genuinely declared required check is never fallback-origin ---
+
+@pytest.fixture
+def github_unpinned_required_no_denial(tmp_path, monkeypatch):
+    """PR #9 gate-2 finding: GraphQL declares a real required check (``ci-required``) with
+    no app pin (``app: null`` -- an ordinary unpinned branch-protection config), rules/branches
+    answers an ordinary 200 (no exception, no fallback at all), and the check's only run
+    concludes ``skipped``. The neutral/skipped carve-out must NOT fire here -- it is scoped to
+    checks whose required-ness came from the branch-rules-denied fallback, never to a
+    repo-declared required check just because it happens to have no app pin."""
+    state = {"conclusion": "skipped", "head": "a" * 40, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                        {"context": "ci-required", "app": None}]}}}}}}
+            elif "/rules/branches/" in self.path:
+                value = [[]]  # ordinary 200, no exception -- not the Free-plan 403/404 shape
+            elif "/check-runs" in self.path:
+                runs = [{"id": 42, "name": "ci-required", "head_sha": sha, "app": {"id": 9},
+                         "status": "completed", "conclusion": state["conclusion"],
+                         "html_url": "https://github.com/acme/repo/actions/runs/42"}]
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_unpinned_declared_required_check_skipped_is_not_laundered(github_unpinned_required_no_denial):
+    """No denial, no fallback, a genuinely declared required check with no app pin: a
+    ``skipped`` conclusion must stay ``infra`` (and the completion must fail), never be
+    waved through by the fallback-only neutral/skipped carve-out."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="unpinned-declared", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "required_source" not in receipt
+    check = next(c for c in receipt["checks"] if c["name"] == "ci-required")
+    assert check["classification"] == "infra"
+
+
+# --- branch-rules denial must never launder a check GraphQL did not already know about ---
+
+@pytest.fixture
+def github_required_rules_denied(tmp_path, monkeypatch):
+    """GraphQL branch protection already declares >=1 required check (``required``,
+    success), AND a second real check (``other-ci``) ran on the head and failed, AND the
+    rules/branches REST endpoint is denied. The denial must never make ``other-ci``
+    disappear: a repo with real CI governance cannot have a failing check silently
+    laundered just because the rulesets endpoint is inaccessible."""
+    state = {"conclusion": "failure", "head": "a" * 40, "status_code": 403, "requests": []}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            sha = state["head"]
+            if self.path == "/graphql":
+                value = {"data": {"repository": {"pullRequest": {
+                    "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
+                    "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
+                        {"context": "required", "app": {"databaseId": 1}}]}}}}}}
+            elif "/rules/branches/" in self.path:
+                self.send_error(state["status_code"], state.get("reason"))
+                return
+            elif "/check-runs" in self.path:
+                runs = [
+                    {"id": 1, "name": "required", "head_sha": sha, "app": {"id": 1},
+                     "status": "completed", "conclusion": "success",
+                     "html_url": "https://github.com/acme/repo/actions/runs/1"},
+                    {"id": 2, "name": "other-ci", "head_sha": sha, "app": {"id": 2},
+                     "status": "completed", "conclusion": state["conclusion"],
+                     "html_url": "https://github.com/acme/repo/actions/runs/2"},
+                ]
+                value = [{"total_count": len(runs), "check_runs": runs}]
+            elif "/statuses" in self.path:
+                value = [[]]
+            elif "/pulls/" in self.path:
+                value = {"head": {"sha": sha}, "base": {"ref": "main"}, "state": "open"}
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
+                  f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
+                  "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'gh: {e.reason} (HTTP {e.code})\\n'); sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_denied_rules_never_launders_a_failed_check(github_required_rules_denied):
+    """Finding 1 (#9 release-gate reject): GraphQL already declares 'required' required and
+    passing; rules/branches is denied (403); 'other-ci' also ran on the same head and failed.
+    Pre-fix this returned ok=True (the denial silently dropped whatever rules/branches would
+    have required, and 'fallback' never engaged because the merged required set was non-empty).
+    The fix must catch 'other-ci' by merging the fallback ran-checks set additively."""
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-real-failure", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "failure"
+    assert {"required", "other-ci"} <= {c["context"] for c in receipt["required"]}
+    failed = next(c for c in receipt["checks"] if c["name"] == "other-ci")
+    assert failed["classification"] == "failure"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_denied_rules_still_succeeds_when_everything_passed(github_required_rules_denied):
+    """Same denial shape, but both checks that ran actually passed: completion must still
+    succeed -- the fix must not turn every rules/branches denial into a false failure."""
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-all-pass", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_rules_401_fails_closed_not_laundered(github_required_rules_denied):
+    """Finding 2/4: a 401 (or rate-limited 403) on rules/branches is an identity/infra problem
+    on the SAME login that just read the PR fine -- it must fail closed (classification
+    'auth'), never be treated as 'this plan has no rulesets configured'."""
+    github_required_rules_denied["status_code"] = 401
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-401", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+
+
+
+_RATE_LIMITED = "API rate limit exceeded for user ID 1"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_rate_limited_403_rules_fails_closed(github_required_rules_denied):
+    """A rate-limited 403 on rules/branches is a transient API limit, not the GitHub Free
+    plan's "no branch rules" denial: it must never take the ran-checks fallback, even when
+    every check that ran passed -- the gate fails closed (infra, retry later)."""
+    github_required_rules_denied["reason"] = _RATE_LIMITED
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-rate-limited", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "required_source" not in receipt
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize(("status", "reason"), [
+    (403, _RATE_LIMITED),
+    (403, "You have exceeded a secondary rate limit"),
+    # Legacy secondary-limit wording: no "rate limit" in it, still a transient limit.
+    (403, "You have triggered an abuse detection mechanism"),
+    # Secondary limits can also answer 429.
+    (429, "You have exceeded a secondary rate limit"),
+])
+def test_branch_rules_rate_limited_403_never_takes_fallback(github_no_branch_rules, status, reason):
+    """No GraphQL protection + a rate-limited 403/429 on rules/branches: pre-fix this was read as
+    the Free-plan denial and every ran check became "required" (fail open). It must fail closed."""
+    github_no_branch_rules["rules_status"] = status
+    github_no_branch_rules["rules_reason"] = reason
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-rate-limited", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "required_source" not in receipt
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_plain_403_still_takes_fallback(github_no_branch_rules):
+    """A genuine (non-rate-limited) Free-plan 403 keeps the documented fallback."""
+    github_no_branch_rules["rules_status"] = 403
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-403", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "success"
+    assert "fallback" in receipt["required_source"]
+
+# --- fetch_pr_head_sha: fail-closed on every ambiguous case ---
+
+def test_fetch_pr_head_sha_returns_live_head_on_success(github):
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    sha = fetch_pr_head_sha("https://github.com/acme/repo/pull/7")
+    assert sha == "a" * 40
+
+
+def test_fetch_pr_head_sha_fails_closed_on_malformed_contract(github):
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    assert fetch_pr_head_sha("not-a-pr-or-repo") is None
+    assert fetch_pr_head_sha("acme/repo") is None  # bare OWNER/REPO has no PR number to resolve
+
+
+def test_fetch_pr_head_sha_fails_closed_on_mismatched_published_pr(github):
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7",
+                             published_pr="https://github.com/acme/repo/pull/9") is None
+
+
+def test_fetch_pr_head_sha_fails_closed_on_private_repo_or_closed_pr(tmp_path, monkeypatch):
+    """Null repository (no read access) and a repository with no matching PR both return
+    None -- the review-dedupe guard must fall back to spawning a real reviewer, never skip one."""
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport json\n"
+                  "print(json.dumps({'data': {'repository': None}}))\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None
+
+
+def test_fetch_pr_head_sha_fails_closed_on_gh_error(tmp_path, monkeypatch):
+    """A gh subprocess failure (network, auth) must never raise into the dispatcher tick."""
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None
+
+
+def test_fetch_pr_head_sha_fails_closed_on_rate_limited_gh_error(tmp_path, monkeypatch):
+    """A rate-limited gh call raises ``_GateRateLimitError`` inside ``_api``; fetch_pr_head_sha
+    must swallow it and return None (spawn a real reviewer), never raise into the tick."""
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\n"
+                  "sys.stderr.write('gh: API rate limit exceeded for user ID 1 (HTTP 403)\\n')\n"
+                  "sys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None
