@@ -44,6 +44,11 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
                                 text=True, encoding="utf-8", errors="replace", timeout=30,
                                 check=True, env=_gh_env(profile_home))
     except subprocess.CalledProcessError as exc:
+        # A rate-limited 403/429 ("API rate limit exceeded" / "secondary rate limit") is a
+        # transient API limit, never an access denial: checked first so it can never be read
+        # as the GitHub-Free-plan "branch rules unavailable" 403 and take the fallback.
+        if re.search(r"rate limit", exc.stderr or "", re.IGNORECASE):
+            raise _GateRateLimitError(f"rate limited on {endpoint.split('?')[0]}") from None
         # 401/403/404 = the login cannot see this repository (wrong profile identity
         # or missing grant), not a transient API failure. Persist only the status
         # code + endpoint, never gh's stderr (credentials/host details).
@@ -63,6 +68,12 @@ class _GateAuthError(RuntimeError):
     """gh was refused at HTTP 401/403/404 (or GraphQL returned no repository):
     this profile's login cannot see the repo — an identity problem to fix, not
     an infrastructure blip to retry."""
+
+
+class _GateRateLimitError(RuntimeError):
+    """gh was rate limited (primary or secondary limit): transient, retry later.
+    Deliberately NOT a ``_GateAuthError`` so the branch-rules denial fallback never
+    catches it -- the acceptance gate fails closed (``infra``) instead."""
 
 
 def _resolve_contract_pr(contract: str, published_pr: str | None) -> tuple[re.Match[str], str | None] | None:
@@ -159,8 +170,8 @@ def fetch_pr_head_sha(contract: str, published_pr: str | None = None,
         if pr.get("state") not in {"OPEN", "MERGED"}:
             return None
         return sha
-    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
-            IndexError, AttributeError):
+    except (_GateAuthError, _GateRateLimitError, OSError, subprocess.SubprocessError, ValueError,
+            KeyError, TypeError, IndexError, AttributeError):
         # Never raise into a dispatcher tick: any resolution failure here must fail
         # closed into "spawn for real", never into a silent skip. AttributeError covers a
         # malformed GraphQL shape (e.g. {"data": {"repository": []}}) where .get()/dict
@@ -310,7 +321,9 @@ def collect_acceptance(contract: str, published_pr: str | None,
                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
         return receipt
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+    except (_GateRateLimitError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError,
+            IndexError):
+        # A rate limit lands here too (fail closed as infra), never in the denial fallback.
         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
         receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
         return receipt

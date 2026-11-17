@@ -251,7 +251,7 @@ def github_no_branch_rules(tmp_path, monkeypatch):
                     "headRefOid": sha, "baseRefName": "main", "state": "OPEN",
                     "baseRef": {"branchProtectionRule": None}}}}}
             elif "/rules/branches/" in self.path:
-                self.send_error(404)
+                self.send_error(state.get("rules_status", 404), state.get("rules_reason"))
                 return
             elif "/check-runs" in self.path:
                 runs = [] if state.get("missing") else [
@@ -286,7 +286,7 @@ def github_no_branch_rules(tmp_path, monkeypatch):
     gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
                   "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
-                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'gh: {e.reason} (HTTP {e.code})\\n'); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -546,7 +546,7 @@ def github_required_rules_denied(tmp_path, monkeypatch):
                     "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
                         {"context": "required", "app": {"databaseId": 1}}]}}}}}}
             elif "/rules/branches/" in self.path:
-                self.send_error(state["status_code"])
+                self.send_error(state["status_code"], state.get("reason"))
                 return
             elif "/check-runs" in self.path:
                 runs = [
@@ -581,7 +581,7 @@ def github_required_rules_denied(tmp_path, monkeypatch):
     gh.write_text(f"#!{sys.executable}\nimport sys,urllib.request,urllib.error\n"
                   f"u='http://127.0.0.1:{server.server_port}/'+sys.argv[2]\n"
                   "try:\n    print(urllib.request.urlopen(u).read().decode())\n"
-                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'HTTP {e.code}\\n'); sys.exit(1)\n")
+                  "except urllib.error.HTTPError as e:\n    sys.stderr.write(f'gh: {e.reason} (HTTP {e.code})\\n'); sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
@@ -648,6 +648,63 @@ def test_graphql_required_plus_rules_401_fails_closed_not_laundered(github_requi
             (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
 
+
+
+_RATE_LIMITED = "API rate limit exceeded for user ID 1"
+
+
+@pytest.mark.platforms("linux")
+def test_graphql_required_plus_rate_limited_403_rules_fails_closed(github_required_rules_denied):
+    """A rate-limited 403 on rules/branches is a transient API limit, not the GitHub Free
+    plan's "no branch rules" denial: it must never take the ran-checks fallback, even when
+    every check that ran passed -- the gate fails closed (infra, retry later)."""
+    github_required_rules_denied["reason"] = _RATE_LIMITED
+    github_required_rules_denied["conclusion"] = "success"
+    with connect() as conn:
+        tid = kb.create_task(conn, title="denied-rules-rate-limited", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        assert kb.get_task(conn, tid).status != "done"
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "required_source" not in receipt
+
+
+@pytest.mark.platforms("linux")
+@pytest.mark.parametrize("reason", [_RATE_LIMITED, "You have exceeded a secondary rate limit"])
+def test_branch_rules_rate_limited_403_never_takes_fallback(github_no_branch_rules, reason):
+    """No GraphQL protection + a rate-limited 403 on rules/branches: pre-fix this was read as
+    the Free-plan denial and every ran check became "required" (fail open). It must fail closed."""
+    github_no_branch_rules["rules_status"] = 403
+    github_no_branch_rules["rules_reason"] = reason
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-rate-limited", completion_contract="acme/repo")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "infra"
+    assert "required_source" not in receipt
+
+
+@pytest.mark.platforms("linux")
+def test_branch_rules_plain_403_still_takes_fallback(github_no_branch_rules):
+    """A genuine (non-rate-limited) Free-plan 403 keeps the documented fallback."""
+    github_no_branch_rules["rules_status"] = 403
+    with connect() as conn:
+        tid = kb.create_task(conn, title="fallback-403", completion_contract="acme/repo")
+        assert kb.complete_task(conn, tid, result="done",
+                                metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+            (tid,)).fetchone()[0])
+    assert receipt["classification"] == "success"
+    assert "fallback" in receipt["required_source"]
 
 # --- fetch_pr_head_sha: fail-closed on every ambiguous case ---
 
