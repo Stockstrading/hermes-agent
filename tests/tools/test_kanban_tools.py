@@ -547,6 +547,10 @@ def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
     "SCHEDULED_UNTIL=2026-11-18 06:47+05",
     "SCHEDULED_UNTIL=2026-11-18 06:47:00-0",
     "SCHEDULED_UNTIL=2026-11-18 06",
+    # Any whitespace run before a time, not just one space, blocks the date-only branch.
+    "SCHEDULED_UNTIL=2026-11-18  06:47",
+    "SCHEDULED_UNTIL=2026-11-18\t06:47",
+    "SCHEDULED_UNTIL=2026-11-18\n06:47",
     # Whitespace before an offset must not silently drop the offset.
     "SCHEDULED_UNTIL=2026-11-18T06:47:00 +05:00",
     "SCHEDULED_UNTIL=2026-11-18 06:47 -0230 later",
@@ -578,6 +582,18 @@ def test_parse_scheduled_until_keeps_valid_forms(marker, expected):
     from tools.kanban_tools import _parse_scheduled_until
 
     assert _parse_scheduled_until(marker) == calendar.timegm(expected + (0, 0, 0))
+
+
+def test_parse_scheduled_until_word_after_space_is_prose_not_offset():
+    """Pins the current choice: after a complete time, whitespace followed by a WORD
+    (``+oops``) is free-form prose, not an offset, so the marker is 06:47 UTC. Only
+    whitespace + sign + digit (``06:47 +05:00``) is read as a split-off offset and
+    rejected; rejecting every ``+word`` would also reject ordinary reason text."""
+    import calendar
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until("SCHEDULED_UNTIL=2026-11-18T06:47 +oops") == \
+        calendar.timegm((2026, 11, 18, 6, 47, 0, 0, 0, 0))
 
 
 def test_parse_scheduled_until_logs_rejection_without_reason_text(caplog):
