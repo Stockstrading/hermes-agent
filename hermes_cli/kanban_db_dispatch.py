@@ -1,3 +1,8 @@
+# health: allow FILE_LINES -- card t_9192da49: recompute_scheduled wiring (DispatchResult.scheduled_promoted)
+# and head_sha re-review dedup (_review_respawn_is_redundant, ~45 lines); already over target on main, a
+# facade/sibling split is out of scope for this small fix (the file's helpers, e.g. _pid_alive/
+# reap_worker_zombies, are imported across gateway/, tools/ and 30+ test modules, so a safe split needs its
+# own PR to update every caller, not this narrow one).
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
