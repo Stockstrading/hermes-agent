@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- card t_8686b192: additive kanban.block_recurrence_limit key (5 lines); already over target on main, a broader config split is out of scope for this small recut
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
 Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
@@ -1917,6 +1918,11 @@ DEFAULT_CONFIG = {
         # Auto-block after this many consecutive non-success attempts (spawn_failed, timed_out,
         # crashed) for the same task/profile. Reassignment resets the streak.
         "failure_limit": 2,
+        # Same-reason block -> unblock -> re-block cycles before a card is escalated from
+        # 'blocked' to 'triage' with a block_loop_detected event (the human-gated escalation;
+        # see hermes_cli.kanban_db.BLOCK_RECURRENCE_LIMIT / _resolve_block_recurrence_limit).
+        # Counts unblock recurrences, NOT dispatcher failures (that's failure_limit above).
+        "block_recurrence_limit": 2,
         # Worker stdout/stderr log rotation at spawn time (2 MiB + one backup). Raise to keep more
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
