@@ -674,11 +674,18 @@ def test_graphql_required_plus_rate_limited_403_rules_fails_closed(github_requir
 
 
 @pytest.mark.platforms("linux")
-@pytest.mark.parametrize("reason", [_RATE_LIMITED, "You have exceeded a secondary rate limit"])
-def test_branch_rules_rate_limited_403_never_takes_fallback(github_no_branch_rules, reason):
-    """No GraphQL protection + a rate-limited 403 on rules/branches: pre-fix this was read as
+@pytest.mark.parametrize(("status", "reason"), [
+    (403, _RATE_LIMITED),
+    (403, "You have exceeded a secondary rate limit"),
+    # Legacy secondary-limit wording: no "rate limit" in it, still a transient limit.
+    (403, "You have triggered an abuse detection mechanism"),
+    # Secondary limits can also answer 429.
+    (429, "You have exceeded a secondary rate limit"),
+])
+def test_branch_rules_rate_limited_403_never_takes_fallback(github_no_branch_rules, status, reason):
+    """No GraphQL protection + a rate-limited 403/429 on rules/branches: pre-fix this was read as
     the Free-plan denial and every ran check became "required" (fail open). It must fail closed."""
-    github_no_branch_rules["rules_status"] = 403
+    github_no_branch_rules["rules_status"] = status
     github_no_branch_rules["rules_reason"] = reason
     with connect() as conn:
         tid = kb.create_task(conn, title="fallback-rate-limited", completion_contract="acme/repo")
@@ -749,6 +756,22 @@ def test_fetch_pr_head_sha_fails_closed_on_gh_error(tmp_path, monkeypatch):
     shim.mkdir()
     gh = shim / "gh"
     gh.write_text(f"#!{sys.executable}\nimport sys\nsys.exit(1)\n")
+    gh.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None
+
+
+def test_fetch_pr_head_sha_fails_closed_on_rate_limited_gh_error(tmp_path, monkeypatch):
+    """A rate-limited gh call raises ``_GateRateLimitError`` inside ``_api``; fetch_pr_head_sha
+    must swallow it and return None (spawn a real reviewer), never raise into the tick."""
+    from hermes_cli.kanban_pr_acceptance import fetch_pr_head_sha
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    gh = shim / "gh"
+    gh.write_text(f"#!{sys.executable}\nimport sys\n"
+                  "sys.stderr.write('gh: API rate limit exceeded for user ID 1 (HTTP 403)\\n')\n"
+                  "sys.exit(1)\n")
     gh.chmod(0o755)
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     assert fetch_pr_head_sha("https://github.com/acme/repo/pull/7") is None

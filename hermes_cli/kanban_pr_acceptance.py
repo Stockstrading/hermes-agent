@@ -47,7 +47,10 @@ def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,
         # A rate-limited 403/429 ("API rate limit exceeded" / "secondary rate limit") is a
         # transient API limit, never an access denial: checked first so it can never be read
         # as the GitHub-Free-plan "branch rules unavailable" 403 and take the fallback.
-        if re.search(r"rate limit", exc.stderr or "", re.IGNORECASE):
+        # "abuse detection" is GitHub's older wording for the secondary limit ("You have
+        # triggered an abuse detection mechanism"); it carries no "rate limit" text, so it
+        # is matched explicitly or it would fall through to the denial path and fail open.
+        if re.search(r"rate limit|abuse detection", exc.stderr or "", re.IGNORECASE):
             raise _GateRateLimitError(f"rate limited on {endpoint.split('?')[0]}") from None
         # 401/403/404 = the login cannot see this repository (wrong profile identity
         # or missing grant), not a transient API failure. Persist only the status
@@ -191,9 +194,11 @@ def _resolve_required_checks(required: set[tuple[str, int | None]], graphql_requ
     required check with no app pin still has to resolve to an actual "success".
 
     Raises ``rules_denied_exc`` unchanged when the rules/branches denial was not the
-    GitHub-Free-plan 403/404 shape: a 401 or a rate-limited 403 on the SAME login that just
-    read the PR fine is an identity/infra problem, never "no governance configured", and
-    must fail closed rather than be read as a plan limitation.
+    GitHub-Free-plan 403/404 shape: a 401 on the SAME login that just read the PR fine is an
+    identity problem, never "no governance configured", and must fail closed rather than be
+    read as a plan limitation. Rate limits never reach this function: ``_api`` raises them
+    as ``_GateRateLimitError`` (not a ``_GateAuthError``), so they fail closed as ``infra``
+    before any denial handling.
     """
     if rules_denied_exc is not None:
         if not re.search(r"HTTP 40[34]", str(rules_denied_exc)):
