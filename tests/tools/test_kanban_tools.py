@@ -536,6 +536,39 @@ def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
         ).fetchone()[0] == expected_epoch
 
 
+
+@pytest.mark.parametrize("marker", [
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+05",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+05 waiting",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00-0",
+    "SCHEDULED_UNTIL=2026-11-18T06:47+oops",
+])
+def test_parse_scheduled_until_rejects_malformed_offset(marker):
+    """A malformed or partial timezone suffix must reject the marker, never be
+    silently dropped (which read the time as UTC and fired the timer hours off)."""
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until(marker) is None
+
+
+@pytest.mark.parametrize("marker, expected", [
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00Z", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00+05:00", (2026, 11, 18, 1, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00+0500", (2026, 11, 18, 1, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00-02:30 later", (2026, 11, 18, 9, 17, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 06:47", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18", (2026, 11, 18, 0, 0, 0)),
+    ("wait, SCHEDULED_UNTIL=2026-11-18T06:47:00Z.", (2026, 11, 18, 6, 47, 0)),
+    ("wait (SCHEDULED_UNTIL=2026-11-18T06:47:00.5+05:00)", (2026, 11, 18, 1, 47, 0)),
+])
+def test_parse_scheduled_until_keeps_valid_forms(marker, expected):
+    import calendar
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until(marker) == calendar.timegm(expected + (0, 0, 0))
+
 def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
     """``kanban_request_changes`` stores an optional ``metadata`` dict (e.g.
     ``head_sha``/``findings``) on the closed run, exactly like ``kanban_complete``;

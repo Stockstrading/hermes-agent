@@ -851,9 +851,13 @@ def _handle_block(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "blocked", **extra)
 
 
+# The trailing lookahead anchors the timestamp: a malformed or partial offset
+# (``+oops``, ``+05``) must reject the whole marker, never be dropped so the time
+# silently reads as UTC. Sentence punctuation (``.``, ``,``, ``)``) may still follow.
+_SCHEDULED_UNTIL_MARKER_RE = re.compile(r"\bSCHEDULED_UNTIL=")
 _SCHEDULED_UNTIL_RE = re.compile(
     r"\bSCHEDULED_UNTIL=(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"
-    r"(?:Z|[+-]\d{2}:?\d{2})?)?)"
+    r"(?:Z|[+-]\d{2}:?\d{2})?)?)(?![\w:+-]|\.\d)"
 )
 
 
@@ -868,6 +872,8 @@ def _parse_scheduled_until(reason: Optional[str]) -> Optional[int]:
         return None
     m = _SCHEDULED_UNTIL_RE.search(reason)
     if not m:
+        if _SCHEDULED_UNTIL_MARKER_RE.search(reason):
+            logger.warning("kanban_schedule: malformed SCHEDULED_UNTIL marker, ignoring")
         return None
     raw = m.group(1)
     try:
