@@ -78,7 +78,9 @@ def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home)
     """``exclude_block_loop=True`` drops a card with an unresolved
     ``block_loop_detected`` escalation; a plain ``commented`` event must NOT
     un-hide it (that was the bug -- any later event, including a bare comment,
-    defeated the filter), but an explicit resolving event (``unblocked``) does."""
+    defeated the filter), but an explicit resolving event (``specified``, via
+    the real ``specify_triage_task`` the triage sweep/human actually calls on
+    a triage-escalated card) does."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="escalated", assignee="a", triage=True)
         with kb.write_txn(conn):
@@ -96,15 +98,18 @@ def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home)
         filtered_after_comment = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
         assert not any(t.id == tid for t in filtered_after_comment)
 
-        # An explicit resolving event clears the escalation.
-        with kb.write_txn(conn):
-            kb._append_event(conn, tid, "unblocked", {})
-        filtered_after_unblock = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
+        # An explicit resolving event clears the escalation. The card is in
+        # 'triage' (where block_loop escalation lands it), so the production
+        # resolution path is specify_triage_task (triage -> todo -> auto-promoted
+        # to 'ready', since this task has no parents -- 'specified' event);
+        # unblock_task only applies to 'blocked'/'scheduled' and would no-op here.
+        assert kb.specify_triage_task(conn, tid, title="escalated (specified)")
+        filtered_after_unblock = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
         assert any(t.id == tid for t in filtered_after_unblock)
 
         # Re-escalated for an unrelated reason after being cleared: a fresh
         # ``block_loop_detected`` with nothing resolving it yet must hide again.
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "block_loop_detected", {"kind": "needs_input"})
-        filtered_after_reescalation = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
+        filtered_after_reescalation = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
         assert not any(t.id == tid for t in filtered_after_reescalation)

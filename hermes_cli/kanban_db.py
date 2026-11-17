@@ -1411,11 +1411,20 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 
 # Event kinds that count as a deliberate resolution of a ``block_loop_detected``
 # escalation for ``list_tasks(exclude_block_loop=True)``: the triage sweep actually
-# promoting the card (``specified``/``decomposed``), an explicit unblock, or a
-# manual/dispatcher status move. A bare ``commented`` row is NOT in this set on
-# purpose -- a human-gated escalation must stay hidden from auto-sweeps until it is
-# actually acted on, not merely until someone leaves a comment.
-_BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "status", "archived")
+# promoting the card (``specified``/``decomposed``), an explicit unblock, or an
+# archive. A bare ``commented`` row is NOT in this set on purpose -- a human-gated
+# escalation must stay hidden from auto-sweeps until it is actually acted on, not
+# merely until someone leaves a comment.
+#
+# ``status`` is deliberately EXCLUDED even though it looks like a plausible manual
+# move: the literal event kind ``"status"`` has producers that are NOT a deliberate
+# human judgment about the escalation itself -- ``plugins/kanban/dashboard/plugin_api.py``
+# ``_set_status_direct()`` emits it on every dashboard drag-drop (including a no-op
+# same-value write), and ``invalidate_descendants_for_parent_reopen`` below emits it on
+# every automatically-invalidated descendant of a reopened ancestor. Either one would
+# silently clear a still-unresolved escalation with no human ever looking at it. Only add
+# a kind here when its ONLY repo-wide producer is itself a deliberate resolution.
+_BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "archived")
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
@@ -1447,7 +1456,7 @@ def list_tasks(
     NOT "whatever event happens to land next", so a plain ``commented`` row (e.g.
     from ``add_comment``) can never silently clear a still-unresolved escalation.
     A card unblocked and later re-escalated for an unrelated reason (a fresh
-    ``block_loop_detected`` with no resolving event after it) is still returned."""
+    ``block_loop_detected`` with no resolving event after it) is excluded again."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
