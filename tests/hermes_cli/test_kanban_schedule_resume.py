@@ -75,9 +75,12 @@ def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home
 
 
 def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home):
-    """``exclude_block_loop=True`` drops a card whose MOST RECENT event is
-    ``block_loop_detected``, but a later unrelated event un-hides it again —
-    a sweep must never re-touch a still-current human-gated escalation."""
+    """``exclude_block_loop=True`` drops a card with an unresolved
+    ``block_loop_detected`` escalation; a plain ``commented`` event must NOT
+    un-hide it (that was the bug -- any later event, including a bare comment,
+    defeated the filter), but an explicit resolving event (``specified``, via
+    the real ``specify_triage_task`` the triage sweep/human actually calls on
+    a triage-escalated card) does."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="escalated", assignee="a", triage=True)
         with kb.write_txn(conn):
@@ -89,8 +92,24 @@ def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home)
         filtered = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
         assert not any(t.id == tid for t in filtered)
 
-        # A fresh, later event means the escalation is no longer the latest word.
+        # A bare comment is not a resolution -- the escalation must stay hidden.
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "commented", {})
-        filtered_after = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
-        assert any(t.id == tid for t in filtered_after)
+        filtered_after_comment = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
+        assert not any(t.id == tid for t in filtered_after_comment)
+
+        # An explicit resolving event clears the escalation. The card is in
+        # 'triage' (where block_loop escalation lands it), so the production
+        # resolution path is specify_triage_task (triage -> todo -> auto-promoted
+        # to 'ready', since this task has no parents -- 'specified' event);
+        # unblock_task only applies to 'blocked'/'scheduled' and would no-op here.
+        assert kb.specify_triage_task(conn, tid, title="escalated (specified)")
+        filtered_after_unblock = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
+        assert any(t.id == tid for t in filtered_after_unblock)
+
+        # Re-escalated for an unrelated reason after being cleared: a fresh
+        # ``block_loop_detected`` with nothing resolving it yet must hide again.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected", {"kind": "needs_input"})
+        filtered_after_reescalation = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
+        assert not any(t.id == tid for t in filtered_after_reescalation)
