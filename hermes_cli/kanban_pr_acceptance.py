@@ -171,9 +171,13 @@ def fetch_pr_head_sha(contract: str, published_pr: str | None = None,
 
 def _resolve_required_checks(required: set[tuple[str, int | None]], graphql_required: bool,
                              rules_denied_exc: Exception | None,
-                             ran_checks: set[tuple[str, None]]) -> tuple[set, str | None]:
-    """The final required-checks set and its ``required_source`` label (``None`` when the
-    set is exactly what GraphQL + the rulesets REST call declared, with nothing to disclose).
+                             ran_checks: set[tuple[str, None]]) -> tuple[set, str | None, frozenset]:
+    """The final required-checks set, its ``required_source`` label (``None`` when the
+    set is exactly what GraphQL + the rulesets REST call declared, with nothing to disclose),
+    and the subset of that final set whose membership came ONLY from the branch-rules-denied
+    fallback (never from an ordinary GraphQL/rulesets declaration) -- the caller's neutral/
+    skipped carve-out must key on this, not on "no app pin", so a genuinely repo-declared
+    required check with no app pin still has to resolve to an actual "success".
 
     Raises ``rules_denied_exc`` unchanged when the rules/branches denial was not the
     GitHub-Free-plan 403/404 shape: a 401 or a rate-limited 403 on the SAME login that just
@@ -187,16 +191,19 @@ def _resolve_required_checks(required: set[tuple[str, int | None]], graphql_requ
             # GraphQL already declared >=1 required check: the denied rulesets call may have
             # required more. Never drop that possibility silently -- merge every check that
             # actually ran on the head in ADDITIVELY on top of the known GraphQL set, so a
-            # real failure on an unlisted check is still caught.
-            return required | ran_checks, ("graphql-required checks + fallback: all checks that ran on "
-                                           "the head (rules/branches denied on this plan)")
-        return set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)"
+            # real failure on an unlisted check is still caught. Only the genuinely-added
+            # entries (not already GraphQL-declared) are fallback-origin.
+            return (required | ran_checks, ("graphql-required checks + fallback: all checks that ran on "
+                                            "the head (rules/branches denied on this plan)"),
+                    frozenset(ran_checks - required))
+        return (set(ran_checks), "fallback: all checks that ran on the head (no branch rules available on this plan)",
+                frozenset(ran_checks))
     # No GraphQL branch protection AND an ordinary (non-denied) empty rules/branches response:
     # genuinely no CI governance is declared for this branch. Never promote "whatever happened
     # to run" into "required" here -- that silently accepts any check outcome for a repo with
     # zero configured governance. Return the (empty) required set unchanged; the caller's
     # `if not required` path reports ok=False with local-only-contract guidance.
-    return required, None
+    return required, None, frozenset()
 
 
 def collect_acceptance(contract: str, published_pr: str | None,
@@ -252,7 +259,8 @@ def collect_acceptance(contract: str, published_pr: str | None,
         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
                                                        paginate=True, profile_home=profile_home) for s in page]
         ran_checks = {(r["name"], None) for r in runs} | {(s["context"], None) for s in statuses}
-        required, required_source = _resolve_required_checks(required, graphql_required, rules_denied_exc, ran_checks)
+        required, required_source, fallback_origin = _resolve_required_checks(required, graphql_required,
+                                                                               rules_denied_exc, ran_checks)
         if required_source:
             receipt["required_source"] = required_source
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
@@ -274,12 +282,14 @@ def collect_acceptance(contract: str, published_pr: str | None,
                 is_run = "conclusion" in check
                 outcome = check.get("conclusion") if is_run else check["state"]
                 classification = _classify(check, sha, outcome, is_run)
-                if app_id is None and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
-                    # A required context with no app pin to compare against has nothing for
-                    # _classify's conservative default (infra on an unrecognised-but-non-failing
-                    # outcome -- "neutral"/"skipped") to check, so it would block every
-                    # branch-rules-denied or no-rules repo on its own non-blocking checks;
-                    # treat those as passing. A pinned required check never takes this path.
+                if (context, app_id) in fallback_origin and classification == "infra" and outcome in _PASSING_WHEN_UNPINNED:
+                    # Only a check whose required-ness came from the branch-rules-denied
+                    # fallback (never a genuinely GraphQL/rulesets-declared required check,
+                    # even an unpinned one) has nothing for _classify's conservative default
+                    # (infra on an unrecognised-but-non-failing outcome -- "neutral"/"skipped")
+                    # to check -- without this it would block every branch-rules-denied or
+                    # no-rules repo on its own non-blocking checks. A declared required check
+                    # never takes this path, pinned or not.
                     classification = "success"
                 outcomes.append(classification)
                 receipt["checks"].append({"name": context, "id": check["id"],
