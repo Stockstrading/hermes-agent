@@ -74,6 +74,38 @@ def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home
         assert kb.recompute_scheduled(conn) == 0
 
 
+def test_dispatch_once_wakes_a_due_scheduled_task(kanban_home, all_assignees_spawnable):
+    """End-to-end: an actual dispatcher tick (not just the bare DB helper)
+    must promote a ``scheduled`` card whose ``resume_at`` timer is in the
+    past back to ``ready`` — and then spawn it like any other ready card.
+    Regression for the SOUL's quota-backoff procedure: before this, a task
+    scheduled via ``SCHEDULED_UNTIL=`` never auto-woke in production because
+    no dispatcher phase called ``recompute_scheduled``."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = int(time.time())
+    with kbc.connect() as conn:
+        due = kb.create_task(conn, title="quota wait, due", assignee="a")
+        assert kb.schedule_task(conn, due, resume_at=now - 10)
+        not_due = kb.create_task(conn, title="quota wait, not due", assignee="a")
+        assert kb.schedule_task(conn, not_due, resume_at=now + 3600)
+
+    spawned: list[str] = []
+
+    def _fake_spawn(*args, **kwargs):
+        spawned.append(args[0]["id"] if isinstance(args[0], dict) else args[0].id)
+        return 4242
+
+    with kbc.connect() as conn:
+        result = kbd.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+
+    assert result.scheduled_promoted == 1
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, due).status == "running"
+        assert kb.get_task(conn, not_due).status == "scheduled"
+    assert any(t[0] == due for t in result.spawned)
+
+
 def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home):
     """``exclude_block_loop=True`` drops a card with an unresolved
     ``block_loop_detected`` escalation; a plain ``commented`` event must NOT

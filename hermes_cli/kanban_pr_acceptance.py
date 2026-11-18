@@ -190,6 +190,32 @@ def collect_acceptance(contract: str, published_pr: str | None,
         return receipt
 
 
+def resolve_pr_head_sha(pr_url: str, assignee: str | None = None) -> str | None:
+    """The PR's actual current head SHA, read fresh from GitHub — the ground
+    truth a caller-supplied ``head_sha`` metadata value must be checked
+    against, never substituted for. ``None`` (never raises) when the URL is
+    malformed, the repo/PR can't be read with this profile's ``gh`` login, or
+    GitHub returns anything short of a real 40-hex-char SHA: every one of
+    those is "unknown", and callers must treat unknown as a non-match.
+    """
+    match = _PR.fullmatch(pr_url or "")
+    if not match:
+        return None
+    repo, number = match[1], int(match[2])
+    owner, name = repo.split("/")
+    try:
+        profile_home = _assignee_profile_home(assignee)
+        query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
+                 f'{{pullRequest(number:{number:d}){{headRefOid}}}}}}')
+        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+        if repository is None:
+            return None
+        sha = repository["pullRequest"]["headRefOid"]
+    except (_GateAuthError, OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
+        return None
+    return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
 def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if check.get("head_sha", check.get("sha")) != sha:
         return "stale"

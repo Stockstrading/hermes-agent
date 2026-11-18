@@ -95,7 +95,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _print_json({
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
-                         "reaped_terminal_workers")},
+                         "scheduled_promoted", "reaped_terminal_workers")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -128,6 +128,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    print(f"Scheduled promoted: {getattr(res, 'scheduled_promoted', 0)}")
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:
@@ -238,13 +239,15 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
+            or getattr(res, "scheduled_promoted", 0)
             or res.spawned or res.auto_blocked or res.stale
         )
         if did_work:
             print(
                 f"[{_fmt_ts(int(time.time()))}] reclaimed={res.reclaimed} "
                 f"crashed={len(res.crashed)} timed_out={len(res.timed_out)} stale={len(res.stale)} "
-                f"promoted={res.promoted} spawned={len(res.spawned)} "
+                f"promoted={res.promoted} scheduled_promoted={getattr(res, 'scheduled_promoted', 0)} "
+                f"spawned={len(res.spawned)} "
                 f"auto_blocked={len(res.auto_blocked)}",
                 flush=True,
             )

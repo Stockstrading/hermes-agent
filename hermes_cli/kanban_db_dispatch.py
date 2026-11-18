@@ -1,3 +1,8 @@
+# health: allow FILE_LINES -- card t_9192da49: recompute_scheduled wiring (DispatchResult.scheduled_promoted)
+# and head_sha re-review dedup (_review_respawn_is_redundant, ~45 lines); already over target on main, a
+# facade/sibling split is out of scope for this small fix (the file's helpers, e.g. _pid_alive/
+# reap_worker_zombies, are imported across gateway/, tools/ and 30+ test modules, so a safe split needs its
+# own PR to update every caller, not this narrow one).
 """Dispatcher: crash/stale/orphan detection, failure accounting and the respawn circuit breaker, memory-aware concurrency caps, the one-shot ``dispatch_once`` pass, worker spawning (``_default_spawn``), worker-log rotation and the long-lived ``run_daemon`` loop.
 
 Split out of ``hermes_cli.kanban_db``; origin-resident helpers are reached
@@ -102,6 +107,10 @@ class DispatchResult:
 
     reclaimed: int = 0
     promoted: int = 0
+    scheduled_promoted: int = 0
+    """``scheduled`` cards whose ``resume_at`` wake timer had arrived, promoted
+    back to ``ready`` this tick by :func:`hermes_cli.kanban_db.recompute_scheduled`
+    — the sibling of ``promoted`` for the ``kanban_schedule`` timer path."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken
     claim bookkeeping, dead/gone worker)."""
@@ -1554,6 +1563,87 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _full_sha(value: Any) -> Optional[str]:
+    """A caller-supplied metadata value, accepted ONLY as a full 40-hex-char SHA
+    (never a short/abbreviated prefix, never whitespace-padded garbage)."""
+    if isinstance(value, str) and _FULL_SHA_RE.fullmatch(value.strip()):
+        return value.strip()
+    return None
+
+
+def _current_pr_head_sha(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The PR's REAL current head, resolved from GitHub itself — never from
+    caller-supplied run metadata. ``None`` when the task has no published PR
+    contract or the resolution fails (private repo, API error, malformed
+    URL): callers must treat ``None`` as unknown, never as a match.
+    """
+    from hermes_cli.kanban_pr_acceptance import _PR, resolve_pr_head_sha
+
+    row = conn.execute(
+        "SELECT completion_contract, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    contract = _kb._row_get(row, "completion_contract")
+    if not isinstance(contract, str) or not _PR.fullmatch(contract):
+        return None
+    return resolve_pr_head_sha(contract, assignee=_kb._row_get(row, "assignee"))
+
+
+def _review_respawn_is_redundant(conn: sqlite3.Connection, task_id: str) -> bool:
+    """``True`` when the handoff that put ``task_id`` into the review lane
+    names the exact ``head_sha`` the last ``changes_requested`` verdict
+    already reviewed, with no ``findings`` reported on the fresh handoff,
+    AND that shared SHA is independently confirmed as the PR's actual
+    current head on GitHub right now.
+
+    ``head_sha``/``findings`` are caller-supplied ``metadata`` keys (see
+    ``kanban_request_review``/``kanban_request_changes`` schemas) and are
+    NEVER trusted on their own: a stale or copy-pasted ``head_sha`` on either
+    side (or a selected prior ``changes_requested`` run that predates an
+    intervening approve+re-request-changes cycle) would otherwise permanently
+    suppress a genuinely-needed re-review. Both metadata values must be a
+    full 40-char SHA, and must equal the PR's GitHub-resolved current head —
+    anything short of that (malformed, absent, mismatched, or the real head
+    unresolvable) fails OPEN to a fresh review, never closed to dedup.
+    """
+    requested = conn.execute(
+        "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    run_id = _kb._row_get(requested, "run_id")
+    if run_id is None:
+        return False
+    current_run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (int(run_id),),
+    ).fetchone()
+    current_meta = _kb._json_dict(_kb._row_get(current_run, "metadata"))
+    current_sha = _full_sha(current_meta.get("head_sha"))
+    if current_sha is None:
+        return False
+
+    prior_run = conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id = ? AND outcome = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    prior_meta = _kb._json_dict(_kb._row_get(prior_run, "metadata"))
+    prior_sha = _full_sha(prior_meta.get("head_sha"))
+    if prior_sha is None or prior_sha != current_sha:
+        return False
+    if current_meta.get("findings"):
+        return False
+
+    # Provenance: the two caller-supplied values agreeing proves nothing by
+    # themselves (both can be stale copies of the same old SHA). Only a match
+    # against the PR's real, independently-resolved current head on GitHub
+    # establishes that nothing has actually changed since that verdict.
+    true_head = _current_pr_head_sha(conn, task_id)
+    return true_head is not None and true_head == current_sha
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1625,7 +1715,14 @@ def check_respawn_guard(
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
+    # Exception: ``head_sha`` dedup (kanban_request_changes schema) — the
+    # implementer re-requested review naming the EXACT head SHA the last
+    # ``changes_requested`` verdict already reviewed, with no new findings on
+    # the fresh handoff. Nothing changed since that verdict; spawning another
+    # reviewer would just repeat it.
     if lane == "review":
+        if _review_respawn_is_redundant(conn, task_id):
+            return "head_sha_unchanged"
         return None
 
     # 3. Completed run within guard window. Exception: an explicit re-queue
@@ -2231,6 +2328,7 @@ def _run_reclaim_phase(
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    result.scheduled_promoted = _kb.recompute_scheduled(conn)
 
 
 def _tick_spawn_budget(
