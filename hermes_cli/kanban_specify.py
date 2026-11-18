@@ -197,9 +197,19 @@ def _profile_author(default: str = "specifier") -> str:
 
 
 def _load_triage_task(task_id: str) -> tuple[Optional[kb.Task], str]:
-    """``(task, "")`` when the task exists and is in triage, else ``(None, reason)``."""
+    """``(task, "")`` when the task exists, is in triage, and carries no
+    unresolved ``block_loop_detected`` escalation, else ``(None, reason)``.
+
+    Re-applies the same exclusion ``list_triage_ids()`` used at enumeration
+    time, right before the (slow) auxiliary LLM call -- the enumeration can be
+    minutes stale by the time an ``--all`` sweep reaches this id, and a
+    `block_loop_detected` escalation that landed in between must still refuse
+    here, not just at the DB CAS after the LLM call (#PR12 release-gate
+    MAJOR 2)."""
     with kbc.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        if task is not None and task.status == "triage" and kb.task_has_unresolved_block_loop(conn, task_id):
+            return None, "task has an unresolved block_loop_detected escalation"
     if task is None:
         return None, "unknown task id"
     if task.status != "triage":
@@ -263,7 +273,7 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
 _KEEP_TAG_RE = re.compile(r"\[(?:CAPITAL|CA|CA-adjacent|needs-human-ok|Board-approved)\]", re.IGNORECASE)
 _GH_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
 _TITLE_PR_REF_RE = re.compile(
-    r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
+    r"\b([A-Za-z][\w.-]*)\s*PR\s*#(\d+)\b", re.IGNORECASE)
 
 
 def _norm_repo(name: str) -> str:
@@ -273,6 +283,16 @@ def _norm_repo(name: str) -> str:
     return n.removeprefix("etoro-")
 
 
+def _title_pr_keys(text: Optional[str]) -> set[str]:
+    """``repo#n`` keys a single field (title OR body) names on its own, with no
+    cross-field fallback -- the building block for both halves of
+    ``_card_pr_keys``'s contract."""
+    t = text or ""
+    keys = {f"{_norm_repo(r)}#{n}" for r, n in _GH_PR_URL_RE.findall(t)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _TITLE_PR_REF_RE.findall(t)}
+    return keys
+
+
 def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
     """``repo#n`` keys for the PR a card names: the title decides; the body is
     only consulted when the title names none. Deliberately self-contained
@@ -280,14 +300,8 @@ def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
     this card does not depend on) — a minimal, local re-derivation is enough
     for the one thing ``_preserve_pr_refs`` needs: never silently drop the
     repo+PR a card is about."""
-    t = title or ""
-    keys = {f"{_norm_repo(r)}#{n}" for r, n in _GH_PR_URL_RE.findall(t)}
-    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _TITLE_PR_REF_RE.findall(t)}
-    if not keys:
-        b = body or ""
-        keys = {f"{_norm_repo(r)}#{n}" for r, n in _GH_PR_URL_RE.findall(b)}
-        keys |= {f"{_norm_repo(r)}#{n}" for r, n in _TITLE_PR_REF_RE.findall(b)}
-    return keys
+    keys = _title_pr_keys(title)
+    return keys if keys else _title_pr_keys(body)
 
 
 def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
@@ -296,10 +310,19 @@ def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
 
     The dispatcher's per-PR review round cap keys on ``repo#n`` from the title (or a
     PR URL in the body). An LLM rewrite to "Review PR #329: ..." silently removed the
-    card from the cap on 2026-10-18, so the original reference is re-attached here."""
+    card from the cap on 2026-10-18, so the original reference is re-attached here.
+
+    The title-rewrite step and the body-restore step deliberately use DIFFERENT key
+    sets: the title step only ever looks at keys the OLD TITLE itself named (never a
+    body-only key — promoting a body-only reference into a rewritten title would
+    contradict ``_card_pr_keys``'s own "the title decides" contract, round-2 finding
+    2); the body step unions EVERY PR reference the old body named (not just the
+    title-decided subset ``_card_pr_keys`` returns), so a second body URL the title
+    never mentioned survives a body rewrite too (round-2 finding 1)."""
     title = new_title if new_title is not None else old_title
     body = new_body if new_body is not None else old_body
-    old_keys = _card_pr_keys(old_title, old_body)
+    old_title_keys = _title_pr_keys(old_title)
+    old_all_keys = old_title_keys | _title_pr_keys(old_body)
     old_text = f"{old_title or ''}\n{old_body or ''}"
     display: dict[str, str] = {}
     urls: dict[str, str] = {}
@@ -307,10 +330,10 @@ def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
         k = f"{_norm_repo(m.group(1))}#{m.group(2)}"
         urls.setdefault(k, m.group(0))
         display.setdefault(k, f"{m.group(1)} PR #{m.group(2)}")
-    for r, n in _TITLE_PR_REF_RE.findall(old_title or ""):
-        display[f"{_norm_repo(r)}#{n}"] = f"{r} PR #{n}"
+    for r, n in _TITLE_PR_REF_RE.findall(old_text):
+        display.setdefault(f"{_norm_repo(r)}#{n}", f"{r} PR #{n}")
     if title is not None and new_title is not None:
-        missing = sorted(k for k in old_keys if k not in _card_pr_keys(title, None))
+        missing = sorted(k for k in old_title_keys if k not in _title_pr_keys(title))
         prefix = ", ".join(display.get(k, k.replace("#", " PR #")) for k in missing)
         tags = [t for t in dict.fromkeys(_KEEP_TAG_RE.findall(old_title or ""))
                 if t.lower() not in title.lower()]
@@ -318,9 +341,9 @@ def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
             title = f"{prefix}: {title}"
         if tags:
             title = "".join(tags) + " " + title
-    if new_body is not None and old_keys:
+    if new_body is not None and old_all_keys:
         body_text = body or ""
-        lost = [k for k in sorted(old_keys)
+        lost = [k for k in sorted(old_all_keys)
                 if (urls.get(k) and urls[k] not in body_text)
                 or (not urls.get(k) and display.get(k, "") not in body_text)]
         if lost:
@@ -386,24 +409,38 @@ def specify_task(
         if ok:
             # Rule 6 routing guard (log-only phase): specify_task never changes the
             # assignee itself, so check the assignee the task already carries against
-            # the (possibly just-tightened) title/body.
+            # the (possibly just-tightened) title/body. Audit-only: it must never
+            # change the primary outcome (the card is already promoted above), so the
+            # whole phase is one try/except -- a bad config value or a failed
+            # add_comment must not raise past an already-successful promotion and
+            # abort the rest of an ``--all`` sweep (round-2 finding 3).
             try:
                 from hermes_cli.config import load_config_readonly
                 cfg = load_config_readonly()
             except Exception:
                 logger.debug("specify %s: config load failed for routing guard", task_id, exc_info=True)
                 cfg = {}
-            kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-            default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or "the default profile"
-            mismatch = _routing_guard_mismatch(
-                task.assignee,
-                new_title if new_title is not None else task.title,
-                new_body if new_body is not None else task.body,
-                review_only_profiles=review_only_profiles_from_config(cfg),
-                default_assignee=default_assignee,
-            )
-            if mismatch:
-                kb.add_comment(conn, task_id, audit_author, mismatch)
+            try:
+                kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+                raw_default_assignee = kanban_cfg.get("default_assignee") if isinstance(kanban_cfg, dict) else None
+                default_assignee = (
+                    raw_default_assignee.strip() if isinstance(raw_default_assignee, str) and raw_default_assignee.strip()
+                    else "the default profile"
+                )
+                mismatch = _routing_guard_mismatch(
+                    task.assignee,
+                    new_title if new_title is not None else task.title,
+                    new_body if new_body is not None else task.body,
+                    review_only_profiles=review_only_profiles_from_config(cfg),
+                    default_assignee=default_assignee,
+                )
+                if mismatch:
+                    kb.add_comment(conn, task_id, audit_author, mismatch)
+            except Exception:
+                logger.warning(
+                    "specify %s: routing guard phase failed (card already promoted, "
+                    "continuing)", task_id, exc_info=True,
+                )
     if not ok:
         # Race: promoted/archived between our read and the write.
         return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")
@@ -413,10 +450,12 @@ def specify_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Task ids in the triage column; ``tenant`` narrows the sweep.
 
-    Excludes cards whose most recent event is ``block_loop_detected`` -- that
-    escalation is for a human (or ``kanban_unblock``), not for auto-specify. A
-    card unblocked and later re-escalated for an unrelated, newer reason is
-    still returned (see ``kb.list_tasks(exclude_block_loop=True)``).
+    Excludes a card carrying an unresolved ``block_loop_detected`` escalation
+    (one with no resolving event -- see ``kb.list_tasks(exclude_block_loop=True)``
+    -- AFTER it; NOT merely "the most recent event is block_loop_detected", so a
+    later unrelated comment can't un-hide it) -- that escalation is for a human
+    (or ``kanban_unblock``), not for auto-specify. A card unblocked and later
+    re-escalated for an unrelated, newer reason is still returned.
     """
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(

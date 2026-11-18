@@ -1426,6 +1426,46 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
 # a kind here when its ONLY repo-wide producer is itself a deliberate resolution.
 _BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "archived")
 
+
+def block_loop_unresolved_clause(alias: str = "tasks") -> tuple[str, tuple]:
+    """SQL boolean expression (+ its bind params) that is true when ``<alias>.id``
+    carries a ``block_loop_detected`` escalation with no resolving event after it.
+
+    Shared by ``list_tasks(exclude_block_loop=True)`` (bulk enumeration) and the
+    CAS in ``specify_triage_task``/``decompose_triage_task`` (single-task gate,
+    evaluated inside the SAME write transaction as the promotion) so a card
+    enumerated as eligible minutes ago can never be promoted after a
+    ``block_loop_detected`` lands in between (#PR12 release-gate MAJOR 2):
+    the guard and the mutation share one CAS instead of a stale id list.
+    """
+    placeholders = ", ".join("?" for _ in _BLOCK_LOOP_RESOLUTION_KINDS)
+    sql = (
+        "EXISTS ("
+        "SELECT 1 FROM task_events e"
+        f" WHERE e.task_id = {alias}.id"
+        "   AND e.kind = 'block_loop_detected'"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM task_events e2"
+        "      WHERE e2.task_id = e.task_id"
+        "        AND e2.id > e.id"
+        f"        AND e2.kind IN ({placeholders})"
+        "   )"
+        ")"
+    )
+    return sql, _BLOCK_LOOP_RESOLUTION_KINDS
+
+
+def task_has_unresolved_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Single-id twin of ``list_tasks(exclude_block_loop=True)``'s predicate, for a
+    call site that already holds one task (``_load_triage_task``) and wants to
+    refuse before even starting the (slow) auxiliary LLM call."""
+    clause, clause_params = block_loop_unresolved_clause("tasks")
+    row = conn.execute(
+        f"SELECT 1 FROM tasks WHERE id = ? AND ({clause})",
+        (task_id, *clause_params),
+    ).fetchone()
+    return row is not None
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -1452,11 +1492,13 @@ def list_tasks(
     event with no *resolving* event after it -- a human-gated escalation that a
     sweep (auto-decompose, auto-specify) must never re-touch. "Resolving" is an
     explicit allowlist (``_BLOCK_LOOP_RESOLUTION_KINDS``: the triage sweep actually
-    promoting the card, a manual status move, or an explicit unblock) -- deliberately
-    NOT "whatever event happens to land next", so a plain ``commented`` row (e.g.
-    from ``add_comment``) can never silently clear a still-unresolved escalation.
-    A card unblocked and later re-escalated for an unrelated reason (a fresh
-    ``block_loop_detected`` with no resolving event after it) is excluded again."""
+    promoting the card, or an explicit unblock/archive) -- deliberately NOT
+    "whatever event happens to land next" and NOT a manual status move (see the
+    comment above ``_BLOCK_LOOP_RESOLUTION_KINDS`` for why ``status`` is excluded),
+    so a plain ``commented`` row (e.g. from ``add_comment``) can never silently
+    clear a still-unresolved escalation. A card unblocked and later re-escalated
+    for an unrelated reason (a fresh ``block_loop_detected`` with no resolving
+    event after it) is excluded again."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
@@ -1472,22 +1514,9 @@ def list_tasks(
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if exclude_block_loop:
-        resolution_placeholders = \
-            ", ".join("?" for _ in _BLOCK_LOOP_RESOLUTION_KINDS)
-        query += (
-            " AND NOT EXISTS ("
-            "   SELECT 1 FROM task_events e"
-            "   WHERE e.task_id = tasks.id"
-            "     AND e.kind = 'block_loop_detected'"
-            "     AND NOT EXISTS ("
-            "       SELECT 1 FROM task_events e2"
-            "       WHERE e2.task_id = tasks.id"
-            "         AND e2.id > e.id"
-            f"         AND e2.kind IN ({resolution_placeholders})"
-            "     )"
-            " )"
-        )
-        params.extend(_BLOCK_LOOP_RESOLUTION_KINDS)
+        clause, clause_params = block_loop_unresolved_clause("tasks")
+        query += f" AND NOT ({clause})"
+        params.extend(clause_params)
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3805,8 +3834,12 @@ def specify_triage_task(
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
+    txn; False when not in triage OR has an unresolved ``block_loop_detected``
+    escalation (the CAS predicate is evaluated here, atomically with the
+    mutation -- a stale enumeration from ``list_tasks(exclude_block_loop=True)``
+    can never win a race against an escalation that lands in between, #PR12
+    release-gate MAJOR 2). Lands in ``todo`` (not ``ready``) so parent gating
+    still applies; the audit comment is written only when a field changed.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3834,9 +3867,11 @@ def specify_triage_task(
             params.append(assignee)
             changed_fields.append("assignee")
         params.append(task_id)
+        clause, clause_params = block_loop_unresolved_clause("tasks")
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
+            f"WHERE id = ? AND status = 'triage' AND NOT ({clause})",
+            tuple(params) + tuple(clause_params),
         )
         if cur.rowcount != 1:
             return False

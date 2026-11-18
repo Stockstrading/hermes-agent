@@ -80,3 +80,54 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+# ---------------------------------------------------------------------------
+# PR12 release-gate MAJOR 2 — the CAS must refuse promotion atomically, not
+# rely on a stale enumeration made minutes earlier.
+# ---------------------------------------------------------------------------
+
+
+def _running_task(conn, title="t"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    return tid
+
+
+def _triage_card_with_unresolved_block_loop(conn, title="t"):
+    """Reach the real production path to a triage card carrying an unresolved
+    ``block_loop_detected`` event (mirrors the existing list_triage_ids tests)."""
+    tid = _running_task(conn, title)
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    kb.unblock_task(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    assert kb.get_task(conn, tid).status == "triage"
+    return tid
+
+
+def test_specify_triage_task_refuses_when_block_loop_unresolved(kanban_home):
+    """Even though the row's ``status`` column is still ``triage`` (what a
+    caller's earlier, now-stale enumeration saw), the CAS inside
+    specify_triage_task must independently see the unresolved escalation and
+    refuse to promote -- this is the fix for the TOCTOU the release gate
+    found: enumeration and mutation no longer trust different reads."""
+    with kbc.connect() as conn:
+        tid = _triage_card_with_unresolved_block_loop(conn)
+
+    with kbc.connect() as conn:
+        ok = kb.specify_triage_task(conn, tid, title="Sneaked past the gate", author="sweep")
+    assert ok is False
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [ev.kind for ev in kb.list_events(conn, tid)]
+    # Refused: still in triage, title untouched, and the sweep's own write
+    # never landed a 'specified' event that would have resolved the escalation.
+    assert task.status == "triage"
+    assert task.title == "t"
+    assert "specified" not in events
+
+

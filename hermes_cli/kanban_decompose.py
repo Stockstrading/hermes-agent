@@ -140,7 +140,8 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     silently become the owner of work the card was assigned away from (#114294).
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get(key) or "").strip()
+    raw = kanban_cfg.get(key) if isinstance(kanban_cfg, dict) else None
+    explicit = raw.strip() if isinstance(raw, str) else ""
     for candidate in (explicit, (fallback or "").strip()):
         if candidate:
             try:
@@ -238,17 +239,24 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         if ok:
             # Rule 6 routing guard (log-only phase): check the assignee that actually
             # lands (freshly chosen, or the task's pre-existing one) against the final
-            # title/body.
-            final_assignee = assignee_val if assignee_val is not None else task.assignee
-            mismatch = _routing_guard_mismatch(
-                final_assignee,
-                title_val if title_val is not None else task.title,
-                body_val if body_val is not None else task.body,
-                review_only_profiles=routing.review_only_profiles,
-                default_assignee=routing.default_assignee,
-            )
-            if mismatch:
-                kb.add_comment(conn, task.id, author, mismatch)
+            # title/body. Audit-only: must never raise past an already-successful
+            # promotion and abort the rest of an ``--all`` sweep (round-2 finding 3).
+            try:
+                final_assignee = assignee_val if assignee_val is not None else task.assignee
+                mismatch = _routing_guard_mismatch(
+                    final_assignee,
+                    title_val if title_val is not None else task.title,
+                    body_val if body_val is not None else task.body,
+                    review_only_profiles=routing.review_only_profiles,
+                    default_assignee=routing.default_assignee,
+                )
+                if mismatch:
+                    kb.add_comment(conn, task.id, author, mismatch)
+            except Exception:
+                logger.warning(
+                    "decompose %s: routing guard phase failed (card already "
+                    "promoted, continuing)", task.id, exc_info=True,
+                )
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
@@ -314,9 +322,19 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 auto_promote=routing.auto_promote,
             )
             if child_ids:
-                for child_id, comment in zip(child_ids, guard_comments):
-                    if comment:
-                        kb.add_comment(conn, child_id, author, comment)
+                # Rule 6 routing guard (log-only phase): audit-only, must never turn a
+                # successful fan-out into a reported "DB error" (round-2 finding 3) --
+                # a failed add_comment here is caught on its own, separately from the
+                # decompose_triage_task call above.
+                try:
+                    for child_id, comment in zip(child_ids, guard_comments):
+                        if comment:
+                            kb.add_comment(conn, child_id, author, comment)
+                except Exception:
+                    logger.warning(
+                        "decompose %s: routing guard comment phase failed (children "
+                        "already created, continuing)", task_id, exc_info=True,
+                    )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
@@ -368,10 +386,12 @@ def decompose_task(
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column.
 
-    Excludes cards whose most recent event is ``block_loop_detected`` -- that
-    escalation is for a human (or ``kanban_unblock``), not for this sweep. A
-    card unblocked and later re-escalated for an unrelated, newer reason is
-    still returned (see ``kb.list_tasks(exclude_block_loop=True)``).
+    Excludes a card carrying an unresolved ``block_loop_detected`` escalation
+    (one with no resolving event -- see ``kb.list_tasks(exclude_block_loop=True)``
+    -- AFTER it; NOT merely "the most recent event is block_loop_detected", so a
+    later unrelated comment can't un-hide it) -- that escalation is for a human
+    (or ``kanban_unblock``), not for this sweep. A card unblocked and later
+    re-escalated for an unrelated, newer reason is still returned.
     """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000, exclude_block_loop=True)

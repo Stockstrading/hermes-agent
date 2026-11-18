@@ -226,3 +226,89 @@ def test_list_triage_ids_includes_fresh_triage_card(kanban_home):
     assert tid in spec.list_triage_ids()
 
 
+# ---------------------------------------------------------------------------
+# PR12 release-gate MAJOR 2 — specify_task must re-check for an unresolved
+# block_loop_detected escalation right before the LLM call, not trust a
+# minutes-stale list_triage_ids() enumeration from an --all sweep.
+# ---------------------------------------------------------------------------
+
+
+def test_specify_task_refuses_and_skips_llm_call_when_block_loop_lands_after_enumeration(kanban_home):
+    """Mirrors the exact repro trace from the release-gate finding: a sweep
+    enumerates the card as eligible, a block_loop_detected escalation then
+    lands on it, and the (stale) call into specify_task must still refuse --
+    and never even reach the auxiliary LLM, since the escalation is caught by
+    _load_triage_task before _call_aux runs."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+
+    # The stale enumeration a sweep would have made BEFORE the escalation
+    # landed (simulated here by not even calling list_triage_ids() again).
+    content = jsonlib.dumps({"title": "Sneaked past the gate", "body": "b"})
+    p, mock_fn = _patch_aux_client(content)
+    with p:
+        outcome = spec.specify_task(tid, author="sweep")
+
+    assert outcome.ok is False
+    mock_fn.assert_not_called()
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.title != "Sneaked past the gate"
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate MAJOR 1 — _TITLE_PR_REF_RE requires an explicit "PR"
+# marker; a bare hyphenated token + "#N" must never be treated as a PR ref.
+# ---------------------------------------------------------------------------
+
+
+def test_title_pr_ref_does_not_match_hyphenated_token_without_pr_marker():
+    assert spec._card_pr_keys("Investigate phase-2 #3 rollout", None) == set()
+
+
+def test_title_pr_ref_does_not_match_commit_style_hyphenated_token():
+    assert spec._card_pr_keys("fix(kanban): block-loop #2 follow-up", None) == set()
+
+
+def test_title_pr_ref_matches_explicit_pr_marker_on_non_hyphenated_repo():
+    assert spec._card_pr_keys("numpy PR #123 bump", None) == {"numpy#123"}
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate MINOR 1/2 — the title-prefix step and the body-restore
+# step must use different key sets (title-only vs. all body URLs).
+# ---------------------------------------------------------------------------
+
+
+def test_preserve_pr_refs_keeps_second_body_url_on_body_rewrite():
+    """A second PR URL that the title never named must survive a full body
+    rewrite too, not just the one the title decided on."""
+    old_title = "strategy-api PR #536: fix"
+    old_body = (
+        "See https://github.com/Stockstrading/strategy-api/pull/536 and "
+        "https://github.com/Stockstrading/position-service/pull/7 for context."
+    )
+    _, new_body = spec._preserve_pr_refs(old_title, old_body, None, "Rewritten body.")
+    assert new_body is not None
+    assert "pull/536" in new_body
+    assert "pull/7" in new_body
+
+
+def test_preserve_pr_refs_title_rewrite_does_not_promote_body_only_url():
+    """A PR URL that only ever lived in the body must never get promoted into
+    a rewritten title -- that would contradict _card_pr_keys' own 'the title
+    decides' contract (round-2 finding 2)."""
+    old_title = "Investigate recurring failure"
+    old_body = "Caused by https://github.com/Stockstrading/strategy-api/pull/536."
+    new_title, _ = spec._preserve_pr_refs(old_title, old_body, "Tightened investigation", None)
+    assert new_title == "Tightened investigation"
+
+

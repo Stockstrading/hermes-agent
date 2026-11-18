@@ -90,5 +90,57 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+# ---------------------------------------------------------------------------
+# PR12 release-gate MAJOR 2 — the CAS must refuse fan-out atomically, not
+# rely on a stale enumeration made minutes earlier.
+# ---------------------------------------------------------------------------
+
+
+def _running_task(conn, title="t"):
+    tid = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    return tid
+
+
+def _triage_card_with_unresolved_block_loop(conn, title="t"):
+    """Reach the real production path to a triage card carrying an unresolved
+    ``block_loop_detected`` event (mirrors the existing list_triage_ids tests)."""
+    tid = _running_task(conn, title)
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    kb.unblock_task(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    assert kb.get_task(conn, tid).status == "triage"
+    return tid
+
+
+def test_decompose_triage_task_refuses_when_block_loop_unresolved(kanban_home):
+    """Mirrors the specify-side regression: the CAS inside decompose_triage_task
+    must independently see an unresolved block_loop_detected escalation (not
+    trust a caller's earlier, now-stale enumeration) and refuse the fan-out."""
+    with kbc.connect() as conn:
+        tid = _triage_card_with_unresolved_block_loop(conn)
+
+    with kbc.connect() as conn:
+        child_ids = decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[{"title": "task A", "assignee": "researcher"}],
+            author="sweep",
+        )
+    assert child_ids is None
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        events = [ev.kind for ev in kb.list_events(conn, tid)]
+    assert task.status == "triage"
+    assert "decomposed" not in events
+
+
 
 

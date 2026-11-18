@@ -97,11 +97,15 @@ def decompose_triage_task(
     ``children``: dicts of ``title`` (required), ``body``, ``assignee``,
     ``parents`` (indices into this list), optional workspace overrides.
     Returns child ids in input order, or None when the root is missing / not
-    in triage, or has already decomposed. Atomic: malformed entries abort fan-out.
+    in triage / has an unresolved ``block_loop_detected`` escalation (checked
+    inside this same write transaction, atomically with the fan-out -- a stale
+    enumeration from ``list_tasks(exclude_block_loop=True)`` can never win a
+    race against an escalation that lands in between, #PR12 release-gate
+    MAJOR 2), or has already decomposed. Atomic: malformed entries abort fan-out.
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
-        write_txn, recompute_ready,
+        write_txn, recompute_ready, task_has_unresolved_block_loop,
     )
 
     if not children:
@@ -119,6 +123,8 @@ def decompose_triage_task(
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
+            return None
+        if task_has_unresolved_block_loop(conn, task_id):
             return None
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
