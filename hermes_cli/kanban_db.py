@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- card t_8686b192: resume_at/recompute_scheduled, block_recurrence_limit override and exclude_block_loop filter (~90 lines); already over target on main, a facade/sibling split is out of scope for this small recut
 """SQLite-backed Kanban board shared across profiles (the cross-profile coordination primitive).
 
 Lives under the shared Hermes root: ``default`` board DB at ``<root>/kanban.db`` (pre-boards
@@ -873,7 +874,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Epoch seconds a 'scheduled' task auto-wakes to 'ready'. NULL = no
+    -- timer (legacy schedule_task behaviour; parked until an explicit
+    -- unblock_task). Set by quota/429 backoff scheduling (schedule_task's
+    -- resume_at kwarg); cleared by recompute_scheduled once it fires.
+    resume_at            INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1403,6 +1409,63 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+# Event kinds that count as a deliberate resolution of a ``block_loop_detected``
+# escalation for ``list_tasks(exclude_block_loop=True)``: the triage sweep actually
+# promoting the card (``specified``/``decomposed``), an explicit unblock, or an
+# archive. A bare ``commented`` row is NOT in this set on purpose -- a human-gated
+# escalation must stay hidden from auto-sweeps until it is actually acted on, not
+# merely until someone leaves a comment.
+#
+# ``status`` is deliberately EXCLUDED even though it looks like a plausible manual
+# move: the literal event kind ``"status"`` has producers that are NOT a deliberate
+# human judgment about the escalation itself -- ``plugins/kanban/dashboard/plugin_api.py``
+# ``_set_status_direct()`` emits it on every dashboard drag-drop (including a no-op
+# same-value write), and ``invalidate_descendants_for_parent_reopen`` below emits it on
+# every automatically-invalidated descendant of a reopened ancestor. Either one would
+# silently clear a still-unresolved escalation with no human ever looking at it. Only add
+# a kind here when its ONLY repo-wide producer is itself a deliberate resolution.
+_BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "archived")
+
+
+def block_loop_unresolved_clause(alias: str = "tasks") -> tuple[str, tuple]:
+    """SQL boolean expression (+ its bind params) that is true when ``<alias>.id``
+    carries a ``block_loop_detected`` escalation with no resolving event after it.
+
+    Shared by ``list_tasks(exclude_block_loop=True)`` (bulk enumeration) and the
+    CAS in ``specify_triage_task``/``decompose_triage_task`` (single-task gate,
+    evaluated inside the SAME write transaction as the promotion) so a card
+    enumerated as eligible minutes ago can never be promoted after a
+    ``block_loop_detected`` lands in between (#PR12 release-gate MAJOR 2):
+    the guard and the mutation share one CAS instead of a stale id list.
+    """
+    placeholders = ", ".join("?" for _ in _BLOCK_LOOP_RESOLUTION_KINDS)
+    sql = (
+        "EXISTS ("
+        "SELECT 1 FROM task_events e"
+        f" WHERE e.task_id = {alias}.id"
+        "   AND e.kind = 'block_loop_detected'"
+        "   AND NOT EXISTS ("
+        "     SELECT 1 FROM task_events e2"
+        "      WHERE e2.task_id = e.task_id"
+        "        AND e2.id > e.id"
+        f"        AND e2.kind IN ({placeholders})"
+        "   )"
+        ")"
+    )
+    return sql, _BLOCK_LOOP_RESOLUTION_KINDS
+
+
+def task_has_unresolved_block_loop(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Single-id twin of ``list_tasks(exclude_block_loop=True)``'s predicate, for a
+    call site that already holds one task (``_load_triage_task``) and wants to
+    refuse before even starting the (slow) auxiliary LLM call."""
+    clause, clause_params = block_loop_unresolved_clause("tasks")
+    row = conn.execute(
+        f"SELECT 1 FROM tasks WHERE id = ? AND ({clause})",
+        (task_id, *clause_params),
+    ).fetchone()
+    return row is not None
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -1423,7 +1486,19 @@ def list_tasks(
     tenant: Optional[str] = None, session_id: Optional[str] = None, include_archived: bool = False,
     limit: Optional[int] = None, order_by: Optional[str] = None,
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
+    exclude_block_loop: bool = False,
 ) -> list[Task]:
+    """``exclude_block_loop=True`` drops a task that has a ``block_loop_detected``
+    event with no *resolving* event after it -- a human-gated escalation that a
+    sweep (auto-decompose, auto-specify) must never re-touch. "Resolving" is an
+    explicit allowlist (``_BLOCK_LOOP_RESOLUTION_KINDS``: the triage sweep actually
+    promoting the card, or an explicit unblock/archive) -- deliberately NOT
+    "whatever event happens to land next" and NOT a manual status move (see the
+    comment above ``_BLOCK_LOOP_RESOLUTION_KINDS`` for why ``status`` is excluded),
+    so a plain ``commented`` row (e.g. from ``add_comment``) can never silently
+    clear a still-unresolved escalation. A card unblocked and later re-escalated
+    for an unrelated reason (a fresh ``block_loop_detected`` with no resolving
+    event after it) is excluded again."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
@@ -1438,6 +1513,10 @@ def list_tasks(
             params.append(val)
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
+    if exclude_block_loop:
+        clause, clause_params = block_loop_unresolved_clause("tasks")
+        query += f" AND NOT ({clause})"
+        params.extend(clause_params)
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3182,6 +3261,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            recurrence_limit=_resolve_block_recurrence_limit(),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3215,9 +3295,24 @@ def block_task(
     return True
 
 
+def _resolve_block_recurrence_limit() -> int:
+    """``kanban.block_recurrence_limit`` config override (default
+    ``BLOCK_RECURRENCE_LIMIT``). A missing/invalid/non-positive value falls
+    back to the hardcoded default rather than raising -- this guards a
+    circuit breaker, so a bad config value must never disable it."""
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        raw = cfg_get(load_config_readonly(), "kanban", "block_recurrence_limit", default=BLOCK_RECURRENCE_LIMIT)
+        limit = int(raw)
+        return limit if limit >= 1 else BLOCK_RECURRENCE_LIMIT
+    except Exception:  # health: allow BLE001 -- fail-closed: a bad/missing config value must never disable this circuit breaker
+        return BLOCK_RECURRENCE_LIMIT
+
+
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, recurrence_limit: Optional[int] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3230,16 +3325,18 @@ def _route_block(
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``recurrence_limit`` (``kanban.block_recurrence_limit`` config, default
+    ``BLOCK_RECURRENCE_LIMIT``) the task routes to ``triage`` for a human.
     """
+    limit = recurrence_limit if recurrence_limit is not None else BLOCK_RECURRENCE_LIMIT
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
-    if recurrences >= BLOCK_RECURRENCE_LIMIT:
-        payload["limit"] = BLOCK_RECURRENCE_LIMIT
+    if recurrences >= limit:
+        payload["limit"] = limit
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
@@ -3557,11 +3654,69 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    clear_escalation: bool = False, confirmed_by: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    A third case (PR12 release-gate MAJOR 2): a ``triage`` row carrying an
+    unresolved ``block_loop_detected`` escalation. Before this, that escalation
+    had NO forward move at all -- ``specify_triage_task``/``decompose_triage_task``
+    refuse it on purpose (the fail-closed CAS), and this function itself used to
+    refuse it too (only ``blocked``/``scheduled`` in the ``WHERE``), leaving
+    ``archive`` as the only way to clear a human-gated escalation.
+
+    ``clear_escalation`` is the authority gate for that third case, ``confirmed_by``
+    is the PROVENANCE gate (round-7 finding: ``clear_escalation=True`` alone gated
+    the call CHANNEL -- "not a dispatcher-spawned worker" -- not the caller; a plain
+    subprocess with no ``HERMES_KANBAN_TASK`` and no ``kanban`` toolset at all, an
+    unattended cron heartbeat, or a CEO/default session could all still set it).
+    ``confirmed_by`` must be a non-empty provenance string a model or bare script
+    cannot mint on its own -- one of:
+
+    - the CLI path (``hermes_cli/kanban.py::_cmd_unblock``), which refuses outright
+      unless both stdin/stdout are a real, live TTY and then requires the human to
+      type ``yes`` at an interactive prompt right now, in this process, passing
+      ``confirmed_by=f"cli-tty:{author}"``;
+    - the dashboard's authenticated drag-to-ready action (``plugins/kanban/dashboard/
+      plugin_api.py::_drag_to``), passing ``confirmed_by="dashboard"`` -- the human
+      surface MINOR 2 named as able to bypass but never resolve this escalation.
+
+    The model-facing ``kanban_unblock`` MCP tool (``tools/kanban_tools.py``) calls
+    this with the default ``clear_escalation=False`` and so still refuses an
+    escalated triage card outright -- its schema has no such parameter for a model
+    to set. With both ``clear_escalation=True`` and a non-empty ``confirmed_by``
+    this records a resolving ``unblocked`` event (one of
+    ``_BLOCK_LOOP_RESOLUTION_KINDS``) carrying ``confirmed_by`` in its payload, and
+    leaves status/claim/run fields alone -- no dangling-run reclaim (nothing was
+    running), no status change (the card stays in triage, now eligible for
+    ``specify``/``decompose`` again).
+    """
     now = int(time.time())
     with write_txn(conn):
+        if _task_status(conn, task_id) == "triage":
+            if not clear_escalation:
+                return False
+            if not confirmed_by:
+                # Fail-closed: clear_escalation alone is not provenance. Every
+                # non-worker call site this function cannot distinguish from a bare
+                # subprocess must supply its own proof a human is actually present.
+                return False
+            if not task_has_unresolved_block_loop(conn, task_id):
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'triage'", (task_id,),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(
+                conn, task_id, "unblocked",
+                {"escalation_resolved": True, "confirmed_by": confirmed_by},
+            )
+            return True
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"
@@ -3737,8 +3892,12 @@ def specify_triage_task(
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
-    txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
-    gating still applies; the audit comment is written only when a field changed.
+    txn; False when not in triage OR has an unresolved ``block_loop_detected``
+    escalation (the CAS predicate is evaluated here, atomically with the
+    mutation -- a stale enumeration from ``list_tasks(exclude_block_loop=True)``
+    can never win a race against an escalation that lands in between, #PR12
+    release-gate MAJOR 2). Lands in ``todo`` (not ``ready``) so parent gating
+    still applies; the audit comment is written only when a field changed.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3766,9 +3925,11 @@ def specify_triage_task(
             params.append(assignee)
             changed_fields.append("assignee")
         params.append(task_id)
+        clause, clause_params = block_loop_unresolved_clause("tasks")
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
-            f"WHERE id = ? AND status = 'triage'", tuple(params),
+            f"WHERE id = ? AND status = 'triage' AND NOT ({clause})",
+            tuple(params) + tuple(clause_params),
         )
         if cur.rowcount != 1:
             return False
@@ -3867,18 +4028,22 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def schedule_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, resume_at: Optional[int] = None,
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
-    until ``unblock_task`` re-gates it."""
+    until ``unblock_task`` re-gates it, or — when ``resume_at`` (epoch
+    seconds) is given — until :func:`recompute_scheduled` auto-promotes it
+    back to ``ready`` on its own. ``resume_at`` is the quota/429 backoff
+    path's timer; omit it to keep the old park-forever behaviour."""
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [None if resume_at is None else int(resume_at), task_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   resume_at    = ?
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
@@ -3892,6 +4057,34 @@ def schedule_task(
         )
         _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
         return True
+
+
+def recompute_scheduled(conn: sqlite3.Connection) -> int:
+    """Promote ``scheduled`` tasks whose ``resume_at`` timer has arrived back
+    to ``ready``; returns the count. Sibling of :func:`recompute_ready`,
+    opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+
+    A ``scheduled`` row with no ``resume_at`` (the legacy / human-driven
+    path) is left alone forever, exactly as before this timer existed —
+    only ``unblock_task`` moves it.
+    """
+    now = int(time.time())
+    promoted = 0
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'scheduled' "
+            "AND resume_at IS NOT NULL AND resume_at <= ?", (now,),
+        ).fetchall()
+        for row in rows:
+            task_id = row["id"]
+            if conn.execute(
+                "UPDATE tasks SET status = 'ready', resume_at = NULL "
+                "WHERE id = ? AND status = 'scheduled'", (task_id,),
+            ).rowcount != 1:
+                continue
+            _append_event(conn, task_id, "promoted", {"status": "ready", "reason": "resume_at_due"})
+            promoted += 1
+    return promoted
 
 
 # --- Worker context builder (what a spawned worker sees) ---

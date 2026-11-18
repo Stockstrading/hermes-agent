@@ -28,6 +28,7 @@ from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import profiles as profiles_mod
 from hermes_cli.kanban_specify import (
     _call_aux, _extract_json_blob, _load_triage_task, _task_prompt_fields, _title_body,
+    _routing_guard_mismatch, review_only_profiles_from_config,
 )
 from hermes_cli.kanban_specify import _profile_author as _specify_author
 
@@ -139,7 +140,8 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
     silently become the owner of work the card was assigned away from (#114294).
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    explicit = (kanban_cfg.get(key) or "").strip()
+    raw = kanban_cfg.get(key) if isinstance(kanban_cfg, dict) else None
+    explicit = raw.strip() if isinstance(raw, str) else ""
     for candidate in (explicit, (fallback or "").strip()):
         if candidate:
             try:
@@ -199,6 +201,7 @@ class _Routing:
     auto_promote: bool
     roster: list[dict]
     valid_names: set[str]
+    review_only_profiles: set[str]
 
 
 def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
@@ -215,6 +218,7 @@ def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
+        review_only_profiles=review_only_profiles_from_config(cfg),
     )
 
 
@@ -232,14 +236,43 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
         ok = kb.specify_triage_task(
             conn, task.id, title=title_val, body=body_val, assignee=assignee_val, author=author,
         )
+        if ok:
+            # Rule 6 routing guard (log-only phase): check the assignee that actually
+            # lands (freshly chosen, or the task's pre-existing one) against the final
+            # title/body. Audit-only: must never raise past an already-successful
+            # promotion and abort the rest of an ``--all`` sweep (round-2 finding 3).
+            try:
+                final_assignee = assignee_val if assignee_val is not None else task.assignee
+                mismatch = _routing_guard_mismatch(
+                    final_assignee,
+                    title_val if title_val is not None else task.title,
+                    body_val if body_val is not None else task.body,
+                    review_only_profiles=routing.review_only_profiles,
+                    default_assignee=routing.default_assignee,
+                )
+                if mismatch:
+                    kb.add_comment(conn, task.id, author, mismatch)
+            except Exception:
+                logger.warning(
+                    "decompose %s: routing guard phase failed (card already "
+                    "promoted, continuing)", task.id, exc_info=True,
+                )
+        elif kb.task_has_unresolved_block_loop(conn, task.id):
+            # MINOR 2 (round-5): name the real cause instead of a promotion/
+            # archive that never happened.
+            return DecomposeOutcome(task.id, False, "escalation landed during the call")
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
 def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[list[dict], str]:
-    """Validate/normalise the LLM's ``tasks`` list; ``(children, "")`` or ``([], reason)``.
-    Unknown assignees route to the default; never assignee=None."""
+    """Validate/normalise the LLM's tasks list; (children, "") or ([], reason).
+    Unknown assignees route to the default; never assignee=None. Guard comments are
+    computed later, by the caller, AFTER a successful fan-out (round-5 MINOR 1):
+    computing them here ran before any DB work, so a bad guard computation raised
+    straight out of _apply_fanout with no per-card try/except anywhere above it
+    (_run_triage_sweep), aborting the rest of an --all sweep on one bad card."""
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
@@ -261,9 +294,10 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
+        clean_body = body.strip() if isinstance(body, str) else ""
         children.append({
             "title": title.strip()[:200],
-            "body": body.strip() if isinstance(body, str) else "",
+            "body": clean_body,
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
@@ -278,6 +312,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     children, reason = _clean_children(task_id, raw_tasks, routing)
     if reason:
         return DecomposeOutcome(task_id, False, reason)
+    reason_on_fail = "task already decomposed or moved out of triage"
     try:
         with kbc.connect_closing() as conn:
             child_ids = decompose_triage_task(
@@ -288,13 +323,39 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 author=author,
                 auto_promote=routing.auto_promote,
             )
+            if child_ids:
+                # Rule 6 routing guard (log-only phase): computed AFTER a successful
+                # fan-out (round-5 MINOR 1 moved this out of _clean_children, which ran
+                # before any DB work) so a bad computation can never abort the primary
+                # creation (round-2 finding 3). One try/except PER CHILD -- the old
+                # single try wrapping the whole loop dropped every later child's audit
+                # comment when an earlier one failed.
+                for child, child_id in zip(children, child_ids):
+                    try:
+                        mismatch = _routing_guard_mismatch(
+                            child["assignee"], child["title"], child["body"],
+                            review_only_profiles=routing.review_only_profiles,
+                            default_assignee=routing.default_assignee,
+                        )
+                        if mismatch:
+                            kb.add_comment(conn, child_id, author, mismatch)
+                    except Exception:
+                        logger.warning(
+                            "decompose %s: routing guard phase failed for child %s "
+                            "(child already created, continuing)", task_id, child_id,
+                            exc_info=True,
+                        )
+            elif kb.task_has_unresolved_block_loop(conn, task_id):
+                # MINOR 2 (round-5): name the real cause instead of implying a
+                # decompose/promotion/archive that never happened.
+                reason_on_fail = "escalation landed during the call"
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, reason_on_fail)
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -337,7 +398,15 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column.
+
+    Excludes a card carrying an unresolved ``block_loop_detected`` escalation
+    (one with no resolving event -- see ``kb.list_tasks(exclude_block_loop=True)``
+    -- AFTER it; NOT merely "the most recent event is block_loop_detected", so a
+    later unrelated comment can't un-hide it) -- that escalation is for a human
+    (or ``kanban_unblock``), not for this sweep. A card unblocked and later
+    re-escalated for an unrelated, newer reason is excluded again.
+    """
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
+        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000, exclude_block_loop=True)
     return [row.id for row in rows]

@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -33,6 +35,8 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser
+
+logger = logging.getLogger(__name__)
 
 
 # --- Flag parsing helpers ---
@@ -1027,9 +1031,34 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        # Round-7 release-gate MAJOR 2: `clear_escalation=True` is the authority gate,
+        # not the proof a human is present -- it used to be reachable by any session
+        # without HERMES_KANBAN_TASK set, a population a bare, unattended subprocess
+        # (no kanban toolset at all) and the cron heartbeat both belong to. An
+        # escalated triage card now additionally requires a live interactive TTY
+        # confirmation typed right now, in THIS process; the provenance string that
+        # proves it travels into the resolving `unblocked` event via `confirmed_by`.
+        escalated = {tid for tid in ids if kb.task_has_unresolved_block_loop(conn, tid)}
+        confirmed_by = None
+        if escalated:
+            names = ", ".join(sorted(escalated))
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                return _err(
+                    f"cannot clear the human-gated escalation on {names} from a "
+                    "non-interactive session; run `hermes kanban unblock` from a real "
+                    "terminal, or resolve it from the dashboard"
+                )
+            print(f"The following task(s) carry an unresolved escalation: {names}")
+            answer = input("Type 'yes' to confirm clearing the escalation: ").strip().lower()
+            if answer != "yes":
+                return _err("escalation not cleared: confirmation not given")
+            confirmed_by = f"cli-tty:{_profile_author()}"
+        op = _commented(conn, reason, author, "UNBLOCK",
+                        lambda tid: kb.unblock_task(
+                            conn, tid, clear_escalation=True,
+                            confirmed_by=confirmed_by if tid in escalated else None))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
-                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
+                           lambda tid: f"cannot unblock {tid} (not blocked/scheduled, or triage with no unresolved escalation?)")
 
 
 def _cmd_request_review(args: argparse.Namespace) -> int:
@@ -1274,7 +1303,18 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
 
     ok_count = 0
     for tid in ids:
-        outcome = run_one(tid, author=author)
+        try:
+            outcome = run_one(tid, author=author)
+        except Exception as exc:
+            # MINOR 1 (round-6): an exception escaping run_one used to abort the
+            # whole `--all` sweep -- the root cause the `_clean_children`
+            # docstring names. Record the failure on this one card and continue
+            # with the rest, same as the per-child guard after a fan-out.
+            logger.warning("%s %s: unhandled error, skipping", verb, tid, exc_info=True)
+            outcome = SimpleNamespace(
+                task_id=tid, ok=False, reason=f"unhandled error: {exc}",
+                new_title=None, fanout=False, child_ids=None,
+            )
         if outcome.ok:
             ok_count += 1
         if want_json:

@@ -20,6 +20,7 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,237 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         payload = events[-1].payload or {}
         assert payload.get("recurrences") == 2
         assert payload.get("kind") == "capability"
+
+
+def test_unblock_task_resolves_triage_escalation(kanban_home: Path) -> None:
+    """PR12 release-gate MAJOR 2: before this, an escalated ``triage`` row had
+    NO forward move at all -- ``specify``/``decompose``/``promote`` all refuse
+    it on purpose, and ``unblock_task`` itself only accepted ``blocked``/
+    ``scheduled``, leaving ``archive`` as the only way to clear it. This is
+    the attended, single-id recovery: status stays ``triage``, but the card
+    is no longer excluded from enumeration/specify/decompose.
+
+    Round-6 MAJOR 2: clearing the escalation requires the explicit
+    ``clear_escalation=True`` authority flag -- the human CLI path sets it,
+    the model-facing ``kanban_unblock`` tool never does.
+
+    Round-7 MAJOR 2: ``clear_escalation=True`` alone is the authority gate, not
+    proof a human is present -- ``confirmed_by`` (a non-empty provenance string
+    only the CLI's interactive-TTY confirmation or the dashboard's authenticated
+    drag action supply) is now also required.
+    """
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+        assert kb.unblock_task(conn, tid, clear_escalation=True, confirmed_by="cli-tty:human") is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"  # unchanged -- not a status move
+        assert not kb.task_has_unresolved_block_loop(conn, tid)
+        events = kb.list_events(conn, tid)
+        assert "unblocked" in [e.kind for e in events]
+        unblocked_event = max(
+            (e for e in events if e.kind == "unblocked"), key=lambda e: (e.created_at, e.id),
+        )
+        assert unblocked_event.payload.get("confirmed_by") == "cli-tty:human"
+        # Now reachable by the real promotion paths again.
+        assert kb.specify_triage_task(conn, tid, title="Tightened", author="human")
+        # Lands in todo, then recompute_ready flips a parent-free task to ready.
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_without_clear_escalation_refuses_escalated_triage_card(
+    kanban_home: Path,
+) -> None:
+    """Round-6 MAJOR 2: the default (``clear_escalation=False``, what the
+    model-facing ``kanban_unblock`` tool always calls with) must refuse an
+    escalated triage card -- only the human CLI path's explicit
+    ``clear_escalation=True`` may clear it. Without this gate, any
+    orchestrator session carrying the ``kanban`` toolset (including an
+    unattended cron heartbeat) could clear a human-gated escalation through
+    the single-id MCP tool."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+        assert kb.unblock_task(conn, tid) is False  # clear_escalation defaults False
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)  # still escalated
+
+
+def test_unblock_task_clear_escalation_without_confirmed_by_refuses(
+    kanban_home: Path,
+) -> None:
+    """Round-7 MAJOR 2: ``clear_escalation=True`` with no ``confirmed_by`` must
+    still refuse -- the authority flag alone used to be reachable by any
+    non-worker caller (CEO/default session, bare subprocess with no
+    HERMES_KANBAN_TASK and no kanban toolset, unattended cron heartbeat), none
+    of which proves a human is actually present."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+        assert kb.unblock_task(conn, tid, clear_escalation=True) is False
+        assert kb.unblock_task(conn, tid, clear_escalation=True, confirmed_by="") is False
+
+        assert kb.task_has_unresolved_block_loop(conn, tid)  # still escalated
+
+
+def test_unblock_task_refuses_triage_row_without_escalation(kanban_home: Path) -> None:
+    """A plain (non-escalated) triage row is untouched: unblock is not a
+    generic triage->triage no-op button."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rough idea", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        assert kb.unblock_task(conn, tid) is False
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 7 MAJOR 2 — the real CLI entry point (`hermes kanban
+# unblock`), not just the library kwarg, must refuse to clear an escalation
+# outside a live, attended TTY session, and must record who confirmed it.
+# ---------------------------------------------------------------------------
+
+
+def _run_kanban_cli(*argv: str) -> int:
+    root = argparse.ArgumentParser()
+    subp = root.add_subparsers(dest="cmd")
+    kanban_cli.build_parser(subp)
+    ns = root.parse_args(["kanban", *argv])
+    return kanban_cli.kanban_command(ns)
+
+
+def test_cmd_unblock_refuses_escalated_card_from_non_interactive_session(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-7 MAJOR 2's exact repro: a plain, non-interactive invocation (no
+    live TTY on stdin/stdout -- what a bare subprocess or the unattended cron
+    heartbeat actually looks like) must never clear a human-gated escalation,
+    independent of whether HERMES_KANBAN_TASK happens to be unset."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+    rc = _run_kanban_cli("unblock", tid)
+
+    assert rc != 0
+    with kbc.connect_closing() as conn:
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+
+def test_cmd_unblock_clears_escalated_card_with_interactive_confirmation(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live TTY session typing 'yes' is the one path allowed to clear it, and
+    the confirming provenance lands in the resolving event's payload."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "yes")
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+    rc = _run_kanban_cli("unblock", tid)
+
+    assert rc == 0
+    with kbc.connect_closing() as conn:
+        assert not kb.task_has_unresolved_block_loop(conn, tid)
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "unblocked"]
+        resolving = [e for e in events if (e.payload or {}).get("escalation_resolved")]
+        assert resolving
+        assert str(resolving[-1].payload.get("confirmed_by", "")).startswith("cli-tty:")
+
+
+def test_cmd_unblock_refuses_escalated_card_without_yes_confirmation(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live TTY that types anything other than 'yes' must not clear it."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a, **_kw: "sure")
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+    rc = _run_kanban_cli("unblock", tid)
+
+    assert rc != 0
+    with kbc.connect_closing() as conn:
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+
+def test_block_recurrence_limit_config_override_raises_threshold(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``kanban.block_recurrence_limit`` raises the escalation threshold above
+    the hardcoded ``BLOCK_RECURRENCE_LIMIT`` default: the same re-block count
+    that trips the default stays ``blocked`` under the higher configured
+    limit."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"block_recurrence_limit": 5}},
+    )
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        # Second same-kind re-block: recurrences == kb.BLOCK_RECURRENCE_LIMIT (2),
+        # which would trip the hardcoded default but must stay under limit=5.
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "blocked"
+        assert not [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+
+
+def test_block_recurrence_limit_config_override_lowers_threshold(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured limit BELOW the hardcoded default escalates earlier."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"kanban": {"block_recurrence_limit": 1}},
+    )
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        # First block ever: recurrences == 1, which already meets limit=1.
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        events = [e for e in kb.list_events(conn, tid) if e.kind == "block_loop_detected"]
+        assert events and events[-1].payload.get("limit") == 1
 
 
 # ---------------------------------------------------------------------------
