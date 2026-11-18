@@ -1031,8 +1031,32 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
+        # Round-7 release-gate MAJOR 2: `clear_escalation=True` is the authority gate,
+        # not the proof a human is present -- it used to be reachable by any session
+        # without HERMES_KANBAN_TASK set, a population a bare, unattended subprocess
+        # (no kanban toolset at all) and the cron heartbeat both belong to. An
+        # escalated triage card now additionally requires a live interactive TTY
+        # confirmation typed right now, in THIS process; the provenance string that
+        # proves it travels into the resolving `unblocked` event via `confirmed_by`.
+        escalated = {tid for tid in ids if kb.task_has_unresolved_block_loop(conn, tid)}
+        confirmed_by = None
+        if escalated:
+            names = ", ".join(sorted(escalated))
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                return _err(
+                    f"cannot clear the human-gated escalation on {names} from a "
+                    "non-interactive session; run `hermes kanban unblock` from a real "
+                    "terminal, or resolve it from the dashboard"
+                )
+            print(f"The following task(s) carry an unresolved escalation: {names}")
+            answer = input("Type 'yes' to confirm clearing the escalation: ").strip().lower()
+            if answer != "yes":
+                return _err("escalation not cleared: confirmation not given")
+            confirmed_by = f"cli-tty:{_profile_author()}"
         op = _commented(conn, reason, author, "UNBLOCK",
-                        lambda tid: kb.unblock_task(conn, tid, clear_escalation=True))
+                        lambda tid: kb.unblock_task(
+                            conn, tid, clear_escalation=True,
+                            confirmed_by=confirmed_by if tid in escalated else None))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled, or triage with no unresolved escalation?)")
 

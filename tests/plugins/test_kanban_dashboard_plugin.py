@@ -1259,3 +1259,61 @@ def test_ws_events_for_archived_board_does_not_recreate_it(tmp_path, monkeypatch
         "/api/plugins/kanban/events?token=secret-xyz&board=alive"
     ) as ws:
         assert ws is not None
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate round-7 MAJOR 2 / MINOR 2 — dragging an escalated triage
+# card to "ready" must resolve the block_loop_detected escalation through the
+# same authenticated-provenance path the CLI uses, not bypass it.
+# ---------------------------------------------------------------------------
+
+
+def _escalated_triage_task(conn) -> str:
+    """A task driven through block/unblock/re-block until the recurrence
+    breaker lands it in ``triage`` with an unresolved ``block_loop_detected``
+    escalation (same recipe as ``tests/hermes_cli/test_kanban_block_kinds.py``)."""
+    tid = kb.create_task(conn, title="escalated", assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    kb.unblock_task(conn, tid)
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+    assert kb.claim_task(conn, tid, claimer="worker") is not None
+    kb.block_task(conn, tid, reason="x", kind="capability")
+    assert kb.get_task(conn, tid).status == "triage"
+    assert kb.task_has_unresolved_block_loop(conn, tid)
+    return tid
+
+
+def test_dashboard_drag_to_ready_resolves_escalation(client):
+    """Round-7: before this, dragging an escalated triage card to 'ready' fell
+    through to `_set_status_direct`, leaving the escalation unresolved while
+    the card became dispatchable again."""
+    with kbc.connect() as conn:
+        tid = _escalated_triage_task(conn)
+
+    response = client.patch(f"/api/plugins/kanban/tasks/{tid}", json={"status": "ready"})
+    assert response.status_code == 200, response.text
+
+    with kbc.connect() as conn:
+        assert not kb.task_has_unresolved_block_loop(conn, tid)
+        events = kb.list_events(conn, tid)
+        unblocked = [e for e in events if e.kind == "unblocked" and (e.payload or {}).get("escalation_resolved")]
+        assert unblocked, [e.kind for e in events]
+        assert unblocked[-1].payload.get("confirmed_by") == "dashboard"
+
+
+def test_dashboard_drag_to_ready_on_plain_triage_card_still_works(client):
+    """A plain (non-escalated) triage card dragged to ready must keep working
+    through the ordinary direct-status path -- this is not a generic
+    triage->ready blocker."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "plain idea"}).json()["task"]
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (t["id"],))
+
+    response = client.patch(f"/api/plugins/kanban/tasks/{t['id']}", json={"status": "ready"})
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["status"] == "ready"

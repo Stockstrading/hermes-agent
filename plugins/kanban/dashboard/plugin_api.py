@@ -578,11 +578,19 @@ _RUNNING_DIRECT_MSG = "Cannot set status to 'running' directly; use the dispatch
 
 def _drag_to(conn, task_id: str, s: str) -> bool:
     """Drag-drop into ready/todo/triage: blocked/scheduled -> ready re-opens via ``unblock_task``;
-    leaving ``review`` goes through ``reopen_review_task`` (stale-run recovery, parent re-gate,
-    ``review_reopened`` event) instead of a raw write; ``triage`` needs no current-state query."""
+    an escalated ``triage`` card dragged to ``ready`` resolves the escalation through the same
+    function (round-7 MAJOR 2/MINOR 2: the dashboard used to bypass the escalation via
+    ``_set_status_direct`` without ever clearing it -- the human surface that CAN resolve it now
+    does, passing ``confirmed_by="dashboard"``, the provenance string an authenticated dashboard
+    action carries that a model/script cannot mint on its own); leaving ``review`` goes through
+    ``reopen_review_task`` (stale-run recovery, parent re-gate, ``review_reopened`` event) instead
+    of a raw write; ``triage`` with no escalation needs no current-state query."""
     current = kanban_db.get_task(conn, task_id) if s != "triage" else None
     if s == "ready" and current and current.status in ("blocked", "scheduled"):
         return kanban_db.unblock_task(conn, task_id)
+    if (s == "ready" and current and current.status == "triage"
+            and kanban_db.task_has_unresolved_block_loop(conn, task_id)):
+        return kanban_db.unblock_task(conn, task_id, clear_escalation=True, confirmed_by="dashboard")
     if current is not None and current.status == "review":
         return kanban_db.reopen_review_task(conn, task_id)
     return _set_status_direct(conn, task_id, s)

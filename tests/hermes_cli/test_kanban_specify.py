@@ -421,3 +421,139 @@ def test_preserve_pr_refs_title_rewrite_does_not_promote_body_only_url():
     assert new_title == "Tightened investigation"
 
 
+# ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 7 MAJOR 1 — an explicit owner/repo prefix is
+# evidence, not a guess, and bypasses the ambiguous-word filter entirely.
+# This is the structural fix for "Even Stockstrading/capital PR #6 yields
+# nothing" (the post-slash token "capital" used to reach the bare-word
+# matcher and get denied).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("Stockstrading/capital PR #6", {"capital#6"}),
+    ("Stockstrading/test PR #88", {"test#88"}),
+    ("NousResearch/hermes-agent PR #12", {"hermes-agent#12"}),
+    ("org/open PR #99", {"open#99"}),
+])
+def test_round7_owner_repo_prefix_bypasses_the_word_filter(title, expected):
+    assert spec._card_pr_keys(title, None) == expected
+
+
+def test_round7_owner_repo_prefix_does_not_double_count_the_bare_token():
+    """The post-slash repo token must not also be re-evaluated (and denied) as a
+    second, separate bare-word match."""
+    assert spec._card_pr_keys("Stockstrading/capital PR #6", None) == {"capital#6"}
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 7 MAJOR 1 — the 20 further PR-workflow verbs the
+# gate-2/gate-3 measurement found still fabricating a key, plus the -ise
+# spelling of an already-listed verb ("summarize"/"analyze"), must produce no
+# key either. A fixture corpus mixing these fabrication candidates with the
+# real-repo-shaped cases from round 6 (below) is the acceptance test.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title", [
+    "Deploy PR #1", "Triage PR #1", "Document PR #1", "Split PR #1",
+    "Unblock PR #1", "Finish PR #1", "Ship PR #1", "Reject PR #1",
+    "Draft PR #1", "Amend PR #1", "Squash PR #1", "Cherry-pick PR #1",
+    "Finalize PR #1", "Confirm PR #1", "Recheck PR #1", "Sync PR #1",
+    "Monitor PR #1", "Validate PR #1", "Re-run PR #1", "Analyze PR #1",
+    # the exact fabrications measured over real titles
+    "analyze#312".replace("#312", " PR #312"), "finish#440".replace("#440", " PR #440"),
+    "Investigate checkout#103".replace("checkout#103", "checkout PR #103"),
+    "Split the parent#296".replace("parent#296", "parent PR #296"),
+    "Reduce port#114".replace("port#114", "port PR #114"),
+    "Clear PR #115", "Duplicate PR #431", "Exceed PR #221",
+    # the -ise spelling of a listed verb
+    "Summarise PR #3", "Finalise PR #1", "Analyse PR #1",
+])
+def test_round7_pr_ref_fabrication_words_produce_no_key(title):
+    assert spec._card_pr_keys(title, None) == set()
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("strategy-api PR #528", {"strategy-api#528"}),
+    ("hermes-agent PR #12", {"hermes-agent#12"}),
+    ("numpy PR #123", {"numpy#123"}),
+    ("AI-StockTrading PR #617", {"ai-stocktrading#617"}),
+])
+def test_round7_real_repo_pr_refs_still_produce_their_key(title, expected):
+    """The fixture corpus's real-repo half: these must keep working while every
+    fabrication candidate above produces no key."""
+    assert spec._card_pr_keys(title, None) == expected
+
+
+def test_round7_capital_and_test_stay_ambiguous_without_owner_qualification():
+    """Round-7 design decision: a bare, unqualified 'Capital PR #6' / 'Test PR #88'
+    is indistinguishable from an English sentence using that word, so it is never
+    minted into a key (see the design note above `_PR_REF_NON_REPO_WORDS`). The
+    owner-qualified and GH-URL forms are the supported way to name a repo that
+    happens to share a spelling with a common word -- covered separately above."""
+    assert spec._card_pr_keys("Capital PR #6", None) == set()
+    assert spec._card_pr_keys("Test PR #88", None) == set()
+
+
+def test_round7_verbatim_pr_ref_preserved_even_when_ambiguous():
+    """An ambiguous bare-word reference is never minted into a key, but it must
+    still never be silently dropped: _preserve_pr_refs re-attaches it verbatim."""
+    old_title = "Capital PR #6: quarterly review"
+    new_title, _ = spec._preserve_pr_refs(old_title, "body", "Tightened quarterly review", None)
+    assert new_title is not None
+    assert "PR #6" in new_title
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 7 MINOR 1 — the per-card sweep guard
+# (`_run_triage_sweep`'s try/except around `run_one`) had no test: mutating it
+# back to a straight call left the suite green. This exercises the real CLI
+# `--all` sweep with the first card raising and a later card succeeding,
+# through both JSON and text rendering.
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_guard_continues_after_one_task_raises_json(kanban_home, monkeypatch, capsys):
+    with kbc.connect() as conn:
+        bad = kb.create_task(conn, title="boom", triage=True)
+        good = kb.create_task(conn, title="fine", triage=True)
+
+    def fake_specify_task(task_id, *, author=None, timeout=None):
+        if task_id == bad:
+            raise RuntimeError("kaboom")
+        return spec.SpecifyOutcome(task_id, True, "specified", new_title="Fine: tightened")
+
+    monkeypatch.setattr(spec, "specify_task", fake_specify_task)
+
+    rc = _run_cli("specify", "--all", "--json")
+
+    assert rc == 0  # at least one id succeeded
+    lines = [jsonlib.loads(l) for l in capsys.readouterr().out.strip().splitlines() if l]
+    by_id = {row["task_id"]: row for row in lines}
+    assert by_id[bad]["ok"] is False
+    assert "kaboom" in by_id[bad]["reason"]
+    assert by_id[good]["ok"] is True
+
+
+def test_sweep_guard_continues_after_one_task_raises_text(kanban_home, monkeypatch, capsys):
+    with kbc.connect() as conn:
+        bad = kb.create_task(conn, title="boom", triage=True)
+        good = kb.create_task(conn, title="fine", triage=True)
+
+    def fake_specify_task(task_id, *, author=None, timeout=None):
+        if task_id == bad:
+            raise RuntimeError("kaboom")
+        return spec.SpecifyOutcome(task_id, True, "specified", new_title="Fine: tightened")
+
+    monkeypatch.setattr(spec, "specify_task", fake_specify_task)
+
+    rc = _run_cli("specify", "--all")
+
+    assert rc == 0
+    out, err = capsys.readouterr()
+    assert "Specified" in out and good in out
+    assert "kaboom" in err and bad in err
+
+
+

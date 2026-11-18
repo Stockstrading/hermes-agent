@@ -3654,7 +3654,10 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str, *, clear_escalation: bool = False) -> bool:
+def unblock_task(
+    conn: sqlite3.Connection, task_id: str, *,
+    clear_escalation: bool = False, confirmed_by: Optional[str] = None,
+) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first.
 
@@ -3665,24 +3668,41 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, clear_escalation: bo
     refuse it too (only ``blocked``/``scheduled`` in the ``WHERE``), leaving
     ``archive`` as the only way to clear a human-gated escalation.
 
-    ``clear_escalation`` is the authority gate for that third case, NOT the
-    mechanism (round-6 finding: "single-id-only" is not "attended" -- any
-    orchestrator session carrying the ``kanban`` toolset, including an
-    unattended cron heartbeat, can call the single-id MCP tool). Only the human
-    CLI path (``hermes_cli/kanban.py::_cmd_unblock``) passes ``clear_escalation=
-    True``; the model-facing ``kanban_unblock`` tool (``tools/kanban_tools.py``)
-    calls this with the default ``False`` and so still refuses an escalated
-    triage card -- the schema has no ``clear_escalation`` parameter for a model
-    to set. With ``clear_escalation=True`` this records a resolving ``unblocked``
-    event (one of ``_BLOCK_LOOP_RESOLUTION_KINDS``) and leaves status/claim/run
-    fields alone -- no dangling-run reclaim (nothing was running), no status
-    change (the card stays in triage, now eligible for ``specify``/``decompose``
-    again).
+    ``clear_escalation`` is the authority gate for that third case, ``confirmed_by``
+    is the PROVENANCE gate (round-7 finding: ``clear_escalation=True`` alone gated
+    the call CHANNEL -- "not a dispatcher-spawned worker" -- not the caller; a plain
+    subprocess with no ``HERMES_KANBAN_TASK`` and no ``kanban`` toolset at all, an
+    unattended cron heartbeat, or a CEO/default session could all still set it).
+    ``confirmed_by`` must be a non-empty provenance string a model or bare script
+    cannot mint on its own -- one of:
+
+    - the CLI path (``hermes_cli/kanban.py::_cmd_unblock``), which refuses outright
+      unless both stdin/stdout are a real, live TTY and then requires the human to
+      type ``yes`` at an interactive prompt right now, in this process, passing
+      ``confirmed_by=f"cli-tty:{author}"``;
+    - the dashboard's authenticated drag-to-ready action (``plugins/kanban/dashboard/
+      plugin_api.py::_drag_to``), passing ``confirmed_by="dashboard"`` -- the human
+      surface MINOR 2 named as able to bypass but never resolve this escalation.
+
+    The model-facing ``kanban_unblock`` MCP tool (``tools/kanban_tools.py``) calls
+    this with the default ``clear_escalation=False`` and so still refuses an
+    escalated triage card outright -- its schema has no such parameter for a model
+    to set. With both ``clear_escalation=True`` and a non-empty ``confirmed_by``
+    this records a resolving ``unblocked`` event (one of
+    ``_BLOCK_LOOP_RESOLUTION_KINDS``) carrying ``confirmed_by`` in its payload, and
+    leaves status/claim/run fields alone -- no dangling-run reclaim (nothing was
+    running), no status change (the card stays in triage, now eligible for
+    ``specify``/``decompose`` again).
     """
     now = int(time.time())
     with write_txn(conn):
         if _task_status(conn, task_id) == "triage":
             if not clear_escalation:
+                return False
+            if not confirmed_by:
+                # Fail-closed: clear_escalation alone is not provenance. Every
+                # non-worker call site this function cannot distinguish from a bare
+                # subprocess must supply its own proof a human is actually present.
                 return False
             if not task_has_unresolved_block_loop(conn, task_id):
                 return False
@@ -3692,7 +3712,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str, *, clear_escalation: bo
             )
             if cur.rowcount != 1:
                 return False
-            _append_event(conn, task_id, "unblocked", {"escalation_resolved": True})
+            _append_event(
+                conn, task_id, "unblocked",
+                {"escalation_resolved": True, "confirmed_by": confirmed_by},
+            )
             return True
         resume_status = (
             _resume_status_from_events(conn, task_id)

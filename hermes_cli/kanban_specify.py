@@ -280,34 +280,84 @@ _GH_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)",
 # captured token's first character.
 _TITLE_PR_REF_RE = re.compile(
     r"(?<![\w.-])([A-Za-z][\w.-]*)\s+PR\s*#(\d+)\b", re.IGNORECASE)
+# Round-7 MAJOR 1: an explicit ``owner/repo`` prefix is actual evidence (a human or tool
+# wrote a path, not a sentence), so it bypasses the ambiguous-word filter entirely --
+# fixes the gate-2 finding that even ``Stockstrading/capital PR #6`` yielded nothing,
+# because only the bare post-slash token (``capital``, a denied word) ever reached the
+# matcher. Both segments are ``[\w.-]+`` (no further slashes) so greedy matching can't
+# eat a third path component.
+_OWNER_REPO_PR_REF_RE = re.compile(
+    r"(?<![\w./-])([A-Za-z0-9][\w.-]*)/([A-Za-z0-9][\w.-]*)\s+PR\s*#(\d+)\b", re.IGNORECASE)
 
 
-def _verb_forms(base: str) -> frozenset[str]:
-    """Regular English inflections (-s/-es/-ed/-ing, plus the y->i shift) for one
-    base verb, so a single entry in ``_PR_REF_NON_REPO_VERBS`` covers all of
-    merge/merged/merging/merges without hand-typing (and missing, as round-6 did)
-    every surface form."""
+def _regular_inflections(base: str) -> frozenset[str]:
+    """One base verb's regular English inflections: -s/-es/-ed/-ing, the y->i shift
+    (``verify``->``verified``), and CVC consonant doubling for a short, closed set of
+    single-syllable verbs that need it (``stop``->``stopped``/``stopping``, never
+    ``stoped``/``stoping`` -- the round-7 NIT). Doubling only fires for the verbs that
+    are actually single-syllable (stress always on the final syllable), so it can't
+    mis-double a multi-syllable word like ``monitor`` (->``monitored``, not
+    ``monitorred``) the way a blind CVC regex would."""
     if base.endswith("y") and len(base) > 1 and base[-2] not in "aeiou":
         stem = base[:-1]
         return frozenset({base, stem + "ied", base + "ing", stem + "ies"})
     if base.endswith("e"):
         stem = base[:-1]
         return frozenset({base, base + "d", stem + "ing", base + "s"})
+    if base in _DOUBLING_SINGLE_SYLLABLE_VERBS:
+        doubled = base + base[-1]
+        return frozenset({base, doubled + "ed", doubled + "ing", base + "s"})
     s_form = base + "es" if base.endswith(("s", "x", "z", "ch", "sh")) else base + "s"
     return frozenset({base, base + "ed", base + "ing", s_form})
 
 
-# Round-6 MAJOR 1: measured against the 8209 real card titles in
-# ~/.hermes/kanban.db, 80 fabricated a key from an ordinary English verb that
-# commonly precedes "PR #N" in a PR-workflow sentence (verify#560, rebase#103,
-# re-review#210, resolve#324, update#319, ...). These are the PR-workflow verbs
-# that measurement surfaced, each expanded to its regular inflections below.
-# "keep"/"kept" is irregular and listed as a literal word instead.
+# Single-syllable verbs ending consonant-vowel-consonant whose final consonant doubles
+# before -ed/-ing (``stop``->``stopped``). Deliberately a short, explicit set rather than
+# a CVC-shape regex: a shape-only rule would also (wrongly) double multi-syllable verbs
+# like ``monitor``/``confirm`` whose stress isn't on the final syllable.
+_DOUBLING_SINGLE_SYLLABLE_VERBS = frozenset({"stop", "ship"})
+
+
+def _verb_forms(base: str) -> frozenset[str]:
+    """Regular inflections for one base verb, plus the opposite -ize/-ise spelling
+    (``analyze``/``analyse``, ``finalize``/``finalise``) so a single American-spelled
+    entry in ``_PR_REF_NON_REPO_VERBS`` also covers the British form, instead of a
+    second hand-typed entry that round-7 proved gets missed (``Summarise PR #3``)."""
+    forms = _regular_inflections(base)
+    if base.endswith("ize"):
+        forms |= _regular_inflections(base[:-3] + "ise")
+    elif base.endswith("yze"):
+        forms |= _regular_inflections(base[:-3] + "yse")
+    elif base.endswith("ise"):
+        forms |= _regular_inflections(base[:-3] + "ize")
+    elif base.endswith("yse"):
+        forms |= _regular_inflections(base[:-3] + "yze")
+    return forms
+
+
+# Round-6/round-7 MAJOR 1: measured against the real card titles in ~/.hermes/kanban.db,
+# ordinary English verbs that commonly precede "PR #N" in a PR-workflow sentence
+# fabricate a repo (verify#560, rebase#103, re-review#210, resolve#324, update#319,
+# deploy#1, triage#1, analyze#312, finish#440, final#217 via "finalize", ...). These are
+# the PR-workflow verbs that measurement surfaced, each expanded to its regular
+# inflections below (including the opposite -ize/-ise spelling, see `_verb_forms`).
+# "keep"/"kept" and the irregular doublers "split" (splitting, not splitted) and
+# "re-run" (reran, not re-runned) are listed as literal words instead -- regular
+# inflection would mangle them.
 _PR_REF_NON_REPO_VERBS = frozenset({
     "merge", "rebase", "revert", "backport", "verify", "test", "open", "land",
     "close", "inspect", "reconcile", "resolve", "push", "summarize", "approve",
     "retarget", "fold", "prepare", "refresh", "assess", "audit", "complete",
     "correct", "harden", "rework", "stack", "block", "gate", "update",
+    # Round-7: verbs measured as still fabricating a key (20 verbs from the gate-2/3
+    # finding, minus "split"/"re-run", listed below as literal irregular forms).
+    "deploy", "triage", "document", "unblock", "finish", "ship", "reject", "draft",
+    "amend", "squash", "finalize", "confirm", "recheck", "sync", "monitor",
+    "validate", "analyze",
+    # Round-7: further verbs the same measurement caught fabricating a key over
+    # real titles (checkout#103, port#114, reduce#232, clear#115, duplicate#431,
+    # exceed#221) -- not in the required 20 but measured all the same.
+    "checkout", "port", "reduce", "clear", "duplicate", "exceed",
 })
 # Mandatory whitespace plus a real token boundary still leaves every ordinary
 # English word/verb/preposition that happens to sit right before "PR #N" in a
@@ -319,6 +369,24 @@ _PR_REF_NON_REPO_VERBS = frozenset({
 # and commonly precede "PR" in a title: function words, plus every PR-workflow
 # verb's regular inflections, plus a short list of PR-workflow nouns/jargon
 # that aren't verbs (github, upstream, qa, follow-up, ...).
+#
+# Round-7 design decision (MAJOR 1, "Capital PR #6"/"Test PR #88"/"Open PR #99"/
+# "Update PR #319" -- gate-2's "legitimate repo name" examples): these stay in the
+# ambiguous/denied set ON PURPOSE. A bare, unqualified single dictionary word
+# immediately before "PR #N" is indistinguishable from an English sentence using
+# that word ("capital" the adjective, "test"/"open"/"update" the verb) -- there is
+# no in-card evidence that disambiguates it, and minting a key from it anyway is
+# exactly the failure this function exists to prevent (a wrong, fabricated repo is
+# no safer than a dropped one -- it just fails quietly instead of loudly). The
+# actual fix for a card that DOES name one of these as a real repo is to say so
+# unambiguously: `_OWNER_REPO_PR_REF_RE` below always wins over this list, so
+# "Stockstrading/capital PR #6" (or any `owner/repo PR #N`) produces its key
+# regardless of what the repo segment spells -- the exact case gate-2 found
+# broken ("Even Stockstrading/capital PR #6 yields nothing"). An unqualified
+# "capital PR #6" with no owner prefix and no corroborating PR URL elsewhere on
+# the card is never minted into a key; `_preserve_pr_refs` still re-attaches it
+# VERBATIM ("PR #6", no invented repo) so the reference itself is never silently
+# dropped, which is the safety property the round-cap actually depends on.
 _PR_REF_NON_REPO_WORDS = frozenset({
     "a", "an", "the", "this", "that", "these", "those",
     "on", "in", "at", "of", "to", "for", "with", "by", "from", "via", "re",
@@ -330,9 +398,13 @@ _PR_REF_NON_REPO_WORDS = frozenset({
     "fix", "fixing", "fixed", "fixes",
     "check", "checking", "checked", "checks", "see",
     "keep", "keeping", "kept", "keeps",
+    "split", "splitting", "splits",
+    "re-run", "re-running", "reran", "re-ran", "reruns", "re-runs",
+    "cherry-pick", "cherry-picked", "cherry-picking", "cherry-picks",
     "follow-up", "follow-ups", "re-review", "re-reviews",
     "post-merge", "re-land",
     "github", "upstream", "capital", "qa", "apv", "addendum", "stale", "orphaned",
+    "parent", "final",
 }) | frozenset().union(*(_verb_forms(v) for v in _PR_REF_NON_REPO_VERBS))
 
 
@@ -344,13 +416,27 @@ def _norm_repo(name: str) -> str:
 
 
 def _title_pr_ref_matches(text: str) -> list[tuple[str, str]]:
-    """``_TITLE_PR_REF_RE`` matches with ``_PR_REF_NON_REPO_WORDS`` filtered out --
-    the single seam both ``_title_pr_keys`` and ``_preserve_pr_refs`` go through so
+    """Plausible ``(repo, n)`` pairs for one field: ``owner/repo PR #N`` matches are
+    ALWAYS confirmed (an explicit owner prefix is evidence, not a guess -- round-7
+    MAJOR 1); a bare ``word PR #N`` match is confirmed only when it is not one of
+    ``_PR_REF_NON_REPO_WORDS`` AND it is not inside the span an owner/repo match
+    already consumed (so the post-slash repo token in ``Stockstrading/capital PR #6``
+    is never also re-evaluated — and potentially denied — as a second, bare match).
+    The single seam both ``_title_pr_keys`` and ``_preserve_pr_refs`` go through so
     neither can drift out of sync on what counts as a plausible repo token."""
-    return [
-        (r, n) for r, n in _TITLE_PR_REF_RE.findall(text)
-        if r.lower() not in _PR_REF_NON_REPO_WORDS
-    ]
+    t = text or ""
+    owner_spans: list[tuple[int, int]] = []
+    matches: list[tuple[str, str]] = []
+    for m in _OWNER_REPO_PR_REF_RE.finditer(t):
+        matches.append((m.group(2), m.group(3)))
+        owner_spans.append((m.start(), m.end()))
+    for m in _TITLE_PR_REF_RE.finditer(t):
+        if any(start <= m.start() < end for start, end in owner_spans):
+            continue
+        r, n = m.group(1), m.group(2)
+        if r.lower() not in _PR_REF_NON_REPO_WORDS:
+            matches.append((r, n))
+    return matches
 
 
 def _title_pr_keys(text: Optional[str]) -> set[str]:
@@ -361,6 +447,24 @@ def _title_pr_keys(text: Optional[str]) -> set[str]:
     keys = {f"{_norm_repo(r)}#{n}" for r, n in _GH_PR_URL_RE.findall(t)}
     keys |= {f"{_norm_repo(r)}#{n}" for r, n in _title_pr_ref_matches(t)}
     return keys
+
+
+def _ambiguous_pr_numbers(text: Optional[str]) -> set[str]:
+    """PR numbers from a bare ``word PR #N`` match this module deliberately refuses to
+    key (an ambiguous, denied word with no owner qualification -- see the round-7
+    design note above ``_PR_REF_NON_REPO_WORDS``), so ``_preserve_pr_refs`` can still
+    re-attach the number VERBATIM ("PR #N", no invented repo) instead of silently
+    dropping it."""
+    t = text or ""
+    owner_spans = [(m.start(), m.end()) for m in _OWNER_REPO_PR_REF_RE.finditer(t)]
+    out: set[str] = set()
+    for m in _TITLE_PR_REF_RE.finditer(t):
+        if any(start <= m.start() < end for start, end in owner_spans):
+            continue
+        r, n = m.group(1), m.group(2)
+        if r.lower() in _PR_REF_NON_REPO_WORDS:
+            out.add(n)
+    return out
 
 
 def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
@@ -405,10 +509,19 @@ def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
     if title is not None and new_title is not None:
         missing = sorted(k for k in old_title_keys if k not in _title_pr_keys(title))
         prefix = ", ".join(display.get(k, k.replace("#", " PR #")) for k in missing)
+        # Round-7: an ambiguous bare-word reference (denied, no key minted) must still
+        # never be silently dropped -- re-attach the bare number verbatim, no invented
+        # repo, distinct from (and appended after) any keyed references above.
+        ambiguous_missing = sorted(
+            n for n in _ambiguous_pr_numbers(old_title)
+            if f"PR #{n}" not in title and n not in {k.split("#", 1)[1] for k in missing}
+        )
+        ambiguous_prefix = ", ".join(f"PR #{n}" for n in ambiguous_missing)
+        full_prefix = ", ".join(p for p in (prefix, ambiguous_prefix) if p)
         tags = [t for t in dict.fromkeys(_KEEP_TAG_RE.findall(old_title or ""))
                 if t.lower() not in title.lower()]
-        if prefix:
-            title = f"{prefix}: {title}"
+        if full_prefix:
+            title = f"{full_prefix}: {title}"
         if tags:
             title = "".join(tags) + " " + title
     if new_body is not None and old_all_keys:
