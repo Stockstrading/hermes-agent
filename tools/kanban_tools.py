@@ -855,13 +855,19 @@ def _handle_block(args: dict, **kw) -> str:
 # never truncated into a different time read as UTC:
 # - a date may stand alone only when no time follows (``(?!T|\s+\d)``: no ``T`` and no
 #   whitespace run + digit), so a bad time or offset can never backtrack to midnight;
-# - the trailing lookahead rejects a malformed/partial offset (``+oops``, ``+05``) and
-#   an offset split off by whitespace (``06:47:00 +05:00``).
-# Sentence punctuation (``.``, ``,``, ``)``) and plain words may still follow.
+# - the trailing lookahead rejects a malformed/partial offset (``+oops``, ``+05``), an
+#   offset split off by whitespace (``06:47:00 +05:00``), and a ``.``/``,`` immediately
+#   glued to a word character — a fractional-seconds continuation the main pattern
+#   couldn't consume, whether a comma decimal separator (``06:47:00,5+05:00``, which
+#   would otherwise truncate to a naive prefix read as UTC — hours wrong) or a
+#   non-numeric tail (``06:47:00.oops``, which would otherwise truncate to the valid
+#   prefix and be ACCEPTED instead of rejected).
+# Sentence punctuation (``.``, ``,``, ``)``) followed by whitespace/end, and plain
+# words separated by whitespace, may still follow a genuinely complete timestamp.
 _SCHEDULED_UNTIL_MARKER_RE = re.compile(r"\bSCHEDULED_UNTIL=")
 _SCHEDULED_UNTIL_RE = re.compile(
     r"\bSCHEDULED_UNTIL=(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?"
-    r"(?:Z|[+-]\d{2}:?\d{2})?|(?!T|\s+\d)))(?![\w:+-]|\.\d|\s+[+-]\d)"
+    r"(?:Z|[+-]\d{2}:?\d{2})?|(?!T|\s+\d)))(?![\w:+-]|[.,]\w|\s+[+-]\d)"
 )
 
 

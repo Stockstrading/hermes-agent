@@ -554,6 +554,15 @@ def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
     # Whitespace before an offset must not silently drop the offset.
     "SCHEDULED_UNTIL=2026-11-18T06:47:00 +05:00",
     "SCHEDULED_UNTIL=2026-11-18 06:47 -0230 later",
+    # F3: a comma decimal separator must reject whole, never truncate to the
+    # naive prefix (which would be read as UTC — hours wrong against the
+    # intended offset).
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00,5+05:00",
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00,5-02:30",
+    # F3: a non-numeric tail glued onto the fractional-seconds separator must
+    # reject whole, never truncate to the otherwise-valid prefix.
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00.oops",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00,oops",
 ])
 def test_parse_scheduled_until_rejects_malformed_offset(marker):
     """A malformed or partial timezone suffix must reject the marker, never be
@@ -672,6 +681,48 @@ def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
         assert (task.status, task.assignee) == ("ready", "dev")
         run = kb.latest_run(conn, tid)
         assert run.metadata == {"head_sha": head_sha, "findings": ["missing boundary test"]}
+
+
+def test_request_changes_db_layer_redacts_sensitive_metadata_directly(monkeypatch, tmp_path):
+    """F13 regression: ``kb.request_changes()`` itself must redact a sensitive
+    ``metadata``/``reason`` value (``kanban_db.py``'s own ``redact_review_value``
+    call at the DB layer), independent of the tool handler's own redaction. Calls
+    ``kb.request_changes()`` directly — bypassing ``kt._handle_request_changes``
+    entirely — so this pins the DB-layer defense-in-depth and would fail if that
+    call were deleted."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    secret = "ghp_" + "Z" * 40
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        ok, implementer = kb.request_changes(
+            conn, tid, reason=f"fix the leaked token {secret}",
+            expected_run_id=rclaim.current_run_id,
+            metadata={"token": secret, "findings": [f"leaked {secret} in logs"]},
+        )
+        assert ok and implementer == "dev"
+
+        run = kb.latest_run(conn, tid)
+        assert secret not in json.dumps(run.metadata)
+        changes_event = [
+            item for item in kb.list_events(conn, tid) if item.kind == "changes_requested"
+        ][-1]
+        assert secret not in changes_event.payload["reason"]
 
 
 def test_request_changes_rejects_non_dict_metadata(worker_env):

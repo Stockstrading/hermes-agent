@@ -1563,15 +1563,50 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+_FULL_SHA_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _full_sha(value: Any) -> Optional[str]:
+    """A caller-supplied metadata value, accepted ONLY as a full 40-hex-char SHA
+    (never a short/abbreviated prefix, never whitespace-padded garbage)."""
+    if isinstance(value, str) and _FULL_SHA_RE.fullmatch(value.strip()):
+        return value.strip()
+    return None
+
+
+def _current_pr_head_sha(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The PR's REAL current head, resolved from GitHub itself — never from
+    caller-supplied run metadata. ``None`` when the task has no published PR
+    contract or the resolution fails (private repo, API error, malformed
+    URL): callers must treat ``None`` as unknown, never as a match.
+    """
+    from hermes_cli.kanban_pr_acceptance import _PR, resolve_pr_head_sha
+
+    row = conn.execute(
+        "SELECT completion_contract, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    contract = _kb._row_get(row, "completion_contract")
+    if not isinstance(contract, str) or not _PR.fullmatch(contract):
+        return None
+    return resolve_pr_head_sha(contract, assignee=_kb._row_get(row, "assignee"))
+
+
 def _review_respawn_is_redundant(conn: sqlite3.Connection, task_id: str) -> bool:
     """``True`` when the handoff that put ``task_id`` into the review lane
     names the exact ``head_sha`` the last ``changes_requested`` verdict
-    already reviewed, with no ``findings`` reported on the fresh handoff.
+    already reviewed, with no ``findings`` reported on the fresh handoff,
+    AND that shared SHA is independently confirmed as the PR's actual
+    current head on GitHub right now.
 
     ``head_sha``/``findings`` are caller-supplied ``metadata`` keys (see
-    ``kanban_request_review``/``kanban_request_changes`` schemas); absent on
-    either side, this is conservatively ``False`` (never dedup a handoff we
-    cannot positively identify as a repeat).
+    ``kanban_request_review``/``kanban_request_changes`` schemas) and are
+    NEVER trusted on their own: a stale or copy-pasted ``head_sha`` on either
+    side (or a selected prior ``changes_requested`` run that predates an
+    intervening approve+re-request-changes cycle) would otherwise permanently
+    suppress a genuinely-needed re-review. Both metadata values must be a
+    full 40-char SHA, and must equal the PR's GitHub-resolved current head —
+    anything short of that (malformed, absent, mismatched, or the real head
+    unresolvable) fails OPEN to a fresh review, never closed to dedup.
     """
     requested = conn.execute(
         "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
@@ -1585,8 +1620,8 @@ def _review_respawn_is_redundant(conn: sqlite3.Connection, task_id: str) -> bool
         "SELECT metadata FROM task_runs WHERE id = ?", (int(run_id),),
     ).fetchone()
     current_meta = _kb._json_dict(_kb._row_get(current_run, "metadata"))
-    current_sha = current_meta.get("head_sha")
-    if not isinstance(current_sha, str) or not current_sha.strip():
+    current_sha = _full_sha(current_meta.get("head_sha"))
+    if current_sha is None:
         return False
 
     prior_run = conn.execute(
@@ -1595,11 +1630,18 @@ def _review_respawn_is_redundant(conn: sqlite3.Connection, task_id: str) -> bool
         (task_id,),
     ).fetchone()
     prior_meta = _kb._json_dict(_kb._row_get(prior_run, "metadata"))
-    prior_sha = prior_meta.get("head_sha")
-    if not isinstance(prior_sha, str) or prior_sha.strip() != current_sha.strip():
+    prior_sha = _full_sha(prior_meta.get("head_sha"))
+    if prior_sha is None or prior_sha != current_sha:
+        return False
+    if current_meta.get("findings"):
         return False
 
-    return not current_meta.get("findings")
+    # Provenance: the two caller-supplied values agreeing proves nothing by
+    # themselves (both can be stale copies of the same old SHA). Only a match
+    # against the PR's real, independently-resolved current head on GitHub
+    # establishes that nothing has actually changed since that verdict.
+    true_head = _current_pr_head_sha(conn, task_id)
+    return true_head is not None and true_head == current_sha
 
 
 def check_respawn_guard(
