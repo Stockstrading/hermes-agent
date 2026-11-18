@@ -228,6 +228,55 @@ def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     assert task.assignee == "fallback"
 
 
+def test_decompose_task_reason_names_escalation_landed_during_the_call(kanban_home):
+    """Round-6 MINOR 2: mirrors the kanban_specify twin -- the CAS refusal that
+    fires when an escalation lands strictly DURING the (slow) LLM call must
+    report ``"escalation landed during the call"``, not the generic
+    "task moved out of triage before promotion". A mutation that replaces
+    that string with a no-op silently passes every other test in this file."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Sneaked past the gate",
+        "body": "b",
+    })
+
+    def _escalate_during_the_call(*args, **kwargs):
+        # Simulates another worker's block_task hitting the recurrence limit
+        # and landing block_loop_detected on this card while the LLM call this
+        # process is making is still in flight.
+        with kbc.connect() as conn2:
+            with kb.write_txn(conn2):
+                kb._append_event(conn2, tid, "block_loop_detected", None)
+        return _fake_aux_response(llm_payload)
+
+    mock_fn = MagicMock(side_effect=_escalate_during_the_call)
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", mock_fn), _patch_extra_body(), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"kanban": {"default_assignee": "fallback"}},
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    mock_fn.assert_called_once()
+    assert outcome.ok is False
+    assert outcome.reason == "escalation landed during the call"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "triage"
+    assert task.title != "Sneaked past the gate"
+
+
 def test_load_routing_falls_back_to_defaults_when_config_unreadable(kanban_home, monkeypatch):
     """decompose_task promises ok=False on expected failures; a config read that raises (missing
     profile home, HomeInitializationError) must not escape _load_routing as an exception."""

@@ -272,29 +272,68 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
 
 _KEEP_TAG_RE = re.compile(r"\[(?:CAPITAL|CA|CA-adjacent|needs-human-ok|Board-approved)\]", re.IGNORECASE)
 _GH_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
-# PR12 release-gate round-5 MAJOR 1: the old `\s*` let the match backtrack INTO a
-# word and carve a fake repo out of its own letters (`APR #12` -> `a#12`, `The SPR
-# #7` -> `s#7`); `\s+` is mandatory so the token must be a whole, separately-typed
-# word before a standalone `PR`. A real word boundary (`(?<![A-Za-z])`) stops the
-# token from starting mid-word too.
+# PR12 release-gate round-6 MAJOR 1: `(?<![A-Za-z])` is not a token boundary --
+# a digit or underscore right before the token ("3D PR #12", "123repo PR #8",
+# "_internal PR #4") still let the match start mid-word and carve a fake repo
+# out of the tail (the round-5 defect verbatim). `(?<![\w.-])` is the real
+# boundary: nothing in `[\w.-]` (letters, digits, `_`, `.`, `-`) may precede the
+# captured token's first character.
 _TITLE_PR_REF_RE = re.compile(
-    r"(?<![A-Za-z])([A-Za-z][\w.-]*)\s+PR\s*#(\d+)\b", re.IGNORECASE)
-# Mandatory whitespace alone still leaves every ordinary English word/verb/
-# preposition that happens to sit right before "PR #N" in a sentence ("Review PR
-# #123", "... comments on PR #45", "... regression in PR #5") indistinguishable
-# from a real repo name using regex shape alone -- there is no configured repo
-# list to validate against here (this module is deliberately self-contained, see
-# `_card_pr_keys`'s docstring), so the practical fix is a small, closed set of
-# words that are never plausible repo names and commonly precede "PR" in a title.
+    r"(?<![\w.-])([A-Za-z][\w.-]*)\s+PR\s*#(\d+)\b", re.IGNORECASE)
+
+
+def _verb_forms(base: str) -> frozenset[str]:
+    """Regular English inflections (-s/-es/-ed/-ing, plus the y->i shift) for one
+    base verb, so a single entry in ``_PR_REF_NON_REPO_VERBS`` covers all of
+    merge/merged/merging/merges without hand-typing (and missing, as round-6 did)
+    every surface form."""
+    if base.endswith("y") and len(base) > 1 and base[-2] not in "aeiou":
+        stem = base[:-1]
+        return frozenset({base, stem + "ied", base + "ing", stem + "ies"})
+    if base.endswith("e"):
+        stem = base[:-1]
+        return frozenset({base, base + "d", stem + "ing", base + "s"})
+    s_form = base + "es" if base.endswith(("s", "x", "z", "ch", "sh")) else base + "s"
+    return frozenset({base, base + "ed", base + "ing", s_form})
+
+
+# Round-6 MAJOR 1: measured against the 8209 real card titles in
+# ~/.hermes/kanban.db, 80 fabricated a key from an ordinary English verb that
+# commonly precedes "PR #N" in a PR-workflow sentence (verify#560, rebase#103,
+# re-review#210, resolve#324, update#319, ...). These are the PR-workflow verbs
+# that measurement surfaced, each expanded to its regular inflections below.
+# "keep"/"kept" is irregular and listed as a literal word instead.
+_PR_REF_NON_REPO_VERBS = frozenset({
+    "merge", "rebase", "revert", "backport", "verify", "test", "open", "land",
+    "close", "inspect", "reconcile", "resolve", "push", "summarize", "approve",
+    "retarget", "fold", "prepare", "refresh", "assess", "audit", "complete",
+    "correct", "harden", "rework", "stack", "block", "gate", "update",
+})
+# Mandatory whitespace plus a real token boundary still leaves every ordinary
+# English word/verb/preposition that happens to sit right before "PR #N" in a
+# sentence ("Review PR #123", "... comments on PR #45", "... regression in PR
+# #5") indistinguishable from a real repo name using regex shape alone -- there
+# is no configured repo list to validate against here (this module is
+# deliberately self-contained, see `_card_pr_keys`'s docstring), so the
+# practical fix is a closed set of words that are never plausible repo names
+# and commonly precede "PR" in a title: function words, plus every PR-workflow
+# verb's regular inflections, plus a short list of PR-workflow nouns/jargon
+# that aren't verbs (github, upstream, qa, follow-up, ...).
 _PR_REF_NON_REPO_WORDS = frozenset({
     "a", "an", "the", "this", "that", "these", "those",
     "on", "in", "at", "of", "to", "for", "with", "by", "from", "via", "re",
     "and", "or", "about", "regarding", "before", "after", "into", "onto",
-    "review", "reviewing", "reviewed",
-    "address", "addressing", "addressed",
-    "investigate", "investigating", "investigated",
-    "fix", "fixing", "fixed", "check", "checking", "checked", "see",
-})
+    "as", "during", "past", "vs",
+    "review", "reviewing", "reviewed", "reviews",
+    "address", "addressing", "addressed", "addresses",
+    "investigate", "investigating", "investigated", "investigates",
+    "fix", "fixing", "fixed", "fixes",
+    "check", "checking", "checked", "checks", "see",
+    "keep", "keeping", "kept", "keeps",
+    "follow-up", "follow-ups", "re-review", "re-reviews",
+    "post-merge", "re-land",
+    "github", "upstream", "capital", "qa", "apv", "addendum", "stale", "orphaned",
+}) | frozenset().union(*(_verb_forms(v) for v in _PR_REF_NON_REPO_VERBS))
 
 
 def _norm_repo(name: str) -> str:

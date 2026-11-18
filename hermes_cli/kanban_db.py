@@ -3654,7 +3654,7 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
     return "ready" if _parents_satisfied(conn, task_id) else "todo"
 
 
-def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def unblock_task(conn: sqlite3.Connection, task_id: str, *, clear_escalation: bool = False) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first.
 
@@ -3663,17 +3663,27 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     had NO forward move at all -- ``specify_triage_task``/``decompose_triage_task``
     refuse it on purpose (the fail-closed CAS), and this function itself used to
     refuse it too (only ``blocked``/``scheduled`` in the ``WHERE``), leaving
-    ``archive`` as the only way to clear a human-gated escalation. This is the
-    attended, single-id-only recovery: it records a resolving ``unblocked`` event
-    (one of ``_BLOCK_LOOP_RESOLUTION_KINDS``) and leaves status/claim/run fields
-    alone -- no dangling-run reclaim (nothing was running), no status change (the
-    card stays in triage, now eligible for ``specify``/``decompose`` again). The
-    CLI surface for ``unblock`` always takes explicit id(s), never ``--all``, so
-    the unattended sweep can never reach this branch.
+    ``archive`` as the only way to clear a human-gated escalation.
+
+    ``clear_escalation`` is the authority gate for that third case, NOT the
+    mechanism (round-6 finding: "single-id-only" is not "attended" -- any
+    orchestrator session carrying the ``kanban`` toolset, including an
+    unattended cron heartbeat, can call the single-id MCP tool). Only the human
+    CLI path (``hermes_cli/kanban.py::_cmd_unblock``) passes ``clear_escalation=
+    True``; the model-facing ``kanban_unblock`` tool (``tools/kanban_tools.py``)
+    calls this with the default ``False`` and so still refuses an escalated
+    triage card -- the schema has no ``clear_escalation`` parameter for a model
+    to set. With ``clear_escalation=True`` this records a resolving ``unblocked``
+    event (one of ``_BLOCK_LOOP_RESOLUTION_KINDS``) and leaves status/claim/run
+    fields alone -- no dangling-run reclaim (nothing was running), no status
+    change (the card stays in triage, now eligible for ``specify``/``decompose``
+    again).
     """
     now = int(time.time())
     with write_txn(conn):
         if _task_status(conn, task_id) == "triage":
+            if not clear_escalation:
+                return False
             if not task_has_unresolved_block_loop(conn, task_id):
                 return False
             cur = conn.execute(

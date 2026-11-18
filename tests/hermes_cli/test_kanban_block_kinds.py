@@ -92,7 +92,12 @@ def test_unblock_task_resolves_triage_escalation(kanban_home: Path) -> None:
     it on purpose, and ``unblock_task`` itself only accepted ``blocked``/
     ``scheduled``, leaving ``archive`` as the only way to clear it. This is
     the attended, single-id recovery: status stays ``triage``, but the card
-    is no longer excluded from enumeration/specify/decompose."""
+    is no longer excluded from enumeration/specify/decompose.
+
+    Round-6 MAJOR 2: clearing the escalation requires the explicit
+    ``clear_escalation=True`` authority flag -- the human CLI path sets it,
+    the model-facing ``kanban_unblock`` tool never does.
+    """
     with kbc.connect_closing() as conn:
         tid = _running_task(conn)
         kb.block_task(conn, tid, reason="x", kind="capability")
@@ -102,7 +107,7 @@ def test_unblock_task_resolves_triage_escalation(kanban_home: Path) -> None:
         assert kb.get_task(conn, tid).status == "triage"
         assert kb.task_has_unresolved_block_loop(conn, tid)
 
-        assert kb.unblock_task(conn, tid) is True
+        assert kb.unblock_task(conn, tid, clear_escalation=True) is True
 
         task = kb.get_task(conn, tid)
         assert task.status == "triage"  # unchanged -- not a status move
@@ -112,6 +117,32 @@ def test_unblock_task_resolves_triage_escalation(kanban_home: Path) -> None:
         assert kb.specify_triage_task(conn, tid, title="Tightened", author="human")
         # Lands in todo, then recompute_ready flips a parent-free task to ready.
         assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_without_clear_escalation_refuses_escalated_triage_card(
+    kanban_home: Path,
+) -> None:
+    """Round-6 MAJOR 2: the default (``clear_escalation=False``, what the
+    model-facing ``kanban_unblock`` tool always calls with) must refuse an
+    escalated triage card -- only the human CLI path's explicit
+    ``clear_escalation=True`` may clear it. Without this gate, any
+    orchestrator session carrying the ``kanban`` toolset (including an
+    unattended cron heartbeat) could clear a human-gated escalation through
+    the single-id MCP tool."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+        assert kb.unblock_task(conn, tid) is False  # clear_escalation defaults False
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)  # still escalated
 
 
 def test_unblock_task_refuses_triage_row_without_escalation(kanban_home: Path) -> None:

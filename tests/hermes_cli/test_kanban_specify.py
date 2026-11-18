@@ -264,6 +264,40 @@ def test_specify_task_refuses_and_skips_llm_call_when_block_loop_lands_after_enu
     assert task.title != "Sneaked past the gate"
 
 
+def test_specify_task_reason_names_escalation_landed_during_the_call(kanban_home):
+    """Round-6 MINOR 2: the CAS refusal that fires when an escalation lands
+    strictly DURING the (slow) LLM call -- after ``_load_triage_task`` already
+    passed -- must report ``"escalation landed during the call"``, not the
+    generic "task moved out of triage before promotion" used for every other
+    CAS miss. A mutation that replaces that string with a no-op silently
+    passes every other test in this file, so it needs its own pin."""
+    with kbc.connect() as conn:
+        tid = _running_task(conn)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+
+    def _escalate_during_the_call(*args, **kwargs):
+        # Simulates another worker's block_task hitting the recurrence limit
+        # and landing block_loop_detected on this card while the LLM call this
+        # process is making is still in flight.
+        with kbc.connect() as conn2:
+            with kb.write_txn(conn2):
+                kb._append_event(conn2, tid, "block_loop_detected", None)
+        return _fake_aux_response(jsonlib.dumps({"title": "Sneaked past the gate", "body": "b"}))
+
+    mock_fn = MagicMock(side_effect=_escalate_during_the_call)
+    with patch("agent.auxiliary_client.call_llm", mock_fn):
+        outcome = spec.specify_task(tid, author="sweep")
+
+    mock_fn.assert_called_once()
+    assert outcome.ok is False
+    assert outcome.reason == "escalation landed during the call"
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+    assert task.title != "Sneaked past the gate"
+
+
 # ---------------------------------------------------------------------------
 # PR12 release-gate MAJOR 1 — _TITLE_PR_REF_RE requires an explicit "PR"
 # marker; a bare hyphenated token + "#N" must never be treated as a PR ref.
@@ -308,6 +342,53 @@ def test_title_pr_ref_does_not_treat_preposition_on_as_a_repo():
 
 def test_title_pr_ref_does_not_treat_preposition_in_as_a_repo():
     assert spec._card_pr_keys("Investigate the regression in PR #5", None) == set()
+
+
+# ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 6 MAJOR 1 — the deny-list measured against the 8209
+# real card titles in ~/.hermes/kanban.db still fabricated a key from 80 of
+# them (verify#560, rebase#103, re-review#210, resolve#324, update#319, ...).
+# Every word from that measurement and the round-6 finding's own text must
+# now produce no key; the real-repo cases must keep working.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("title", [
+    "Merge PR #123", "Rebase PR #12", "Revert PR #8", "Backport PR #45",
+    "Follow-up PR #12", "Re-review PR #12", "Verify PR #2", "Test PR #88",
+    "GitHub PR #42", "Upstream PR #7", "Open PR #99", "Land PR #100",
+    # the 80-fabrication measurement over real titles
+    "Verify PR #560 test evidence and static gates", "rebase PR #103",
+    "re-review PR #210", "resolve PR #324", "update PR #319",
+    "Inspect PR #6", "Reconcile PR #6", "Push PR #6", "Summarize PR #6",
+    "Approve PR #6", "Retarget PR #6", "Fold PR #6", "Prepare PR #6",
+    "Refresh PR #6", "Assess PR #6", "Audit PR #6", "Complete PR #6",
+    "Correct PR #6", "Harden PR #6", "Rework PR #6", "Stacked PR #6",
+    "Blocking PR #6", "Gate PR #6", "Keep PR #6", "QA PR #6", "vs PR #6",
+    "capital PR #6", "post-merge PR #6", "re-land PR #6",
+])
+def test_round6_pr_ref_fabrication_words_produce_no_key(title):
+    assert spec._card_pr_keys(title, None) == set()
+
+
+@pytest.mark.parametrize("title", [
+    "3D PR #12", "123repo PR #8", "_internal PR #4",
+])
+def test_round6_pr_ref_non_letter_prefix_never_starts_a_match(title):
+    """`(?<![A-Za-z])` is not a token boundary -- a digit or underscore right
+    before the token still let the match start mid-word and carve a fake
+    repo out of the tail (the round-5 defect verbatim)."""
+    assert spec._card_pr_keys(title, None) == set()
+
+
+@pytest.mark.parametrize("title,expected", [
+    ("strategy-api PR #528", {"strategy-api#528"}),
+    ("hermes-agent PR #12", {"hermes-agent#12"}),
+    ("numpy PR #123", {"numpy#123"}),
+    ("AI-StockTrading PR #617", {"ai-stocktrading#617"}),
+])
+def test_round6_real_repo_pr_refs_still_produce_their_key(title, expected):
+    assert spec._card_pr_keys(title, None) == expected
 
 
 # ---------------------------------------------------------------------------

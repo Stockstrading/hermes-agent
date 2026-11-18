@@ -820,6 +820,45 @@ def test_unblock_happy_path(monkeypatch, worker_env):
         conn.close()
 
 
+def test_unblock_refuses_escalated_triage_card(monkeypatch, worker_env):
+    """Round-6 MAJOR 2: the model-facing ``kanban_unblock`` tool must refuse to
+    clear a ``block_loop_detected`` escalation on a triage card -- that
+    recovery is gated behind ``unblock_task(..., clear_escalation=True)``,
+    which only the human CLI path (``hermes kanban unblock``) ever passes.
+    Without this, any orchestrator session with the kanban toolset (including
+    an unattended cron heartbeat) could clear a human-gated escalation
+    through this single-id tool, reopening the cron-unblock/re-block loop the
+    escalation exists to break."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)  # blocked -> ready (not the triage branch)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason="x", kind="capability")  # escalates to triage
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": tid})
+    d = json.loads(out)
+    assert "error" in d
+    assert "ok" not in d
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+
 def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"

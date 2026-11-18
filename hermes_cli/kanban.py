@@ -9,11 +9,13 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
@@ -33,6 +35,8 @@ from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser
+
+logger = logging.getLogger(__name__)
 
 
 # --- Flag parsing helpers ---
@@ -1027,7 +1031,8 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     author = _profile_author() if reason else None
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "UNBLOCK", lambda tid: kb.unblock_task(conn, tid))
+        op = _commented(conn, reason, author, "UNBLOCK",
+                        lambda tid: kb.unblock_task(conn, tid, clear_escalation=True))
         return _bulk_apply(ids, op, lambda tid: f"Unblocked {tid}{suffix}",
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled, or triage with no unresolved escalation?)")
 
@@ -1274,7 +1279,18 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
 
     ok_count = 0
     for tid in ids:
-        outcome = run_one(tid, author=author)
+        try:
+            outcome = run_one(tid, author=author)
+        except Exception as exc:
+            # MINOR 1 (round-6): an exception escaping run_one used to abort the
+            # whole `--all` sweep -- the root cause the `_clean_children`
+            # docstring names. Record the failure on this one card and continue
+            # with the rest, same as the per-child guard after a fan-out.
+            logger.warning("%s %s: unhandled error, skipping", verb, tid, exc_info=True)
+            outcome = SimpleNamespace(
+                task_id=tid, ok=False, reason=f"unhandled error: {exc}",
+                new_title=None, fanout=False, child_ids=None,
+            )
         if outcome.ok:
             ok_count += 1
         if want_json:
