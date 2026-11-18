@@ -272,8 +272,29 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
 
 _KEEP_TAG_RE = re.compile(r"\[(?:CAPITAL|CA|CA-adjacent|needs-human-ok|Board-approved)\]", re.IGNORECASE)
 _GH_PR_URL_RE = re.compile(r"https?://github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
+# PR12 release-gate round-5 MAJOR 1: the old `\s*` let the match backtrack INTO a
+# word and carve a fake repo out of its own letters (`APR #12` -> `a#12`, `The SPR
+# #7` -> `s#7`); `\s+` is mandatory so the token must be a whole, separately-typed
+# word before a standalone `PR`. A real word boundary (`(?<![A-Za-z])`) stops the
+# token from starting mid-word too.
 _TITLE_PR_REF_RE = re.compile(
-    r"\b([A-Za-z][\w.-]*)\s*PR\s*#(\d+)\b", re.IGNORECASE)
+    r"(?<![A-Za-z])([A-Za-z][\w.-]*)\s+PR\s*#(\d+)\b", re.IGNORECASE)
+# Mandatory whitespace alone still leaves every ordinary English word/verb/
+# preposition that happens to sit right before "PR #N" in a sentence ("Review PR
+# #123", "... comments on PR #45", "... regression in PR #5") indistinguishable
+# from a real repo name using regex shape alone -- there is no configured repo
+# list to validate against here (this module is deliberately self-contained, see
+# `_card_pr_keys`'s docstring), so the practical fix is a small, closed set of
+# words that are never plausible repo names and commonly precede "PR" in a title.
+_PR_REF_NON_REPO_WORDS = frozenset({
+    "a", "an", "the", "this", "that", "these", "those",
+    "on", "in", "at", "of", "to", "for", "with", "by", "from", "via", "re",
+    "and", "or", "about", "regarding", "before", "after", "into", "onto",
+    "review", "reviewing", "reviewed",
+    "address", "addressing", "addressed",
+    "investigate", "investigating", "investigated",
+    "fix", "fixing", "fixed", "check", "checking", "checked", "see",
+})
 
 
 def _norm_repo(name: str) -> str:
@@ -283,13 +304,23 @@ def _norm_repo(name: str) -> str:
     return n.removeprefix("etoro-")
 
 
+def _title_pr_ref_matches(text: str) -> list[tuple[str, str]]:
+    """``_TITLE_PR_REF_RE`` matches with ``_PR_REF_NON_REPO_WORDS`` filtered out --
+    the single seam both ``_title_pr_keys`` and ``_preserve_pr_refs`` go through so
+    neither can drift out of sync on what counts as a plausible repo token."""
+    return [
+        (r, n) for r, n in _TITLE_PR_REF_RE.findall(text)
+        if r.lower() not in _PR_REF_NON_REPO_WORDS
+    ]
+
+
 def _title_pr_keys(text: Optional[str]) -> set[str]:
     """``repo#n`` keys a single field (title OR body) names on its own, with no
     cross-field fallback -- the building block for both halves of
     ``_card_pr_keys``'s contract."""
     t = text or ""
     keys = {f"{_norm_repo(r)}#{n}" for r, n in _GH_PR_URL_RE.findall(t)}
-    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _TITLE_PR_REF_RE.findall(t)}
+    keys |= {f"{_norm_repo(r)}#{n}" for r, n in _title_pr_ref_matches(t)}
     return keys
 
 
@@ -330,7 +361,7 @@ def _preserve_pr_refs(old_title: Optional[str], old_body: Optional[str],
         k = f"{_norm_repo(m.group(1))}#{m.group(2)}"
         urls.setdefault(k, m.group(0))
         display.setdefault(k, f"{m.group(1)} PR #{m.group(2)}")
-    for r, n in _TITLE_PR_REF_RE.findall(old_text):
+    for r, n in _title_pr_ref_matches(old_text):
         display.setdefault(f"{_norm_repo(r)}#{n}", f"{r} PR #{n}")
     if title is not None and new_title is not None:
         missing = sorted(k for k in old_title_keys if k not in _title_pr_keys(title))
@@ -398,6 +429,7 @@ def specify_task(
         new_title, new_body = None, None
 
     audit_author = author or _profile_author()
+    reason_on_fail = "task moved out of triage before promotion"
     with kbc.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn,
@@ -441,9 +473,15 @@ def specify_task(
                     "specify %s: routing guard phase failed (card already promoted, "
                     "continuing)", task_id, exc_info=True,
                 )
+        elif kb.task_has_unresolved_block_loop(conn, task_id):
+            # MINOR 2 (round-5): the CAS refusal is a real state change, not a
+            # stale read -- say what actually happened instead of blaming a
+            # promotion/archive that never occurred.
+            reason_on_fail = "escalation landed during the call"
     if not ok:
-        # Race: promoted/archived between our read and the write.
-        return SpecifyOutcome(task_id, False, "task moved out of triage before promotion")
+        # Race: promoted/archived between our read and the write (or an
+        # escalation that landed mid-call -- see reason_on_fail above).
+        return SpecifyOutcome(task_id, False, reason_on_fail)
     return SpecifyOutcome(task_id, True, "specified", new_title=new_title)
 
 
@@ -455,7 +493,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     -- AFTER it; NOT merely "the most recent event is block_loop_detected", so a
     later unrelated comment can't un-hide it) -- that escalation is for a human
     (or ``kanban_unblock``), not for auto-specify. A card unblocked and later
-    re-escalated for an unrelated, newer reason is still returned.
+    re-escalated for an unrelated, newer reason is excluded again.
     """
     with kbc.connect_closing() as conn:
         tasks = kb.list_tasks(

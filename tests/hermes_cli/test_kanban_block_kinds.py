@@ -86,6 +86,45 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_unblock_task_resolves_triage_escalation(kanban_home: Path) -> None:
+    """PR12 release-gate MAJOR 2: before this, an escalated ``triage`` row had
+    NO forward move at all -- ``specify``/``decompose``/``promote`` all refuse
+    it on purpose, and ``unblock_task`` itself only accepted ``blocked``/
+    ``scheduled``, leaving ``archive`` as the only way to clear it. This is
+    the attended, single-id recovery: status stays ``triage``, but the card
+    is no longer excluded from enumeration/specify/decompose."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="x", kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+        assert kb.task_has_unresolved_block_loop(conn, tid)
+
+        assert kb.unblock_task(conn, tid) is True
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"  # unchanged -- not a status move
+        assert not kb.task_has_unresolved_block_loop(conn, tid)
+        assert "unblocked" in [e.kind for e in kb.list_events(conn, tid)]
+        # Now reachable by the real promotion paths again.
+        assert kb.specify_triage_task(conn, tid, title="Tightened", author="human")
+        # Lands in todo, then recompute_ready flips a parent-free task to ready.
+        assert kb.get_task(conn, tid).status == "ready"
+
+
+def test_unblock_task_refuses_triage_row_without_escalation(kanban_home: Path) -> None:
+    """A plain (non-escalated) triage row is untouched: unblock is not a
+    generic triage->triage no-op button."""
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="rough idea", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (tid,))
+        assert kb.unblock_task(conn, tid) is False
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 def test_block_recurrence_limit_config_override_raises_threshold(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -3656,9 +3656,34 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    when that is where it left off), closing any leaked run first.
+
+    A third case (PR12 release-gate MAJOR 2): a ``triage`` row carrying an
+    unresolved ``block_loop_detected`` escalation. Before this, that escalation
+    had NO forward move at all -- ``specify_triage_task``/``decompose_triage_task``
+    refuse it on purpose (the fail-closed CAS), and this function itself used to
+    refuse it too (only ``blocked``/``scheduled`` in the ``WHERE``), leaving
+    ``archive`` as the only way to clear a human-gated escalation. This is the
+    attended, single-id-only recovery: it records a resolving ``unblocked`` event
+    (one of ``_BLOCK_LOOP_RESOLUTION_KINDS``) and leaves status/claim/run fields
+    alone -- no dangling-run reclaim (nothing was running), no status change (the
+    card stays in triage, now eligible for ``specify``/``decompose`` again). The
+    CLI surface for ``unblock`` always takes explicit id(s), never ``--all``, so
+    the unattended sweep can never reach this branch.
+    """
     now = int(time.time())
     with write_txn(conn):
+        if _task_status(conn, task_id) == "triage":
+            if not task_has_unresolved_block_loop(conn, task_id):
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0, last_failure_error = NULL "
+                "WHERE id = ? AND status = 'triage'", (task_id,),
+            )
+            if cur.rowcount != 1:
+                return False
+            _append_event(conn, task_id, "unblocked", {"escalation_resolved": True})
+            return True
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if _task_status(conn, task_id) == "blocked"

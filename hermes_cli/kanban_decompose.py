@@ -257,15 +257,22 @@ def _apply_single(task: kb.Task, parsed: dict, routing: _Routing, author: str) -
                     "decompose %s: routing guard phase failed (card already "
                     "promoted, continuing)", task.id, exc_info=True,
                 )
+        elif kb.task_has_unresolved_block_loop(conn, task.id):
+            # MINOR 2 (round-5): name the real cause instead of a promotion/
+            # archive that never happened.
+            return DecomposeOutcome(task.id, False, "escalation landed during the call")
     if not ok:
         return DecomposeOutcome(task.id, False, "task moved out of triage before promotion")
     return DecomposeOutcome(task.id, True, "single task (no fanout)", fanout=False, new_title=title_val)
 
 
 def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[list[dict], str]:
-    """Validate/normalise the LLM's ``tasks`` list; ``(children, "")`` or ``([], reason)``.
-    Unknown assignees route to the default; never assignee=None. Each cleaned child also
-    carries ``_guard_comment`` (rule 6 log-only routing guard; popped before DB insert)."""
+    """Validate/normalise the LLM's tasks list; (children, "") or ([], reason).
+    Unknown assignees route to the default; never assignee=None. Guard comments are
+    computed later, by the caller, AFTER a successful fan-out (round-5 MINOR 1):
+    computing them here ran before any DB work, so a bad guard computation raised
+    straight out of _apply_fanout with no per-card try/except anywhere above it
+    (_run_triage_sweep), aborting the rest of an --all sweep on one bad card."""
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
@@ -294,11 +301,6 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
-            "_guard_comment": _routing_guard_mismatch(
-                chosen, title, clean_body,
-                review_only_profiles=routing.review_only_profiles,
-                default_assignee=routing.default_assignee,
-            ),
         })
     return children, ""
 
@@ -310,7 +312,7 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
     children, reason = _clean_children(task_id, raw_tasks, routing)
     if reason:
         return DecomposeOutcome(task_id, False, reason)
-    guard_comments = [child.pop("_guard_comment", None) for child in children]
+    reason_on_fail = "task already decomposed or moved out of triage"
     try:
         with kbc.connect_closing() as conn:
             child_ids = decompose_triage_task(
@@ -322,26 +324,38 @@ def _apply_fanout(task_id: str, parsed: dict, routing: _Routing, author: str) ->
                 auto_promote=routing.auto_promote,
             )
             if child_ids:
-                # Rule 6 routing guard (log-only phase): audit-only, must never turn a
-                # successful fan-out into a reported "DB error" (round-2 finding 3) --
-                # a failed add_comment here is caught on its own, separately from the
-                # decompose_triage_task call above.
-                try:
-                    for child_id, comment in zip(child_ids, guard_comments):
-                        if comment:
-                            kb.add_comment(conn, child_id, author, comment)
-                except Exception:
-                    logger.warning(
-                        "decompose %s: routing guard comment phase failed (children "
-                        "already created, continuing)", task_id, exc_info=True,
-                    )
+                # Rule 6 routing guard (log-only phase): computed AFTER a successful
+                # fan-out (round-5 MINOR 1 moved this out of _clean_children, which ran
+                # before any DB work) so a bad computation can never abort the primary
+                # creation (round-2 finding 3). One try/except PER CHILD -- the old
+                # single try wrapping the whole loop dropped every later child's audit
+                # comment when an earlier one failed.
+                for child, child_id in zip(children, child_ids):
+                    try:
+                        mismatch = _routing_guard_mismatch(
+                            child["assignee"], child["title"], child["body"],
+                            review_only_profiles=routing.review_only_profiles,
+                            default_assignee=routing.default_assignee,
+                        )
+                        if mismatch:
+                            kb.add_comment(conn, child_id, author, mismatch)
+                    except Exception:
+                        logger.warning(
+                            "decompose %s: routing guard phase failed for child %s "
+                            "(child already created, continuing)", task_id, child_id,
+                            exc_info=True,
+                        )
+            elif kb.task_has_unresolved_block_loop(conn, task_id):
+                # MINOR 2 (round-5): name the real cause instead of implying a
+                # decompose/promotion/archive that never happened.
+                reason_on_fail = "escalation landed during the call"
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
         return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
     if child_ids is None:
-        return DecomposeOutcome(task_id, False, "task already decomposed or moved out of triage")
+        return DecomposeOutcome(task_id, False, reason_on_fail)
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children", fanout=True, child_ids=child_ids,
     )
@@ -391,7 +405,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     -- AFTER it; NOT merely "the most recent event is block_loop_detected", so a
     later unrelated comment can't un-hide it) -- that escalation is for a human
     (or ``kanban_unblock``), not for this sweep. A card unblocked and later
-    re-escalated for an unrelated, newer reason is still returned.
+    re-escalated for an unrelated, newer reason is excluded again.
     """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000, exclude_block_loop=True)

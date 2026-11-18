@@ -283,6 +283,34 @@ def test_title_pr_ref_matches_explicit_pr_marker_on_non_hyphenated_repo():
 
 
 # ---------------------------------------------------------------------------
+# PR12 release-gate ROUND 5 MAJOR 1 — mandatory whitespace stops the regex
+# backtracking into a word (APR/SPR), and a small non-repo-word filter stops
+# an ordinary English word immediately before "PR" from being treated as a
+# repo. All five measured false positives from the round-5 gate finding.
+# ---------------------------------------------------------------------------
+
+
+def test_title_pr_ref_does_not_split_a_word_ending_in_pr():
+    assert spec._card_pr_keys("APR #12 planning", None) == set()
+
+
+def test_title_pr_ref_does_not_split_a_capitalized_word_ending_in_pr():
+    assert spec._card_pr_keys("The SPR #7 rollout", None) == set()
+
+
+def test_title_pr_ref_does_not_treat_review_as_a_repo():
+    assert spec._card_pr_keys("Review PR #123 before merge", None) == set()
+
+
+def test_title_pr_ref_does_not_treat_preposition_on_as_a_repo():
+    assert spec._card_pr_keys("Address CodeRabbit comments on PR #45", None) == set()
+
+
+def test_title_pr_ref_does_not_treat_preposition_in_as_a_repo():
+    assert spec._card_pr_keys("Investigate the regression in PR #5", None) == set()
+
+
+# ---------------------------------------------------------------------------
 # PR12 release-gate MINOR 1/2 — the title-prefix step and the body-restore
 # step must use different key sets (title-only vs. all body URLs).
 # ---------------------------------------------------------------------------
