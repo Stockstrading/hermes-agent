@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import re
 import signal
@@ -1622,10 +1623,6 @@ _REVIEW_CAP_MARKER = "review round cap"
 _REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
 _REVIEW_PR_TITLE_RE = re.compile(
     r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
-_CAPITAL_DENY_SUBSTRINGS = (
-    "strategy", "execution", "risk", "signal", "exit", "entry", "stop-loss",
-    "sizing", "kelly", "profit", "pnl", "orders", "trade",
-)
 _CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
                   "position-service", "risk-api", "credentials-service")
 _CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
@@ -1888,12 +1885,37 @@ def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) ->
 
 
 def _block_review_for_owner(conn: sqlite3.Connection, task_id: str, status: str, reason: str) -> None:
-    # block_task only transitions running/ready; a review-lane card is parked
-    # in ready first so the owner's unblock returns it to a spawnable lane.
-    if status == "review":
-        with _kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'review'", (task_id,))
-    _kb.block_task(conn, task_id, reason=reason, kind="needs_input")
+    # review -> blocked in ONE transaction: parking the card in 'ready' first and
+    # blocking it in a second write left it claimable as 'ready' in between.
+    _kb.block_task(conn, task_id, reason=reason, kind="needs_input", from_review=status == "review")
+
+
+def _duplicate_review_running(conn: sqlite3.Connection, task_id: str, assignee: str, keys: set[str]) -> bool:
+    """Another card about the same PR is being reviewed by this gate right now."""
+    for other in conn.execute(
+        "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
+        (task_id, assignee),
+    ).fetchall():
+        if _card_matches_pr(conn, other["id"], other["title"], other["body"], keys):
+            return True
+    return False
+
+
+def _duplicate_review_veto(conn: sqlite3.Connection, task_id: str, assignee: str) -> Optional[str]:
+    """Claim-time re-check of ``duplicate_review_running``, run inside the claim's
+    write txn: the gate's own check runs before the claim, so two dispatchers on
+    one board could both pass it for two cards on the same PR. Fails open (None)
+    like the gate itself."""
+    try:
+        row = conn.execute("SELECT title, body FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        keys, _ambiguous = _resolve_card_pr_keys(conn, task_id, row["title"], row["body"])
+        if keys and _duplicate_review_running(conn, task_id, assignee, keys):
+            return "duplicate_review_running"
+    except Exception as exc:  # pragma: no cover - cost control, never stops a claim
+        _kb._log.warning("review duplicate veto skipped for %s: %s", task_id, exc)
+    return None
 
 
 def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool) -> Optional[str]:
@@ -1923,12 +1945,9 @@ def _review_cost_gate(conn: sqlite3.Connection, task_id: str, assignee: str, *, 
             return "review_pr_ambiguous"
         pr = min(keys)
         # 1. Another card for the same PR is being reviewed by this gate right now.
-        for other in conn.execute(
-            "SELECT id, title, body FROM tasks WHERE id != ? AND assignee = ? AND status = 'running'",
-            (task_id, assignee),
-        ).fetchall():
-            if _card_matches_pr(conn, other["id"], other["title"], other["body"], keys):
-                return "duplicate_review_running"
+        # (Re-checked inside the claim txn by _duplicate_review_veto.)
+        if _duplicate_review_running(conn, task_id, assignee, keys):
+            return "duplicate_review_running"
         runs = _review_verdict_runs(conn, assignee, keys)
         # 2. This gate already gave a verdict on this PR after this card entered its lane.
         entered = _lane_entry_time(conn, task_id, row["created_at"])
@@ -2046,91 +2065,7 @@ def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: 
     else:
         lines.append("No prior findings were recorded.")
     return "\n".join(lines)
-
-
-# --- Rule 5: fallback model for low-risk/text-only review PRs -----------------
-_LOW_RISK_PATH_RE = re.compile(
-    r"(^|/)(docs/|tests/)|\.md$|(^|/)\.github/workflows/|(^|/)\.github/[^/]*\.ya?ml$",
-    re.IGNORECASE,
-)
-_SMALL_PR_LINES = 30  # reuse release-reviewer SOUL.md's existing small_pr threshold
-
-
-def _is_low_risk_review(task, pr_meta: dict) -> bool:
-    """True only for a non-capital, docs/tests/CI-only, small PR -- the ONLY class
-    the dispatcher may ever substitute a fallback model for (Rule 5). Capital-sensitive
-    PRs never qualify, regardless of size or file list -- hard rule, unchanged."""
-    if _is_capital_review(task):
-        return False
-    files = pr_meta.get("files") or []
-    if not files:
-        return False  # unknown file list: fail closed, never low-risk
-    if not all(_LOW_RISK_PATH_RE.search(f) for f in files):
-        return False
-    if any(marker in f.lower() for f in files for marker in _CAPITAL_DENY_SUBSTRINGS):
-        return False
-    additions = int(pr_meta.get("additions") or 0)
-    deletions = int(pr_meta.get("deletions") or 0)
-    return (additions + deletions) <= _SMALL_PR_LINES
-
-
-def _required_gate_unavailable(conn: sqlite3.Connection, task_id: Optional[str]) -> Optional[str]:
-    """The exact error text when the latest run against this task's REQUIRED gate
-    model is CONFIRMED unavailable (quota/429, auth revoked, infra refusal) -- never
-    merely slow (OWNER-RULES #3). None when the gate looks reachable."""
-    row = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ? "
-        "AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-    if row is None or row["outcome"] not in ("spawn_failed", "rate_limited"):
-        return None
-    if row["outcome"] == "spawn_failed" and not _kb._json_dict(row["metadata"]).get("infrastructure"):
-        return None
-    return _kb._lossy_text(row["error"]) or row["outcome"]
-
-
-def _review_fallback_model() -> Optional[tuple]:
-    """``auxiliary.review_fallback`` (model, provider), or None when unset."""
-    try:
-        from hermes_cli.config_effective import load_user_config_effective
-        cfg = (load_user_config_effective(fail_closed=True) or {}).get("auxiliary", {})
-        fallback = cfg.get("review_fallback") or {}
-    except Exception:
-        return None
-    model = (fallback.get("model") or "").strip()
-    if not model:
-        return None
-    provider = (fallback.get("provider") or "").strip()
-    if not provider or provider == "auto":
-        provider = "anthropic"
-    return (model, provider)
-
-
-def _maybe_review_fallback_model(conn: sqlite3.Connection, task, assignee: str,
-                                  pr_meta: Optional[dict] = None) -> Optional[tuple]:
-    """Rule 5: only for a low-risk review PR, only when the REQUIRED gate model is
-    confirmed unavailable, substitute ``auxiliary.review_fallback`` and disclose it
-    on the card. Capital-sensitive PRs never fall back -- enforced by
-    ``_is_low_risk_review`` itself, not re-checked here."""
-    if assignee not in _REVIEW_GATE_PROFILES:
-        return None
-    if not _is_low_risk_review(task, pr_meta or {}):
-        return None
-    err = _required_gate_unavailable(conn, getattr(task, "id", None))
-    if err is None:
-        return None
-    fallback = _review_fallback_model()
-    if fallback is None:
-        return None
-    _kb.add_comment(
-        conn, task.id, "dispatcher",
-        f"Review gate model unavailable ({err}); this low-risk PR (docs/tests/CI-only, "
-        f"<= {_SMALL_PR_LINES} changed lines) ran on the configured fallback "
-        f"`{fallback[0]}` instead -- owner, please read the diff.",
-    )
-    return fallback
-# --- end Rules 3 & 5 -----------------------------------------------------------
+# --- end Rule 3 ---------------------------------------------------------------
 
 
 def check_respawn_guard(
@@ -2955,7 +2890,11 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    veto = (
+        functools.partial(_duplicate_review_veto, task_id=task_id, assignee=assignee)
+        if assignee in _REVIEW_GATE_PROFILES else None
+    )
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, veto=veto)
     if claimed is None:
         return False
     try:
@@ -2984,13 +2923,6 @@ def _dispatch_lane_task(
         delta_context = build_round_delta_context(conn, claimed.id, assignee)
         if delta_context is not None:
             _kb.add_comment(conn, claimed.id, "dispatcher", delta_context)
-        # Rule 5: only a low-risk (docs/tests/CI-only, small) PR, and only when the
-        # required gate model is confirmed unavailable, may run on a fallback model.
-        # Capital-sensitive PRs never fall back (_is_low_risk_review enforces it).
-        if not claimed.model_override:
-            fallback = _maybe_review_fallback_model(conn, claimed, assignee)
-            if fallback is not None:
-                claimed.model_override, claimed.provider_override = fallback
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:

@@ -27,7 +27,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
 from toolsets import get_toolset_names
@@ -2167,14 +2167,32 @@ def _claim_and_open_run(
     return run_id
 
 
+def _claim_vetoed(
+    conn: sqlite3.Connection, task_id: str, source_status: str,
+    veto: Optional[Callable[[sqlite3.Connection], Optional[str]]],
+) -> bool:
+    """Run a caller's claim-time predicate INSIDE the claim's write txn; a
+    non-None reason refuses the claim (``claim_rejected`` event). Under the
+    IMMEDIATE lock the predicate reads what a concurrent claimer committed, so a
+    check-then-claim race between two dispatchers cannot pass both."""
+    if veto is None or _task_status(conn, task_id) != source_status:
+        return False  # nothing to refuse: the CAS below decides
+    reason = veto(conn)
+    if reason is None:
+        return False
+    _append_event(conn, task_id, "claim_rejected", {"reason": reason})
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    veto: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status, or ``veto`` refused it).
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2189,6 +2207,8 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            return None
+        if _claim_vetoed(conn, task_id, "ready", veto):
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -2205,10 +2225,11 @@ def claim_task(
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    veto: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
 ) -> Optional[Task]:
-    """Atomic ``review -> running`` (None when lost). Parents are re-checked
-    (one may have reopened meanwhile) and a NEW run tracks the reviewer
-    separately from the implementer."""
+    """Atomic ``review -> running`` (None when lost or ``veto`` refused it).
+    Parents are re-checked (one may have reopened meanwhile) and a NEW run
+    tracks the reviewer separately from the implementer."""
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2223,6 +2244,8 @@ def claim_review_task(
                     conn, task_id, "dependency_wait",
                     {"reason": "parent_reopened", "source_status": "review"},
                 )
+            return None
+        if _claim_vetoed(conn, task_id, "review", veto):
             return None
         run_id = _claim_and_open_run(
             conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
@@ -3124,9 +3147,14 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    from_review: bool = False,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
+    :func:`_route_block`). ``from_review=True`` also accepts a ``review`` card in
+    the same transaction (the dispatcher's review cost gate parks it for the
+    owner). It is recorded with ``source_status='ready'``, so ``unblock_task``
+    lands it in ``ready``; two writes (review -> ready, then block) would leave it
+    claimable as ``ready`` in between. ``kind='dependency'`` with no incomplete parent is
     re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
     promote it into a context-free respawn. ``transient`` still counts
     toward the loop breaker so a forever-flaky task escalates. True on any
@@ -3186,6 +3214,7 @@ def block_task(
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
+        allowed = "'running', 'ready', 'review'" if from_review else "'running', 'ready'"
         sql = f"""
                 UPDATE tasks
                    SET status        = '{new_status}',
@@ -3194,7 +3223,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ({allowed})
                 """
         params = (*params, task_id)
         if expected_run_id is not None:

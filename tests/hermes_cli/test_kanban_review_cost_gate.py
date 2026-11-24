@@ -188,35 +188,3 @@ def test_review_head_unchanged_true_when_sha_matches_and_no_later_comment(
         assert unchanged is True
         assert prior is not None
         assert prior["metadata"].get("head_sha") == "shaABC"
-
-
-# ---------------------------------------------------------------------------
-# (e) _is_low_risk_review
-# ---------------------------------------------------------------------------
-
-
-def test_is_low_risk_review_rejects_capital_deny_path_even_if_small() -> None:
-    task = type("T", (), {"title": "docs PR", "body": "", "id": "t1"})()
-    pr_meta = {"files": ["strategy/foo.py"], "additions": 1, "deletions": 0}
-    assert kbd._is_low_risk_review(task, pr_meta) is False
-
-
-def test_is_low_risk_review_rejects_capital_marker_even_if_small() -> None:
-    task = type("T", (), {"title": "[CAPITAL] docs PR", "body": "", "id": "t1"})()
-    pr_meta = {"files": ["docs/readme.md"], "additions": 1, "deletions": 0}
-    assert kbd._is_low_risk_review(task, pr_meta) is False
-
-
-def test_is_low_risk_review_accepts_small_docs_tests_ci_only() -> None:
-    task = type("T", (), {"title": "docs PR", "body": "", "id": "t1"})()
-    pr_meta = {
-        "files": ["docs/readme.md", "tests/test_foo.py", ".github/workflows/ci.yml"],
-        "additions": 10, "deletions": 5,
-    }
-    assert kbd._is_low_risk_review(task, pr_meta) is True
-
-
-def test_is_low_risk_review_rejects_when_too_large() -> None:
-    task = type("T", (), {"title": "docs PR", "body": "", "id": "t1"})()
-    pr_meta = {"files": ["docs/readme.md"], "additions": 100, "deletions": 0}
-    assert kbd._is_low_risk_review(task, pr_meta) is False
