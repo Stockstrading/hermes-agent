@@ -57,7 +57,7 @@ jobs:
   # flake turns main red after the merge.
   detect:
     name: Detect affected areas
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       nix: ${{ steps.classify.outputs.nix }}
@@ -82,8 +82,8 @@ jobs:
     # The build compiles the package and its whole dependency closure, so this
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
-    # wider runner with no more configuration.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # standard hosted runner; a cold closure can take longer than Blacksmith.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout code
