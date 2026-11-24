@@ -1623,10 +1623,11 @@ _REVIEW_CAP_MARKER = "review round cap"
 _REVIEW_PR_URL_RE = re.compile(r"github\.com/[^/\s]+/([^/\s]+)/pull/(\d+)", re.IGNORECASE)
 _REVIEW_PR_TITLE_RE = re.compile(
     r"\b([A-Za-z][\w.]*-[\w.-]*[A-Za-z0-9])\s*(?:PR\s*)?#(\d+)\b", re.IGNORECASE)
-_CAPITAL_REPOS = ("strategy-api", "execution-service", "trading-api",
-                  "position-service", "risk-api", "credentials-service")
-_CAPITAL_MARKER_RE = re.compile(r"\[CAPITAL\]|\[CA\]|CAPITAL-AFFECTING", re.IGNORECASE)
-_CAPITAL_REVIEW_MODEL = ("claude-opus-5", "anthropic")
+# Every run by a gate profile that lasted >= _REVIEW_MIN_RUN_SECONDS and ended in one of
+# these outcomes was a paid review, so it counts toward the round cap (cost control).
+_REVIEW_PAID_OUTCOMES = ("completed", "changes_requested", "blocked", "review_requested")
+# Only these outcomes are a reviewer VERDICT that a delta review (Rule 3) can build on.
+_REVIEW_VERDICT_OUTCOMES = ("completed", "changes_requested")
 
 
 def _norm_repo(name: str) -> str:
@@ -1642,9 +1643,9 @@ def _card_pr_keys(title: Optional[str], body: Optional[str]) -> set[str]:
 
     Both qualified forms are checked in the body fallback (not just the URL
     form) so this stays in lockstep with ``_resolve_card_pr_keys`` -- a
-    diverging, URL-only body fallback here let a capital-affecting card with
-    a bare ``PR #n`` title and a textual (non-URL) repo mention in the body
-    silently miss the capital-model gate (round-2 finding F3)."""
+    diverging, URL-only body fallback here let a card with a bare ``PR #n``
+    title and a textual (non-URL) repo mention in the body silently miss its
+    per-PR round count (round-2 finding F3)."""
     t = _kb._lossy_text(title) or ""
     keys = {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_URL_RE.findall(t)}
     keys |= {f"{_norm_repo(r)}#{n}" for r, n in _REVIEW_PR_TITLE_RE.findall(t)}
@@ -1836,20 +1837,31 @@ def _card_matches_pr(conn: Optional[sqlite3.Connection], task_id: Optional[str],
     return False
 
 
-def _is_capital_review(task) -> bool:
-    title = _kb._lossy_text(getattr(task, "title", "")) or ""
-    body = (_kb._lossy_text(getattr(task, "body", "")) or "")[:4000]
-    if _CAPITAL_MARKER_RE.search(title) or _CAPITAL_MARKER_RE.search(body):
-        return True
-    repos = {k.rsplit("#", 1)[0] for k in _card_pr_keys(title, body)}
-    return any(r in _CAPITAL_REPOS for r in repos)
-
-
 def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str]) -> list:
-    """Real verdict runs by ``profile`` on any card about the same PR, oldest first.
+    """Paid review runs by ``profile`` on any card about the same PR, oldest first.
 
-    Returns full rows (including ``metadata``) so callers can read the structured
-    findings a prior round stored there (Rule 3 delta review)."""
+    This is the round-cap count (cost control). It is deliberately inclusive:
+    every run of a gate profile that lasted >= ``_REVIEW_MIN_RUN_SECONDS`` and
+    ended ``_REVIEW_PAID_OUTCOMES`` was a full paid review, whether it ended as
+    a verdict, a handoff (``review_requested``, e.g. "clean, CI not green") or a
+    block ("REQUEST CHANGES posted, waiting"), and whether the card was claimed
+    from ``review`` or is a standalone "Review repo#N" card claimed from
+    ``ready``. Over-counting only hands the decision to the owner early;
+    under-counting silently pays for rounds past the owner's cap.
+
+    PR#1 release-gate MAJOR #4 asked to count only ``completed``/
+    ``changes_requested`` runs claimed via ``claim_review_task``. Not done here
+    (card t_13787972): on the live boards (2026-11-24, all boards, runs >= 120s)
+    326 of 404 such verdicts came from standalone review cards claimed from
+    ``ready``, so that filter would drop counted rounds 611 -> 73 and no PR
+    would reach the cap of 4 (25 do today); outcome-only would still drop
+    them to 374 and leave a long reviewed-then-blocked run counted nowhere.
+    The real defect MAJOR #4 found -- a handoff or block
+    with no findings fed to Rule 3 as "the prior round" -- is fixed at the
+    reader, by :func:`_latest_verdict_run`.
+
+    Returns full rows (including ``id``, ``outcome`` and ``metadata``) so callers
+    can read the structured findings a prior round stored there (Rule 3 delta review)."""
     nums = sorted({k.rsplit("#", 1)[1] for k in keys})
     if not nums:
         return []
@@ -1857,19 +1869,37 @@ def _review_verdict_runs(conn: sqlite3.Connection, profile: str, keys: set[str])
     # filtered out here (only the body was searched for "/pull/N").
     like = " OR ".join(["t.title LIKE ? OR t.body LIKE ? OR t.title LIKE ? OR t.body LIKE ?"] * len(nums))
     since = int(time.time()) - _REVIEW_LOOKBACK_SECONDS if _REVIEW_LOOKBACK_SECONDS else 0
-    params: list = [profile, _REVIEW_MIN_RUN_SECONDS, since]
+    params: list = [profile, *_REVIEW_PAID_OUTCOMES, _REVIEW_MIN_RUN_SECONDS, since]
     for n in nums:
         params += [f"%#{n}%", f"%/pull/{n}%", f"%/pull/{n}%", f"%#{n}%"]
+    outcomes = ", ".join("?" * len(_REVIEW_PAID_OUTCOMES))
     rows = conn.execute(
-        "SELECT r.task_id, r.started_at, r.ended_at, r.metadata, t.title, t.body "
+        "SELECT r.id, r.task_id, r.outcome, r.started_at, r.ended_at, r.metadata, t.title, t.body "
         "FROM task_runs r JOIN tasks t ON t.id = r.task_id "
         "WHERE r.profile = ? AND r.ended_at IS NOT NULL "
-        "AND r.outcome IN ('completed', 'changes_requested', 'blocked', 'review_requested') "
+        f"AND r.outcome IN ({outcomes}) "
         "AND (r.ended_at - r.started_at) >= ? AND r.started_at >= ? "
         f"AND ({like}) ORDER BY r.ended_at",
         params,
     ).fetchall()
     return [r for r in rows if _card_matches_pr(conn, r["task_id"], r["title"], r["body"], keys)]
+
+
+def _latest_verdict_run(runs: list):
+    """Newest run in ``runs`` (oldest-first, from :func:`_review_verdict_runs`) that
+    a delta review can build on: it ended as a verdict (``_REVIEW_VERDICT_OUTCOMES``)
+    or it stored Rule 3 data (``findings`` / ``reviewed_sha``) in its metadata.
+
+    PR#1 MAJOR #4: a newer handoff or operational block with no findings must not
+    stand in for the prior round -- it would tell the next reviewer "no prior
+    findings were recorded" and drop the reviewed SHA. None when no run qualifies."""
+    for run in reversed(runs):
+        if run["outcome"] in _REVIEW_VERDICT_OUTCOMES:
+            return run
+        meta = _kb._json_dict(run["metadata"]) if run["metadata"] else {}
+        if meta.get("findings") or meta.get("reviewed_sha"):
+            return run
+    return None
 
 
 def _lane_entry_time(conn: sqlite3.Connection, task_id: str, created_at: int) -> int:
@@ -2035,9 +2065,9 @@ def build_round_delta_context(conn: sqlite3.Connection, task_id: str, assignee: 
     if not keys:
         return None
     runs = _review_verdict_runs(conn, assignee, keys)
-    if not runs:
-        return None  # round 1: no prior verdict, do a normal full review
-    prior = runs[-1]
+    prior = _latest_verdict_run(runs)
+    if prior is None:
+        return None  # round 1, or no prior run ended as a verdict: do a normal full review
     meta = _kb._json_dict(prior["metadata"]) if prior["metadata"] else {}
     since_sha = meta.get("reviewed_sha")
     findings = _findings_from_metadata(prior["metadata"])
