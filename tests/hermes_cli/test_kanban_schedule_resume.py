@@ -74,6 +74,78 @@ def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home
         assert kb.recompute_scheduled(conn) == 0
 
 
+def _reviewer_run(conn, title="reviewed"):
+    """A card handed to review by ``builder`` and claimed by a reviewer."""
+    tid = kb.create_task(conn, title=title, assignee="builder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.request_review(
+        conn, tid, summary="done", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    review_run = kb.claim_review_task(conn, tid)
+    assert review_run is not None and review_run.status == "running"
+    return tid, review_run
+
+
+def _assert_verdict_returns_to_builder(conn, tid):
+    """Re-claim as the dispatcher's reviewer lane does, then hand back."""
+    reclaimed = kb.claim_review_task(conn, tid)
+    assert reclaimed is not None
+    ok, implementer = kb.request_changes(
+        conn, tid, reason="found issues", expected_run_id=reclaimed.current_run_id,
+    )
+    assert (ok, implementer) == (True, "builder")
+
+
+def test_reviewer_scheduled_mid_review_resumes_to_review_when_timer_fires(kanban_home):
+    """Regression for the PR#1 release-gate CRITICAL #1 on the recut: a reviewer
+    parked with a ``resume_at`` timer (quota wall) must come back to
+    ``review``, else ``request_changes`` rejects the next run with 'active run
+    was not claimed from review' and the verdict can never reach the
+    implementer."""
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+        assert kb.recompute_scheduled(conn) == 1
+        assert kb.get_task(conn, tid).status == "review"
+        _assert_verdict_returns_to_builder(conn, tid)
+
+
+def test_reviewer_scheduled_without_timer_resumes_to_review_on_unblock(kanban_home):
+    """Sibling path: a reviewer parked with no timer and released by a human
+    ``unblock`` must also land back on ``review``, not ``ready``."""
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="waiting on a human",
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "review"
+        _assert_verdict_returns_to_builder(conn, tid)
+
+
+def test_implementer_scheduled_mid_run_still_resumes_to_ready(kanban_home):
+    """The lane is the run's claim lane: an implementer run parked by its
+    timer resumes to ``ready``, never to ``review``."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="building", assignee="builder")
+        run = kb.claim_task(conn, tid)
+        assert run is not None
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=run.current_run_id,
+        )
+        assert kb.recompute_scheduled(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home):
     """``exclude_block_loop=True`` drops a card with an unresolved
     ``block_loop_detected`` escalation; a plain ``commented`` event must NOT
