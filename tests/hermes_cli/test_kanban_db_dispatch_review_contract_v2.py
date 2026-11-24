@@ -379,9 +379,11 @@ def test_capital_round_2_escalates_non_capital_round_3_does_not(conn):
     capital_task = kb.create_task(conn, title="review strategy-api#276", assignee="reviewer")
     for _ in range(2):
         _insert_real_round(conn, capital_task, "reviewer")
-    # strategy-api#276 carries an owner override of 7 in _REVIEW_ROUND_CAP_BY_PR --
-    # use a capital PR with no override to exercise the base cap of 2.
-    assert kbd._REVIEW_ROUND_CAP_BY_PR.get("strategy-api#276") == 7
+    # strategy-api#276 carries an owner override in _REVIEW_ROUND_CAP_BY_PR (its
+    # value is owner data and moves) -- use a capital PR with no override to
+    # exercise the base cap of 2.
+    assert "strategy-api#276" in kbd._REVIEW_ROUND_CAP_BY_PR
+    assert "risk-api#999" not in kbd._REVIEW_ROUND_CAP_BY_PR
     capital_task2 = kb.create_task(conn, title="review risk-api#999", assignee="reviewer")
     for _ in range(2):
         _insert_real_round(conn, capital_task2, "reviewer")

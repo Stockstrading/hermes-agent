@@ -156,7 +156,9 @@ def test_escalation_summary_lists_prior_verdict_findings_past_a_newer_block(conn
     rows = [
         ("changes_requested", now - 9000, {"findings": [
             {"id": "F1", "severity": "MAJOR", "file": "a.py", "line": 7, "status": "open"},
-            {"id": "F2", "severity": "MINOR", "file": "b.py", "line": 1, "status": "addressed"},
+            # Review contract v2 Rule 2/3: "addressed" only resolves with a test_ref.
+            {"id": "F2", "severity": "MINOR", "file": "b.py", "line": 1, "status": "addressed",
+             "test_ref": "tests/test_b.py::test_b"},
         ]}),
         ("blocked", now - 5000, None),
     ]
