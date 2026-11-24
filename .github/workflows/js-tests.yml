@@ -12,15 +12,12 @@ on:
 jobs:
   check:
     name: JS & TS checks
-    # One 32-core job replaces a 14-leg matrix. The matrix spread about 612s
-    # of check payload over 4-core runners. It paid about 371s of repeated
-    # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
-    # restores.
-    #
-    # One larger runner installs one time. vitest, tsc and eslint each size
-    # their own worker pool from the core count.
+    # Install once, but serialize workspace checks on the four-core runner:
+    # each vitest/tsc/eslint invocation can fill its own worker pool. Running
+    # four such checks together risks the real-process timeouts observed in
+    # run 45367156284. Keep every check and its own timeout unchanged.
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
         with:
@@ -76,7 +73,7 @@ jobs:
         with:
           command: npm ci
 
-      # Every check runs at the same time. The step fails only after all of
+      # Every check runs, one at a time. The step fails only after all of
       # them finish. There are two reasons this is not ``npm run --ws check``.
       #
       #   * ``--ws`` is serial and stops at the first workspace that fails. A
@@ -86,7 +83,7 @@ jobs:
       #     most of the payload, and its own ``check`` is a serial && chain.
       #     A spread across workspaces alone leaves that chain as the long
       #     pole. This expands the ``check:*`` sub-scripts of a package, so
-      #     its lint, ui, electron and plugin suites all run together. That
+      #     its lint, ui, electron and plugin suites run as separate checks. That
       #     is the same selection rule the old matrix job used.
       #
       # Discovery is ``npm query .workspace``. A new package or a new
@@ -94,7 +91,7 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 1
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

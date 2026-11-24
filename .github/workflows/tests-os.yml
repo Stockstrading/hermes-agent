@@ -77,7 +77,9 @@ jobs:
   os-tests:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.timeout || 30 }}
+    # Serial files trade throughput for process-startup headroom; per-file
+    # timeouts and all assertions remain unchanged.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -98,12 +100,10 @@ jobs:
           - name: Windows-only tests (arm64, 1/2)
             runner: windows-11-arm
             marker: windows
-            timeout: 60
             slice: 1/2
           - name: Windows-only tests (arm64, 2/2)
             runner: windows-11-arm
             marker: windows
-            timeout: 60
             slice: 2/2
     steps:
       - name: Checkout code
@@ -197,9 +197,9 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. CPU-count parallelism
-          # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          # Each file can spawn several processes. Avoid cross-file contention
+          # on standard hosted runners; preserve test deadlines and assertions.
+          HERMES_TEST_WORKERS: 1
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -241,9 +241,8 @@ jobs:
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
     if: inputs.e2e
-    # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
-    # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
-    # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
+    # Standard four-core runner. This dispatch-only lane is NOT verified by
+    # ordinary PR CI; retain its test deadlines until a real run measures them.
     runs-on: windows-2025
     timeout-minutes: 25
     steps:

@@ -137,7 +137,8 @@ jobs:
 
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # writer processes per test. Dispatch-only: NOT verified on four cores;
+    # ordinary PR checks do not establish this lane's timing viability.
     if: inputs.e2e
     runs-on: ubuntu-24.04
     timeout-minutes: 30
