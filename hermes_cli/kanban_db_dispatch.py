@@ -109,7 +109,8 @@ class DispatchResult:
     promoted: int = 0
     scheduled_promoted: int = 0
     """``scheduled`` cards whose ``resume_at`` wake timer had arrived, promoted
-    back to ``ready`` this tick by :func:`hermes_cli.kanban_db.recompute_scheduled`
+    back to the lane they left (``review`` or ``ready``) this tick by
+    :func:`hermes_cli.kanban_db.recompute_scheduled`
     — the sibling of ``promoted`` for the ``kanban_schedule`` timer path."""
     reconciled_orphans: list[str] = field(default_factory=list)
     """``running`` cards requeued by :func:`reconcile_orphaned_running` (broken

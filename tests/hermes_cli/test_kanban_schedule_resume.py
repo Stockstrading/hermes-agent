@@ -106,10 +106,109 @@ def test_dispatch_once_wakes_a_due_scheduled_task(kanban_home, all_assignees_spa
     assert any(t[0] == due for t in result.spawned)
 
 
+def _reviewer_run(conn, title="reviewed"):
+    """A card handed to review by ``builder`` and claimed by a reviewer."""
+    tid = kb.create_task(conn, title=title, assignee="builder")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.request_review(
+        conn, tid, summary="done", reviewer="reviewer",
+        expected_run_id=claimed.current_run_id,
+    )
+    review_run = kb.claim_review_task(conn, tid)
+    assert review_run is not None and review_run.status == "running"
+    return tid, review_run
+
+
+def _assert_verdict_returns_to_builder(conn, tid):
+    """Re-claim as the dispatcher's reviewer lane does, then hand back."""
+    reclaimed = kb.claim_review_task(conn, tid)
+    assert reclaimed is not None
+    ok, implementer = kb.request_changes(
+        conn, tid, reason="found issues", expected_run_id=reclaimed.current_run_id,
+    )
+    assert (ok, implementer) == (True, "builder")
+
+
+def test_reviewer_scheduled_mid_review_resumes_to_review_when_timer_fires(kanban_home):
+    """Regression for the PR#1 release-gate CRITICAL #1 on the recut: a reviewer
+    parked with a ``resume_at`` timer (quota wall) must come back to
+    ``review``, else ``request_changes`` rejects the next run with 'active run
+    was not claimed from review' and the verdict can never reach the
+    implementer."""
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "scheduled"
+
+        assert kb.recompute_scheduled(conn) == 1
+        assert kb.get_task(conn, tid).status == "review"
+        _assert_verdict_returns_to_builder(conn, tid)
+
+
+def test_dispatch_once_respawns_a_due_scheduled_reviewer_in_the_review_lane(
+    kanban_home, all_assignees_spawnable,
+):
+    """Through a real dispatcher tick: the timer fires, the reviewer is
+    re-claimed from ``review`` and its verdict reaches the implementer."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, dry_run=False)
+        assert result.scheduled_promoted == 1
+        assert any(t[0] == tid for t in result.spawned)
+        respawned = kb.get_task(conn, tid)
+        assert respawned is not None and respawned.status == "running"
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="found issues", expected_run_id=respawned.current_run_id,
+        )
+        assert (ok, implementer) == (True, "builder")
+
+
+def test_reviewer_scheduled_without_timer_resumes_to_review_on_unblock(kanban_home):
+    """Sibling path: a reviewer parked with no timer and released by a human
+    ``unblock`` must also land back on ``review``, not ``ready``."""
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="waiting on a human",
+            expected_run_id=review_run.current_run_id,
+        )
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "review"
+        _assert_verdict_returns_to_builder(conn, tid)
+
+
+def test_implementer_scheduled_mid_run_still_resumes_to_ready(kanban_home):
+    """The lane is the run's claim lane: an implementer run parked by its
+    timer resumes to ``ready``, never to ``review``."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="building", assignee="builder")
+        run = kb.claim_task(conn, tid)
+        assert run is not None
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=run.current_run_id,
+        )
+        assert kb.recompute_scheduled(conn) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home):
-    """``exclude_block_loop=True`` drops a card whose MOST RECENT event is
-    ``block_loop_detected``, but a later unrelated event un-hides it again —
-    a sweep must never re-touch a still-current human-gated escalation."""
+    """``exclude_block_loop=True`` drops a card with an unresolved
+    ``block_loop_detected`` escalation; a plain ``commented`` event must NOT
+    un-hide it (that was the bug -- any later event, including a bare comment,
+    defeated the filter), but an explicit resolving event (``specified``, via
+    the real ``specify_triage_task`` the triage sweep/human actually calls on
+    a triage-escalated card) does."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="escalated", assignee="a", triage=True)
         with kb.write_txn(conn):
@@ -121,8 +220,24 @@ def test_list_tasks_exclude_block_loop_drops_most_recent_escalation(kanban_home)
         filtered = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
         assert not any(t.id == tid for t in filtered)
 
-        # A fresh, later event means the escalation is no longer the latest word.
+        # A bare comment is not a resolution -- the escalation must stay hidden.
         with kb.write_txn(conn):
             kb._append_event(conn, tid, "commented", {})
-        filtered_after = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
-        assert any(t.id == tid for t in filtered_after)
+        filtered_after_comment = kb.list_tasks(conn, status="triage", exclude_block_loop=True)
+        assert not any(t.id == tid for t in filtered_after_comment)
+
+        # An explicit resolving event clears the escalation. The card is in
+        # 'triage' (where block_loop escalation lands it), so the production
+        # resolution path is specify_triage_task (triage -> todo -> auto-promoted
+        # to 'ready', since this task has no parents -- 'specified' event);
+        # unblock_task only applies to 'blocked'/'scheduled' and would no-op here.
+        assert kb.specify_triage_task(conn, tid, title="escalated (specified)")
+        filtered_after_unblock = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
+        assert any(t.id == tid for t in filtered_after_unblock)
+
+        # Re-escalated for an unrelated reason after being cleared: a fresh
+        # ``block_loop_detected`` with nothing resolving it yet must hide again.
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "block_loop_detected", {"kind": "needs_input"})
+        filtered_after_reescalation = kb.list_tasks(conn, status="ready", exclude_block_loop=True)
+        assert not any(t.id == tid for t in filtered_after_reescalation)

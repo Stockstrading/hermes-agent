@@ -1409,6 +1409,23 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+# Event kinds that count as a deliberate resolution of a ``block_loop_detected``
+# escalation for ``list_tasks(exclude_block_loop=True)``: the triage sweep actually
+# promoting the card (``specified``/``decomposed``), an explicit unblock, or an
+# archive. A bare ``commented`` row is NOT in this set on purpose -- a human-gated
+# escalation must stay hidden from auto-sweeps until it is actually acted on, not
+# merely until someone leaves a comment.
+#
+# ``status`` is deliberately EXCLUDED even though it looks like a plausible manual
+# move: the literal event kind ``"status"`` has producers that are NOT a deliberate
+# human judgment about the escalation itself -- ``plugins/kanban/dashboard/plugin_api.py``
+# ``_set_status_direct()`` emits it on every dashboard drag-drop (including a no-op
+# same-value write), and ``invalidate_descendants_for_parent_reopen`` below emits it on
+# every automatically-invalidated descendant of a reopened ancestor. Either one would
+# silently clear a still-unresolved escalation with no human ever looking at it. Only add
+# a kind here when its ONLY repo-wide producer is itself a deliberate resolution.
+_BLOCK_LOOP_RESOLUTION_KINDS = ("specified", "decomposed", "unblocked", "archived")
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -1431,11 +1448,15 @@ def list_tasks(
     workflow_template_id: Optional[str] = None, current_step_key: Optional[str] = None,
     exclude_block_loop: bool = False,
 ) -> list[Task]:
-    """``exclude_block_loop=True`` drops tasks whose MOST RECENT ``task_events``
-    row is ``block_loop_detected`` -- a human-gated escalation that a sweep
-    (auto-decompose, auto-specify) must never re-touch. Correlated on the
-    latest event only, so a card unblocked and later re-escalated for an
-    unrelated reason (a fresh, later event) is still returned."""
+    """``exclude_block_loop=True`` drops a task that has a ``block_loop_detected``
+    event with no *resolving* event after it -- a human-gated escalation that a
+    sweep (auto-decompose, auto-specify) must never re-touch. "Resolving" is an
+    explicit allowlist (``_BLOCK_LOOP_RESOLUTION_KINDS``: the triage sweep actually
+    promoting the card, a manual status move, or an explicit unblock) -- deliberately
+    NOT "whatever event happens to land next", so a plain ``commented`` row (e.g.
+    from ``add_comment``) can never silently clear a still-unresolved escalation.
+    A card unblocked and later re-escalated for an unrelated reason (a fresh
+    ``block_loop_detected`` with no resolving event after it) is excluded again."""
     if status is not None and status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     query = "SELECT * FROM tasks WHERE 1=1"
@@ -1451,14 +1472,22 @@ def list_tasks(
     if not include_archived and status != "archived":
         query += " AND status != 'archived'"
     if exclude_block_loop:
+        resolution_placeholders = \
+            ", ".join("?" for _ in _BLOCK_LOOP_RESOLUTION_KINDS)
         query += (
             " AND NOT EXISTS ("
             "   SELECT 1 FROM task_events e"
             "   WHERE e.task_id = tasks.id"
-            "     AND e.id = (SELECT MAX(id) FROM task_events e2 WHERE e2.task_id = tasks.id)"
             "     AND e.kind = 'block_loop_detected'"
+            "     AND NOT EXISTS ("
+            "       SELECT 1 FROM task_events e2"
+            "       WHERE e2.task_id = tasks.id"
+            "         AND e2.id > e.id"
+            f"         AND e2.kind IN ({resolution_placeholders})"
+            "     )"
             " )"
         )
+        params.extend(_BLOCK_LOOP_RESOLUTION_KINDS)
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -2043,7 +2072,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'scheduled'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -3609,11 +3638,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     when that is where it left off), closing any leaked run first."""
     now = int(time.time())
     with write_txn(conn):
-        resume_status = (
-            _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
-            else "ready"
-        )
+        # The newest lifecycle event (``blocked`` or ``scheduled``) carries the
+        # lane the task left, so one lookup covers both source statuses.
+        resume_status = _resume_status_from_events(conn, task_id)
         _reclaim_dangling_run(
             conn, task_id, statuses=("blocked", "scheduled"), now=now,
             note="invariant recovery on unblock",
@@ -3919,9 +3946,18 @@ def schedule_task(
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it, or — when ``resume_at`` (epoch
     seconds) is given — until :func:`recompute_scheduled` auto-promotes it
-    back to ``ready`` on its own. ``resume_at`` is the quota/429 backoff
+    back to the lane it left (``review`` or ``ready``) on its own.
+    ``resume_at`` is the quota/429 backoff
     path's timer; omit it to keep the old park-forever behaviour."""
     with write_txn(conn):
+        # The lane is read BEFORE the run ends: a reviewer parked mid-review
+        # must resume to ``review`` or ``request_changes`` refuses its next run.
+        status = _task_status(conn, task_id)
+        source_status = (
+            _retry_status_for_run(conn, task_id) if status == "running"
+            else _resume_status_from_events(conn, task_id) if status in ("todo", "blocked")
+            else "ready"
+        )
         params: list[Any] = [None if resume_at is None else int(resume_at), task_id]
         sql = """
             UPDATE tasks
@@ -3941,14 +3977,20 @@ def schedule_task(
         run_id = _end_or_synthesize_run(
             conn, task_id, outcome="scheduled", status="scheduled", summary=reason, synthesize=bool(reason),
         )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        _append_event(
+            conn, task_id, "scheduled",
+            {"reason": reason, **({"source_status": "review"} if source_status == "review" else {})},
+            run_id=run_id,
+        )
         return True
 
 
 def recompute_scheduled(conn: sqlite3.Connection) -> int:
     """Promote ``scheduled`` tasks whose ``resume_at`` timer has arrived back
-    to ``ready``; returns the count. Sibling of :func:`recompute_ready`,
-    opens its own IMMEDIATE txn — call OUTSIDE any write txn.
+    to the lane they left (``review`` for a parked reviewer, else ``ready``;
+    parent re-gated, as in ``unblock_task``); returns the count. Sibling of
+    :func:`recompute_ready`, opens its own IMMEDIATE txn — call OUTSIDE any
+    write txn.
 
     A ``scheduled`` row with no ``resume_at`` (the legacy / human-driven
     path) is left alone forever, exactly as before this timer existed —
@@ -3963,12 +4005,18 @@ def recompute_scheduled(conn: sqlite3.Connection) -> int:
         ).fetchall()
         for row in rows:
             task_id = row["id"]
+            landing_status = _landing_status_after_parents(conn, task_id)
+            new_status = (
+                "review"
+                if landing_status == "ready" and _resume_status_from_events(conn, task_id) == "review"
+                else landing_status
+            )
             if conn.execute(
-                "UPDATE tasks SET status = 'ready', resume_at = NULL "
-                "WHERE id = ? AND status = 'scheduled'", (task_id,),
+                "UPDATE tasks SET status = ?, resume_at = NULL "
+                "WHERE id = ? AND status = 'scheduled'", (new_status, task_id),
             ).rowcount != 1:
                 continue
-            _append_event(conn, task_id, "promoted", {"status": "ready", "reason": "resume_at_due"})
+            _append_event(conn, task_id, "promoted", {"status": new_status, "reason": "resume_at_due"})
             promoted += 1
     return promoted
 
