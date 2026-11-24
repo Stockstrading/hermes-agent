@@ -4,7 +4,10 @@ frozen-findings rule. Split out of ``hermes_cli.kanban_db_dispatch`` (that
 facade's ``FILE_LINES`` budget is already over target) -- origin-resident
 predicates (``_is_capital_review``, ``_findings_from_metadata``) are reached
 late-bound via a function-local import of the facade (import-cycle breaking),
-same convention the facade itself uses for ``kanban_db``.
+same convention the facade itself uses for ``kanban_db``. ``kanban_db`` is
+imported inside each function as well: the facade imports this module at its
+top, so a module-level ``kanban_db`` import here runs while the facade is half
+initialised and breaks any caller that imports the facade before ``kanban_db``.
 """
 
 from __future__ import annotations
@@ -14,8 +17,6 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Optional
-
-from hermes_cli import kanban_db as _kb
 
 # Rule 7 (single source of truth): three named round caps replace the single
 # flat ``_REVIEW_ROUND_CAP`` that used to live in kanban_db_dispatch.py. Every
@@ -107,6 +108,7 @@ def pr_meta_for_review_cap(
     whenever no PR URL resolves at all or the lookup fails for any
     reason -- the classifier already treats an empty file list as "never
     docs-only"."""
+    from hermes_cli import kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
     from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
 
@@ -157,6 +159,8 @@ def _handoff_has_evidence(conn: sqlite3.Connection, task_id: str) -> tuple[bool,
     safety check."""
     if EVIDENCE_GATE_ROLLOUT_AT is None:
         return True, None
+    from hermes_cli import kanban_db as _kb
+
     try:
         row = conn.execute(
             "SELECT summary, metadata, started_at FROM task_runs WHERE task_id = ? "
