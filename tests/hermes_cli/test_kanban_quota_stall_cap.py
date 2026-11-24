@@ -145,3 +145,28 @@ def test_real_round_cap_still_honours_owner_per_pr_override(conn):
 
     assert reason is None
     assert kb.get_task(conn, task_id).status != "blocked"
+
+
+def test_escalation_summary_lists_prior_verdict_findings_past_a_newer_block(conn):
+    """PR#1 MAJOR #4: the owner summary reads open findings from the newest VERDICT,
+    not from a newer blocked run that stored none ("none recorded" would hide them)."""
+    task_id = kb.create_task(conn, title="review strategy-lab#102", assignee="reviewer")
+    now = int(time.time())
+    rows = [
+        ("changes_requested", now - 9000, {"findings": [
+            {"id": "F1", "severity": "MAJOR", "file": "a.py", "line": 7, "status": "open"},
+            {"id": "F2", "severity": "MINOR", "file": "b.py", "line": 1, "status": "addressed"},
+        ]}),
+        ("blocked", now - 5000, None),
+    ]
+    with kb.write_txn(conn):
+        for outcome, start, meta in rows:
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at, metadata) "
+                "VALUES (?, 'reviewer', 'done', ?, ?, ?, ?)",
+                (task_id, outcome, start, start + 300, kb._json_or_null(meta) if meta else None),
+            )
+    runs = kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#102"})
+    assert [r["outcome"] for r in runs] == ["changes_requested", "blocked"]
+    open_ids = [f["id"] for f in kbd._open_findings_from_runs(runs)]
+    assert open_ids == ["F1"]

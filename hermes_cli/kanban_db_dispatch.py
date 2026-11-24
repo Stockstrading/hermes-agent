@@ -1954,10 +1954,15 @@ def _pr_url_for_key(conn: sqlite3.Connection, pr_key: str) -> Optional[str]:
 
 
 def _open_findings_from_runs(verdict_runs: list) -> list:
-    """The most recent verdict's structured findings (Rule 3) still marked open."""
-    if not verdict_runs:
+    """The most recent verdict's structured findings (Rule 3) still marked open.
+
+    "Most recent verdict" is :func:`_latest_verdict_run`, not ``verdict_runs[-1]``:
+    a newer handoff/block with no findings must not report "none recorded" to the
+    owner while the prior verdict still has open MAJORs (PR#1 MAJOR #4)."""
+    prior = _latest_verdict_run(verdict_runs)
+    if prior is None:
         return []
-    findings = _findings_from_metadata(verdict_runs[-1]["metadata"])
+    findings = _findings_from_metadata(prior["metadata"])
     return [f for f in findings if str(f.get("status", "open") if isinstance(f, dict) else "open").lower() != "addressed"]
 
 
