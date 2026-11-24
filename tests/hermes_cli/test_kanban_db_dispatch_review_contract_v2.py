@@ -319,11 +319,46 @@ def test_docs_only_pr_base_cap_is_one():
     assert kbd.REVIEW_ROUND_CAP_DOCS_ONLY == 1
 
 
-def test_is_docs_only_review_has_no_size_cap_unlike_is_low_risk_review():
+def test_is_docs_only_review_has_no_size_cap():
     task = kbd._TaskLike(title="review bff-api#141", body="")
     pr_meta = {"files": ["docs/readme.md"], "additions": 500, "deletions": 500}
     assert kbd._is_docs_only_review(task, pr_meta) is True
-    assert kbd._is_low_risk_review(task, pr_meta) is False  # over _SMALL_PR_LINES
+
+
+# --- Recut (t_b523cae4): capital corpus (PR#1 MAJOR #2, 8d943f35d1), missing
+# metadata, plain-string findings (decision 312) ------------------------------
+
+def test_capital_repo_named_after_pr_number_gives_capital_cap():
+    task = kbd._TaskLike(title="Fix release-gate findings on PR #276 (strategy-api)", body="")
+    assert kbd._is_capital_review(task) is True
+    assert kbd._review_round_cap_for(task) == kbd.REVIEW_ROUND_CAP_CAPITAL
+
+
+def test_capital_marker_past_old_4000_char_window_is_still_capital():
+    task = kbd._TaskLike(title="review bff-api#141", body=("padding " * 1000) + "touches strategy-api order sizing")
+    assert kbd._is_capital_review(task) is True
+
+
+def test_non_capital_text_stays_non_capital():
+    task = kbd._TaskLike(title="review bff-api#141", body="docs-only readme update, no behaviour change")
+    assert kbd._is_capital_review(task) is False
+
+
+def test_docs_only_pr_with_missing_metadata_gets_default_cap_not_one():
+    task = kbd._TaskLike(title="review bff-api#141", body="docs only")
+    assert kbd._review_round_cap_for(task, {}) == kbd.REVIEW_ROUND_CAP_DEFAULT
+    assert kbd._review_round_cap_for(task, None) == kbd.REVIEW_ROUND_CAP_DEFAULT
+
+
+def test_plain_string_prior_finding_is_open_in_delta_prompt_and_open_findings(conn):
+    task_id = kb.create_task(conn, title="review strategy-lab#4242", assignee="reviewer")
+    text = "MAJOR: app/x.py:12 missing timeout"
+    _insert_real_round(conn, task_id, "reviewer", metadata={"findings": [text]})
+    context = kbd.build_round_delta_context(conn, task_id, "reviewer")
+    assert f"- {text} -- open" in context
+    runs = kbd._review_verdict_runs(conn, "reviewer", {"strategy-lab#4242"})
+    assert kbd._open_findings_from_runs(runs) == [text]
+    assert kbd_review_contract._finding_key(text) == kbd_review_contract._finding_key(f"  {text} ")
 
 
 def test_is_docs_only_review_rejects_test_file():

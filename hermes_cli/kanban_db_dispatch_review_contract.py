@@ -63,11 +63,9 @@ _DOCS_ONLY_PATH_RE = re.compile(r"(^|/)docs/|\.md$", re.IGNORECASE)
 
 def _is_docs_only_review(task, pr_meta: dict) -> bool:
     """Rule 6: True only for a non-capital PR touching EXCLUSIVELY docs/** or
-    *.md files -- size-independent (stricter than ``_is_low_risk_review``,
-    which also allows tests/CI paths and caps at ``_SMALL_PR_LINES``).
-    Capital-sensitive PRs never qualify regardless of file list; an unknown
-    file list fails closed (never docs-only), same convention as
-    ``_is_low_risk_review``."""
+    *.md files -- size-independent. Capital-sensitive PRs never qualify
+    regardless of file list; an unknown or empty file list (missing PR
+    metadata) fails closed: never docs-only, so it keeps the larger cap."""
     from hermes_cli.kanban_db_dispatch import _CAPITAL_DENY_SUBSTRINGS, _is_capital_review
 
     if _is_capital_review(task):
@@ -107,8 +105,8 @@ def pr_meta_for_review_cap(
     review-lane cycle -- then one GraphQL round trip via ``kanban_pr_acceptance``.
     Fails closed to ``{}`` (identical behaviour to before this was wired in)
     whenever no PR URL resolves at all or the lookup fails for any
-    reason -- both classifiers already treat an empty file list as "never
-    docs-only/low-risk"."""
+    reason -- the classifier already treats an empty file list as "never
+    docs-only"."""
     from hermes_cli import kanban_db_dispatch as _kbd
     from hermes_cli import kanban_pr_acceptance as _kb_pr_acceptance
 
@@ -211,17 +209,19 @@ _FREEZE_KNOWN_SAFE_CATEGORIES = {"style"}
 _FREEZE_KNOWN_CATEGORIES = _FREEZE_ALLOWED_CATEGORIES | _FREEZE_KNOWN_SAFE_CATEGORIES
 
 
-def _finding_is_addressed(finding: dict) -> bool:
+def _finding_is_addressed(finding) -> bool:
     """Rule 2/3: an 'addressed' finding only counts as resolved when it
     carries a non-blank ``test_ref`` (the test that failed before, passes
     now); missing ``test_ref`` keeps it open regardless of the reported
-    ``status``."""
+    ``status``. A plain-string finding (decision 312) has no status: open."""
+    if not isinstance(finding, dict):
+        return False
     if str(finding.get("status", "open")).lower() != "addressed":
         return False
     return bool(str(finding.get("test_ref") or "").strip())
 
 
-def _finding_key(finding: dict) -> str:
+def _finding_key(finding) -> str:
     """Stable identity for a finding across review rounds: its explicit
     ``id`` when the reviewer set one, else a deterministic fallback hash of
     ``(file, severity)`` (F-identity, hermes-agent PR #5 gate-2 round 5,
@@ -238,7 +238,10 @@ def _finding_key(finding: dict) -> str:
     other unstable/free-text field too). An id-less finding's identity is
     therefore coarser (same file + severity collide) -- reviewers that need
     to distinguish two no-id findings in one file at the same severity must
-    set an explicit ``id``."""
+    set an explicit ``id``. A plain-string finding (decision 312) is keyed
+    by a hash of its stripped text."""
+    if not isinstance(finding, dict):
+        return "text:" + hashlib.sha1(str(finding).strip().encode("utf-8")).hexdigest()
     fid = str(finding.get("id") or "").strip()
     if fid:
         return fid
@@ -270,13 +273,16 @@ def _finding_allowed_after_freeze(finding: dict, round_no: int, frozen_ids: set[
     that is not one of ``_FREEZE_KNOWN_CATEGORIES`` (a typo, synonym, or
     extra word never exactly matches but must not silently exempt the
     finding either) fails closed (treated as blocking, same convention as
-    ``_is_docs_only_review``/``_is_low_risk_review``'s "unknown data is never
+    ``_is_docs_only_review``'s "unknown data is never
     safe") until a reviewer explicitly classifies it as a recognised string
-    category (F4/F-category)."""
+    category (F4/F-category). A plain-string finding has no category, so it
+    fails closed the same way."""
     if round_no <= _FREEZE_ROUND_CUTOFF:
         return True
     if _finding_key(finding) in frozen_ids:
         return True
+    if not isinstance(finding, dict):
+        return True  # decision 312 plain string: no category, fail closed, stays blocking
     raw_category = finding.get("category")
     if raw_category is None or not isinstance(raw_category, str) or not raw_category.strip():
         return True  # unclassified or malformed (non-string): fail closed, stays blocking
