@@ -483,6 +483,152 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_head_sha_dedup_skips_respawn_when_implementer_resubmits_same_commit(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """kanban_request_changes schema: a ``head_sha`` key on a verdict lets
+    the dispatcher skip a redundant re-review on a later tick when the head
+    SHA hasn't moved and no new findings exist. Here the implementer calls
+    ``kanban_request_review`` again naming the EXACT SHA the reviewer already
+    rejected, with no new findings on the fresh handoff — the review lane
+    must not spawn another reviewer for identical code. A genuinely new
+    commit (different ``head_sha``) must still spawn normally.
+
+    The dedup only fires when the shared SHA is independently confirmed as
+    the PR's real current head on GitHub (``resolve_pr_head_sha``); it is
+    never taken on the caller-supplied metadata's say-so alone (F10)."""
+    import hermes_cli.kanban_pr_acceptance as pr_acceptance
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    head_sha = "a" * 40
+    pr_url = "https://github.com/acme/widgets/pull/5"
+    monkeypatch.setattr(pr_acceptance, "resolve_pr_head_sha", lambda *a, **k: head_sha)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="dev",
+                              completion_contract=pr_url)
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="first pass", reviewer="reviewer",
+            metadata={"head_sha": head_sha},
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="fix the test",
+            expected_run_id=rclaim.current_run_id,
+            metadata={"head_sha": head_sha, "findings": ["missing boundary test"]},
+        )
+        assert ok and implementer == "dev"
+
+        # Implementer resubmits WITHOUT pushing a new commit — same head_sha,
+        # no new findings on the handoff itself.
+        re_claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="should be fine now", reviewer="reviewer",
+            metadata={"head_sha": head_sha},
+            expected_run_id=re_claimed.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") == "head_sha_unchanged"
+
+    # A genuinely new commit must still spawn normally.
+    new_sha = "b" * 40
+    with kbc.connect() as conn:
+        tid2 = kb.create_task(conn, title="needs review 2", assignee="dev",
+                               completion_contract=pr_url)
+        claimed2 = kb.claim_task(conn, tid2)
+        assert kb.request_review(
+            conn, tid2, summary="first pass", reviewer="reviewer",
+            metadata={"head_sha": head_sha},
+            expected_run_id=claimed2.current_run_id,
+        )
+        rclaim2 = kb.claim_review_task(conn, tid2)
+        assert kb.request_changes(
+            conn, tid2, reason="fix the test",
+            expected_run_id=rclaim2.current_run_id,
+            metadata={"head_sha": head_sha, "findings": ["missing boundary test"]},
+        )
+        re_claimed2 = kb.claim_task(conn, tid2)
+        assert kb.request_review(
+            conn, tid2, summary="actually fixed, new commit", reviewer="reviewer",
+            metadata={"head_sha": new_sha},
+            expected_run_id=re_claimed2.current_run_id,
+        )
+        assert kbd.check_respawn_guard(conn, tid2, lane="review") is None
+
+
+def test_head_sha_dedup_never_fires_without_verified_github_provenance(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F10 regression: a mismatched, malformed, or absent SHA on either side
+    — or a GitHub resolution that cannot be established — must never trigger
+    the dedup, even when the two caller-supplied metadata values agree with
+    each other."""
+    import hermes_cli.kanban_pr_acceptance as pr_acceptance
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_url = "https://github.com/acme/widgets/pull/9"
+    agreed_sha = "c" * 40
+
+    def _make_pending_pair(conn, title, *, current_meta, prior_meta):
+        tid = kb.create_task(conn, title=title, assignee="dev", completion_contract=pr_url)
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="pass", reviewer="reviewer", metadata=prior_meta,
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        assert kb.request_changes(
+            conn, tid, reason="fix", expected_run_id=rclaim.current_run_id,
+            metadata={**prior_meta, "findings": ["x"]},
+        )[0]
+        re_claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="resubmit", reviewer="reviewer", metadata=current_meta,
+            expected_run_id=re_claimed.current_run_id,
+        )
+        return tid
+
+    # Case 1: metadata agrees, but GitHub's real head cannot be resolved
+    # (e.g. the profile's gh login can't read the repo) -> fail open.
+    monkeypatch.setattr(pr_acceptance, "resolve_pr_head_sha", lambda *a, **k: None)
+    with kbc.connect() as conn:
+        tid = _make_pending_pair(
+            conn, "unresolvable provenance",
+            current_meta={"head_sha": agreed_sha}, prior_meta={"head_sha": agreed_sha},
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+    # Case 2: metadata agrees with each other but NOT with the real GitHub
+    # head (stale/copy-pasted SHA on both sides) -> fail open.
+    monkeypatch.setattr(pr_acceptance, "resolve_pr_head_sha", lambda *a, **k: "d" * 40)
+    with kbc.connect() as conn:
+        tid = _make_pending_pair(
+            conn, "stale copy-pasted sha",
+            current_meta={"head_sha": agreed_sha}, prior_meta={"head_sha": agreed_sha},
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+    # Case 3: a malformed (short/abbreviated) SHA on the fresh handoff, even
+    # though GitHub's real head would otherwise match -> fail open.
+    monkeypatch.setattr(pr_acceptance, "resolve_pr_head_sha", lambda *a, **k: agreed_sha)
+    with kbc.connect() as conn:
+        tid = _make_pending_pair(
+            conn, "malformed sha",
+            current_meta={"head_sha": agreed_sha[:7]}, prior_meta={"head_sha": agreed_sha},
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+    # Case 4: absent head_sha on the fresh handoff -> fail open.
+    with kbc.connect() as conn:
+        tid = _make_pending_pair(
+            conn, "absent sha", current_meta={}, prior_meta={"head_sha": agreed_sha},
+        )
+        assert kbd.check_respawn_guard(conn, tid, lane="review") is None
+
+
 def _backdate_comments(conn, tid, seconds=60):
     """Second-granularity timestamps: make the PR comment older than the
     handoff that follows it in the same test."""

@@ -74,6 +74,38 @@ def test_recompute_scheduled_promotes_due_card_and_leaves_future_one(kanban_home
         assert kb.recompute_scheduled(conn) == 0
 
 
+def test_dispatch_once_wakes_a_due_scheduled_task(kanban_home, all_assignees_spawnable):
+    """End-to-end: an actual dispatcher tick (not just the bare DB helper)
+    must promote a ``scheduled`` card whose ``resume_at`` timer is in the
+    past back to ``ready`` — and then spawn it like any other ready card.
+    Regression for the SOUL's quota-backoff procedure: before this, a task
+    scheduled via ``SCHEDULED_UNTIL=`` never auto-woke in production because
+    no dispatcher phase called ``recompute_scheduled``."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    now = int(time.time())
+    with kbc.connect() as conn:
+        due = kb.create_task(conn, title="quota wait, due", assignee="a")
+        assert kb.schedule_task(conn, due, resume_at=now - 10)
+        not_due = kb.create_task(conn, title="quota wait, not due", assignee="a")
+        assert kb.schedule_task(conn, not_due, resume_at=now + 3600)
+
+    spawned: list[str] = []
+
+    def _fake_spawn(*args, **kwargs):
+        spawned.append(args[0]["id"] if isinstance(args[0], dict) else args[0].id)
+        return 4242
+
+    with kbc.connect() as conn:
+        result = kbd.dispatch_once(conn, spawn_fn=_fake_spawn, dry_run=False)
+
+    assert result.scheduled_promoted == 1
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, due).status == "running"
+        assert kb.get_task(conn, not_due).status == "scheduled"
+    assert any(t[0] == due for t in result.spawned)
+
+
 def _reviewer_run(conn, title="reviewed"):
     """A card handed to review by ``builder`` and claimed by a reviewer."""
     tid = kb.create_task(conn, title=title, assignee="builder")
@@ -115,6 +147,30 @@ def test_reviewer_scheduled_mid_review_resumes_to_review_when_timer_fires(kanban
         assert kb.recompute_scheduled(conn) == 1
         assert kb.get_task(conn, tid).status == "review"
         _assert_verdict_returns_to_builder(conn, tid)
+
+
+def test_dispatch_once_respawns_a_due_scheduled_reviewer_in_the_review_lane(
+    kanban_home, all_assignees_spawnable,
+):
+    """Through a real dispatcher tick: the timer fires, the reviewer is
+    re-claimed from ``review`` and its verdict reaches the implementer."""
+    from hermes_cli import kanban_db_dispatch as kbd
+
+    with kbc.connect() as conn:
+        tid, review_run = _reviewer_run(conn)
+        assert kb.schedule_task(
+            conn, tid, reason="quota wall", resume_at=int(time.time()) - 10,
+            expected_run_id=review_run.current_run_id,
+        )
+        result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 4242, dry_run=False)
+        assert result.scheduled_promoted == 1
+        assert any(t[0] == tid for t in result.spawned)
+        respawned = kb.get_task(conn, tid)
+        assert respawned is not None and respawned.status == "running"
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="found issues", expected_run_id=respawned.current_run_id,
+        )
+        assert (ok, implementer) == (True, "builder")
 
 
 def test_reviewer_scheduled_without_timer_resumes_to_review_on_unblock(kanban_home):

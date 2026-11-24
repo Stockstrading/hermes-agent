@@ -455,6 +455,284 @@ def test_schedule_parks_current_worker_with_reason(worker_env):
             event.kind == "scheduled" and event.payload == {"reason": reason}
             for event in kb.list_events(conn, worker_env)
         )
+        # The marker is a real wake-up timer, not just a human-readable note.
+        import calendar
+        expected_epoch = calendar.timegm((2026, 9, 13, 0, 0, 0))
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] == expected_epoch
+
+
+def test_schedule_without_scheduled_until_marker_leaves_resume_at_null(worker_env):
+    """Missing/unparsable ``SCHEDULED_UNTIL`` keeps the legacy park-forever
+    behaviour (``resume_at`` stays NULL) rather than guessing a wake time."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    json.loads(entry.handler({"reason": "waiting on a human to unblock"}))
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_schedule_unparsable_scheduled_until_marker_leaves_resume_at_null(worker_env):
+    """A malformed marker must never silently drop the task back to ``ready``
+    immediately — it logs and falls back to the legacy park-forever path."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({"reason": "SCHEDULED_UNTIL=not-a-timestamp"}))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_schedule_marker_requires_left_word_boundary(worker_env):
+    """``UNSCHEDULED_UNTIL=...`` must not substring-match the marker — only
+    the exact ``SCHEDULED_UNTIL=`` token (preceded by a non-word char or
+    string start) is honoured."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({
+        "reason": "UNSCHEDULED_UNTIL=2026-09-13T00:00:00Z, not a real marker",
+    }))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_schedule_marker_capture_excludes_trailing_punctuation(worker_env):
+    """A timestamp immediately followed by sentence punctuation (no space)
+    must still parse — the capture group stops at the ISO8601 value, not at
+    the next whitespace."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+    import calendar
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({
+        "reason": "waiting for quota reset, SCHEDULED_UNTIL=2026-09-13T00:00:00Z.",
+    }))
+    assert out["ok"] is True
+    expected_epoch = calendar.timegm((2026, 9, 13, 0, 0, 0))
+    with kbc.connect() as conn:
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] == expected_epoch
+
+
+@pytest.mark.parametrize("marker", [
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+05",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00+05 waiting",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00-0",
+    "SCHEDULED_UNTIL=2026-11-18T06:47+oops",
+    # Space-separated form: the time must never backtrack to a date-only match.
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00+oops",
+    "SCHEDULED_UNTIL=2026-11-18 06:47+05",
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00-0",
+    "SCHEDULED_UNTIL=2026-11-18 06",
+    # Any whitespace run before a time, not just one space, blocks the date-only branch.
+    "SCHEDULED_UNTIL=2026-11-18  06:47",
+    "SCHEDULED_UNTIL=2026-11-18\t06:47",
+    "SCHEDULED_UNTIL=2026-11-18\n06:47",
+    # Whitespace before an offset must not silently drop the offset.
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00 +05:00",
+    "SCHEDULED_UNTIL=2026-11-18 06:47 -0230 later",
+    # F3: a comma decimal separator must reject whole, never truncate to the
+    # naive prefix (which would be read as UTC — hours wrong against the
+    # intended offset).
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00,5+05:00",
+    "SCHEDULED_UNTIL=2026-11-18 06:47:00,5-02:30",
+    # F3: a non-numeric tail glued onto the fractional-seconds separator must
+    # reject whole, never truncate to the otherwise-valid prefix.
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00.oops",
+    "SCHEDULED_UNTIL=2026-11-18T06:47:00,oops",
+])
+def test_parse_scheduled_until_rejects_malformed_offset(marker):
+    """A malformed or partial timezone suffix must reject the marker, never be
+    silently dropped (which read the time as UTC and fired the timer hours off)."""
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until(marker) is None
+
+
+@pytest.mark.parametrize("marker, expected", [
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00Z", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00+05:00", (2026, 11, 18, 1, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00+0500", (2026, 11, 18, 1, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00-02:30 later", (2026, 11, 18, 9, 17, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18T06:47:00", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 06:47", (2026, 11, 18, 6, 47, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 later", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18.", (2026, 11, 18, 0, 0, 0)),
+    ("SCHEDULED_UNTIL=2026-11-18 06:47:00-02:30 x", (2026, 11, 18, 9, 17, 0)),
+    ("wait, SCHEDULED_UNTIL=2026-11-18T06:47:00Z.", (2026, 11, 18, 6, 47, 0)),
+    ("wait (SCHEDULED_UNTIL=2026-11-18T06:47:00.5+05:00)", (2026, 11, 18, 1, 47, 0)),
+])
+def test_parse_scheduled_until_keeps_valid_forms(marker, expected):
+    import calendar
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until(marker) == calendar.timegm(expected + (0, 0, 0))
+
+
+def test_parse_scheduled_until_word_after_space_is_prose_not_offset():
+    """Pins the current choice: after a complete time, whitespace followed by a WORD
+    (``+oops``) is free-form prose, not an offset, so the marker is 06:47 UTC. Only
+    whitespace + sign + digit (``06:47 +05:00``) is read as a split-off offset and
+    rejected; rejecting every ``+word`` would also reject ordinary reason text."""
+    import calendar
+    from tools.kanban_tools import _parse_scheduled_until
+
+    assert _parse_scheduled_until("SCHEDULED_UNTIL=2026-11-18T06:47 +oops") == \
+        calendar.timegm((2026, 11, 18, 6, 47, 0, 0, 0, 0))
+
+
+def test_parse_scheduled_until_logs_rejection_without_reason_text(caplog):
+    """A rejected marker is logged (so a parked-forever task is diagnosable), but the
+    free-form reason text never reaches the log."""
+    import logging
+    from tools.kanban_tools import _parse_scheduled_until
+
+    reason = "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops private-note-xyz"
+    with caplog.at_level(logging.WARNING, logger="tools.kanban_tools"):
+        assert _parse_scheduled_until(reason) is None
+    warnings = [r for r in caplog.records
+                if r.name == "tools.kanban_tools" and r.levelno == logging.WARNING]
+    assert warnings, "rejected SCHEDULED_UNTIL marker must log a warning"
+    for record in warnings:
+        assert "private-note-xyz" not in record.getMessage()
+        assert "+oops" not in record.getMessage()
+
+
+def test_schedule_malformed_offset_marker_leaves_resume_at_null(worker_env):
+    """Handler level: a marker with a malformed offset parks forever (resume_at NULL),
+    never a wake timer read as UTC."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    entry = registry.get_entry("kanban_schedule")
+    out = json.loads(entry.handler({"reason": "SCHEDULED_UNTIL=2026-11-18T06:47:00+oops"}))
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "scheduled"
+        assert conn.execute(
+            "SELECT resume_at FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone()[0] is None
+
+
+def test_request_changes_accepts_redacted_metadata(monkeypatch, tmp_path):
+    """``kanban_request_changes`` stores an optional ``metadata`` dict (e.g.
+    ``head_sha``/``findings``) on the closed run, exactly like ``kanban_complete``;
+    it is redacted the same way request_review's metadata is."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        run_id = rclaim.current_run_id
+
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+
+    head_sha = "a" * 40
+    out = json.loads(kt._handle_request_changes({
+        "reason": "fix the failing test",
+        "metadata": {"head_sha": head_sha, "findings": ["missing boundary test"]},
+    }))
+    assert out["ok"] is True
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert (task.status, task.assignee) == ("ready", "dev")
+        run = kb.latest_run(conn, tid)
+        assert run.metadata == {"head_sha": head_sha, "findings": ["missing boundary test"]}
+
+
+def test_request_changes_db_layer_redacts_sensitive_metadata_directly(monkeypatch, tmp_path):
+    """F13 regression: ``kb.request_changes()`` itself must redact a sensitive
+    ``metadata``/``reason`` value (``kanban_db.py``'s own ``redact_review_value``
+    call at the DB layer), independent of the tool handler's own redaction. Calls
+    ``kb.request_changes()`` directly — bypassing ``kt._handle_request_changes``
+    entirely — so this pins the DB-layer defense-in-depth and would fail if that
+    call were deleted."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    secret = "ghp_" + "Z" * 40
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="needs review", assignee="dev")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="ready", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        ok, implementer = kb.request_changes(
+            conn, tid, reason=f"fix the leaked token {secret}",
+            expected_run_id=rclaim.current_run_id,
+            metadata={"token": secret, "findings": [f"leaked {secret} in logs"]},
+        )
+        assert ok and implementer == "dev"
+
+        run = kb.latest_run(conn, tid)
+        assert secret not in json.dumps(run.metadata)
+        changes_event = [
+            item for item in kb.list_events(conn, tid) if item.kind == "changes_requested"
+        ][-1]
+        assert secret not in changes_event.payload["reason"]
+
+
+def test_request_changes_rejects_non_dict_metadata(worker_env):
+    """A non-object ``metadata`` is a tool_error, not a silent coercion."""
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_request_changes({
+        "reason": "fix it", "metadata": "not-a-dict",
+    }))
+    assert "metadata" in out.get("error", "")
 
 
 def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worker_env):
